@@ -1,0 +1,77 @@
+from pathlib import Path
+from unittest.mock import patch
+
+import fitz
+
+from research_engine import extractor
+from research_engine.schema import ExtractionMethod
+
+
+def _write_sample_pdf(path: Path, text: str) -> None:
+    doc = fitz.open()
+    page = doc.new_page()
+    page.insert_text((72, 72), text)
+    doc.save(path)
+    doc.close()
+
+
+def test_markitdown_convert_pdf_returns_markdown(tmp_path) -> None:
+    pdf_path = tmp_path / "sample.pdf"
+    expected_text = "MarkItDown sample PDF text"
+    _write_sample_pdf(pdf_path, expected_text)
+
+    markdown = extractor._markitdown_convert(str(pdf_path))
+
+    assert markdown is not None
+    assert expected_text in markdown
+
+
+def test_chain_uses_markitdown_when_pdf_rungs_fail(tmp_path) -> None:
+    pdf_path = tmp_path / "sample.pdf"
+    expected_text = "MarkItDown fallback PDF text " * 12
+    _write_sample_pdf(pdf_path, expected_text)
+
+    with patch.object(extractor, "_pdf_docling", return_value={}) as docling_mock, patch.object(
+        extractor,
+        "_pdf_pymupdf",
+        return_value={},
+    ) as pymupdf_mock:
+        out = extractor.extract_clean_text(
+            str(pdf_path),
+            seen_urls_path=tmp_path / "seen.txt",
+        )
+
+    assert out is not None
+    assert out["extraction_method"] == ExtractionMethod.MARKITDOWN.value
+    assert "MarkItDown fallback PDF text" in out["char_text_preview"]
+    assert expected_text.strip() in Path(out["raw_text_path"]).read_text(encoding="utf-8")
+    docling_mock.assert_called_once()
+    pymupdf_mock.assert_called_once()
+
+
+def test_pdf_default_uses_pymupdf_before_docling(tmp_path) -> None:
+    pdf_path = tmp_path / "sample.pdf"
+    _write_sample_pdf(pdf_path, "PyMuPDF first PDF text")
+    calls: list[str] = []
+
+    def fake_pymupdf(*args, **kwargs):
+        calls.append("pymupdf")
+        return {}
+
+    def fake_docling(*args, **kwargs):
+        calls.append("docling")
+        return {"title": "Docling", "text": "docling fallback text " * 20}
+
+    with patch.object(extractor, "_pdf_pymupdf", side_effect=fake_pymupdf), patch.object(
+        extractor,
+        "_pdf_docling",
+        side_effect=fake_docling,
+    ):
+        out = extractor.extract_clean_text(
+            str(pdf_path),
+            seen_urls_path=tmp_path / "seen.txt",
+        )
+
+    assert out is not None
+    assert out["extraction_method"] == ExtractionMethod.DOCLING.value
+    assert calls == ["pymupdf", "docling"]

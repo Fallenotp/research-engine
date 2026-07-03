@@ -1,0 +1,728 @@
+# Multi-mode router config for the research engine.
+#
+# Two-stage routing:
+#   1. RULE-BASED match (this file) — deterministic, free, fast.
+#   2. HAIKU FALLBACK — only when no rule matches the query.
+#
+# Worker model is also routed per Model Law v3 (2026-05-08):
+#   - Logic Engine work     → Codex
+#   - Architect / Wisdom    → Opus
+#   - Creative / Writer     → Sonnet
+#   - Researcher / Speed    → Haiku
+#
+# All lanes referenced here MUST be defined in the `lanes:` registry below.
+# Authority weights are 0.0–1.0; reranker multiplies result scores by them.
+
+schema_version: "1.0.0"
+
+# ---------------------------------------------------------------------------
+# Routing rules — first match wins. Order matters (most specific first).
+# ---------------------------------------------------------------------------
+
+rules:
+
+  # --- Government / Legal / Regulatory ---
+  - name: gov_tech_transfer
+    patterns: [nasa software, patent license, spinoff, tech transfer, commercialize, dual-use technology, government technology, defense open source]
+    lanes: [nasa_techtransfer, github_code, searxng_general]
+    worker_model: haiku
+    topic: gov_tech
+
+  - name: federal_court_ruling
+    patterns: [court ruling, supreme court, circuit court, appellate, scotus, opinion]
+    lanes: [courtlistener, congress_gov, searxng_general, paid_proxy]
+    worker_model: haiku
+    topic: legal
+    require_tier_1: true
+
+  - name: sec_filing
+    patterns: [10-k, 10-q, 8-k, sec filing, edgar, form s-1, proxy statement]
+    lanes: [sec_edgar, sec_gov, searxng_general]
+    worker_model: haiku
+    topic: finance_filings
+    require_tier_1: true
+
+  - name: campaign_finance
+    patterns: [campaign finance, fec, super pac, independent expenditure]
+    lanes: [fec_gov, openstates, congress_gov, searxng_general]
+    worker_model: haiku
+    topic: politics
+
+  - name: legislation
+    patterns: [bill, congress, senate, house, statute, h.r., s.b., legislation]
+    lanes: [congress_gov, openstates, govinfo_gov, searxng_general]
+    worker_model: haiku
+    topic: politics
+
+  - name: state_legislation
+    patterns: [state senate, state assembly, governor, state law]
+    lanes: [openstates, searxng_general, paid_proxy]
+    worker_model: haiku
+    topic: politics
+
+  # --- Academic / Research ---
+  - name: academic_paper
+    patterns: [arxiv, paper, study, peer-reviewed, journal, doi, et al]
+    lanes: [arxiv, semantic_scholar, core, papers_with_code, searxng_general, exa_direct]
+    worker_model: haiku
+    topic: academic
+    require_tier_1: true
+
+  - name: medical_research
+    patterns: [clinical trial, nih, pubmed, fda, peer-reviewed, randomized, cohort]
+    lanes: [pubmed, semantic_scholar, fda_gov, nih_gov, searxng_general, exa_direct, linkup_direct]
+    worker_model: haiku
+    topic: medicine
+    require_tier_1: true
+
+  - name: ml_sota
+    patterns: [state of the art, sota, benchmark, leaderboard, ablation]
+    lanes: [papers_with_code, hn_algolia, github_code, gitlab_code, codeberg_code, hf_hub, semantic_scholar]
+    worker_model: haiku
+    topic: ml_ai
+
+  # --- Code / Engineering ---
+  - name: code_pattern
+    patterns: [how to, library, function, sdk, api, code example, implementation]
+    lanes: [github_code, gitlab_code, codeberg_code, sourcehut_code, sourcegraph, stack_exchange, hn_algolia, searxng_general, firecrawl_direct]
+    worker_model: codex_5_4
+    topic: code
+
+  - name: error_diagnosis
+    patterns: [error, exception, traceback, bug, "doesn't work", segfault, panic]
+    lanes: [stack_exchange, github_code, gitlab_code, codeberg_code, sourcegraph, searxng_general]
+    worker_model: codex_5_4
+    topic: code
+
+  # --- Real-time / Social ---
+  - name: breaking_news
+    patterns: [today, breaking, just announced, this morning, last hour]
+    lanes: [x_pulse, bluesky_jetstream, hn_algolia, searxng_general, tavily_direct, firecrawl_direct, paid_proxy]
+    worker_model: haiku
+    topic: news
+    freshness_max_age_hours: 24
+
+  - name: social_sentiment
+    patterns: [reddit, twitter, x.com, what people think, community reaction]
+    lanes: [reddit_rss, x_pulse, bluesky_jetstream, hn_algolia, searxng_forums, youcom_direct]
+    worker_model: haiku
+    topic: social
+
+  - name: counter_evidence_focused
+    patterns: [counter, "what's wrong with", failures, banned, debunked, lawsuit against]
+    lanes: [searxng_forums, reddit_failures, hn_algolia, paid_proxy, courtlistener]
+    worker_model: haiku
+    topic: any
+    bias: counter_evidence
+
+  # --- Datasets / AI artifacts ---
+  - name: dataset_lookup
+    patterns: [dataset, training data, csv, parquet, kaggle dataset]
+    lanes: [kaggle, hf_datasets, searxng_general]
+    worker_model: haiku
+    topic: datasets
+
+  - name: model_lookup
+    patterns: [model card, fine-tune, checkpoint, weights, gguf, mlx model]
+    lanes: [hf_hub, papers_with_code, github_code, gitlab_code, codeberg_code, searxng_general]
+    worker_model: haiku
+    topic: ml_ai
+
+  # --- Personal / Memory ---
+  - name: memory_recall
+    patterns: [check memory, did we discuss, what do i know about, have i seen]
+    lanes: [mentor_memory, claude_memory_files, obsidian]
+    worker_model: haiku
+    topic: personal
+    skip_web: true
+
+  # --- General fallback (lowest priority) ---
+  - name: general_web
+    patterns: [".*"]
+    lanes: [searxng_general, linkup_direct, firecrawl_direct, paid_proxy]
+    worker_model: haiku
+    topic: general
+
+# ---------------------------------------------------------------------------
+# Lane registry — every lane referenced above must appear here.
+# ---------------------------------------------------------------------------
+
+lanes:
+
+  # ------- Web search -------
+  searxng_general:
+    type: api
+    endpoint: "http://localhost:8888/search?q={query}&format=json"
+    auth: none
+    cost_per_call_usd: 0.0
+    rate_limit_qps: 5
+    notes: "Default first lane. Free, local."
+
+  searxng_forums:
+    type: api
+    endpoint: "http://localhost:8888/search?q={query}&format=json&engines=reddit,hackernews,lemmy,stackoverflow,discourse"
+    auth: none
+    cost_per_call_usd: 0.0
+
+  gemini_pro_scout:
+    type: cli
+    command: "agy-cli-1"
+    profile: "agy-cli-1"
+    fallback_command: "agy-cli-2"
+    model_candidates:
+      - "gemini-3-flash"
+    auth: oauth_subscription
+    cost_per_call_usd: 0.0
+    notes: "Front scout lane for /research and /deep-research only. Locked scout = Gemini 3 Flash through agy-cli-1. Never call the retired gemini CLI. AGY RULE: pass the brief as the --print argument; never pass --model/-m; use agy-cli-1's configured default only. Ask Ian if the default fails."
+
+  counter_evidence:
+    type: cli
+    command: "hermes"
+    model: "grok-4.20-0309-reasoning"
+    auth: oauth_subscription
+    cost_per_call_usd: 0.0
+    notes: "Compatibility lane for the Grok-via-Hermes counter-evidence worker."
+
+  paid_proxy:
+    type: api
+    endpoint: "http://localhost:18791/search"
+    method: POST
+    body_template: '{"query":"{query}","numResults":10}'
+    auth: none_local
+    cost_per_call_usd: 0.005
+    notes: "Paid proxy fallback. Routes Linkup -> Tavily -> You.com -> paid Exa backup. Free-first search should exhaust local/free lanes before this."
+
+  linkup_direct:
+    type: api
+    endpoint: "http://localhost:18791/search"
+    method: POST
+    body_template: '{"query":"{query}","numResults":10,"provider":"linkup"}'
+    auth: none_local
+    cost_per_call_usd: 0.005
+    notes: "Direct Linkup via the proxy — uses next live linkup_* key."
+
+  exa_direct:
+    type: api
+    endpoint: "http://localhost:18791/search"
+    method: POST
+    body_template: '{"query":"{query}","numResults":10,"provider":"exa"}'
+    auth: none_local
+    cost_per_call_usd: 0.005
+    notes: "Paid Exa backup via proxy exa_* keys. Do not confuse this with the free keyless mcp.exa.ai endpoint used by buzz."
+
+  exa:
+    type: api
+    endpoint: "http://localhost:18791/search"
+    method: POST
+    body_template: '{"query":"{query}","numResults":10,"provider":"exa"}'
+    auth: none_local
+    cost_per_call_usd: 0.005
+    notes: "Compatibility alias for paid exa_direct."
+
+  youcom_direct:
+    type: api
+    endpoint: "http://localhost:18791/search"
+    method: POST
+    body_template: '{"query":"{query}","numResults":10,"provider":"youcom"}'
+    auth: none_local
+    cost_per_call_usd: 0.005
+    notes: "Direct You.com via the proxy — uses next live youcom_* key. Currently 4 keys all alive but never used in production."
+
+  tavily_direct:
+    type: api
+    endpoint: "http://localhost:18791/search"
+    method: POST
+    body_template: '{"query":"{query}","numResults":10,"provider":"tavily"}'
+    auth: none_local
+    cost_per_call_usd: 0.005
+    notes: "Direct Tavily via the proxy — uses next live tavily_* key."
+
+  firecrawl_direct:
+    type: api
+    endpoint: "http://localhost:18791/search"
+    method: POST
+    body_template: '{"query":"{query}","numResults":10,"provider":"firecrawl"}'
+    auth: none_local
+    cost_per_call_usd: 0.005
+    notes: "Paid Firecrawl fallback via proxy firecrawl_* keys. Treat as last-resort paid credits, not a free lane."
+
+  # ------- Government / legal -------
+  courtlistener:
+    type: api
+    endpoint: "https://www.courtlistener.com/api/rest/v3/search/?q={query}"
+    auth: optional_token
+    cost_per_call_usd: 0.0
+    notes: "CT already has bridge/courtlistener_ingest.py — reuse."
+
+  nasa_techtransfer:
+    type: api
+    endpoint: "https://technology.nasa.gov/api/query/{stream}/{query}"
+    auth: none
+    cost_per_call_usd: 0.0
+    notes: "NASA Tech Transfer patent/software/spinoff search. Stream chosen from query intent."
+
+  dod_oss:
+    type: api
+    endpoint: "https://api.github.com/search/{resource}?q={q_clause}"
+    auth: env:GITHUB_TOKEN
+    headers:
+      Authorization: "Bearer env:GITHUB_TOKEN"
+    cost_per_call_usd: 0.0
+    rate_limit_qps: 1
+    notes: "DoD open-source on GitHub (deptofdefense org). Resource/repos vs code chosen from query intent."
+
+  congress_gov:
+    type: api
+    endpoint: "https://api.congress.gov/v3/?api_key={DATA_GOV_API_KEY}&query={query}"
+    auth: env:DATA_GOV_API_KEY
+    cost_per_call_usd: 0.0
+    notes: "ProPublica API died 2024. congress.gov is the live replacement."
+
+  sec_edgar:
+    type: api
+    endpoint: "https://efts.sec.gov/LATEST/search-index?q={query}&forms=10-K,10-Q,8-K"
+    auth: none
+    cost_per_call_usd: 0.0
+
+  sec_gov:
+    type: scrape
+    endpoint: "https://www.sec.gov/cgi-bin/srqsb?text={query}"
+    auth: none
+
+  fec_gov:
+    type: api
+    endpoint: "https://api.open.fec.gov/v1/?api_key={FEC_API_KEY}&q={query}"
+    auth: env:FEC_API_KEY
+    cost_per_call_usd: 0.0
+
+  openstates:
+    type: api
+    endpoint: "https://v3.openstates.org/bills?q={query}&apikey={OPENSTATES_API_KEY}"
+    auth: env:OPENSTATES_API_KEY
+    cost_per_call_usd: 0.0
+
+  govinfo_gov:
+    type: api
+    endpoint: "https://api.govinfo.gov/search?api_key={DATA_GOV_API_KEY}&query={query}"
+    auth: env:DATA_GOV_API_KEY
+    cost_per_call_usd: 0.0
+
+  fda_gov:
+    type: api
+    endpoint: "https://api.fda.gov/drug/event.json?search={query}&api_key={FDA_API_KEY}"
+    auth: env:FDA_API_KEY
+    cost_per_call_usd: 0.0
+
+  nih_gov:
+    type: api
+    endpoint: "https://api.reporter.nih.gov/v2/projects/search"
+    method: POST
+    body_template: '{"criteria":{"text_search":"{query}"}}'
+    auth: none
+
+  pubmed:
+    type: api
+    endpoint: "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=pubmed&term={query}&retmode=json"
+    auth: none
+    cost_per_call_usd: 0.0
+
+  # ------- Academic / research -------
+  arxiv:
+    type: api
+    endpoint: "https://export.arxiv.org/api/query?search_query=all:{query}&max_results=20"
+    auth: none
+    cost_per_call_usd: 0.0
+
+  semantic_scholar:
+    type: api
+    endpoint: "https://api.semanticscholar.org/graph/v1/paper/search?query={query}&limit=20"
+    auth: optional_key
+    cost_per_call_usd: 0.0
+
+  core:
+    type: api
+    endpoint: "https://api.core.ac.uk/v3/search/works?q={query}&limit=20"
+    auth: optional_key
+    cost_per_call_usd: 0.0
+
+  papers_with_code:
+    type: api
+    endpoint: "https://paperswithcode.com/api/v1/search/?q={query}"
+    auth: none
+    cost_per_call_usd: 0.0
+
+  # ------- Code -------
+  github_code:
+    type: api
+    endpoint: "https://api.github.com/search/code?q={query}"
+    auth: env:GITHUB_TOKEN
+    # headers is the operative auth field; auth stays as documentation.
+    headers:
+      Authorization: "Bearer env:GITHUB_TOKEN"
+    cost_per_call_usd: 0.0
+    rate_limit_qps: 1  # GitHub is strict
+
+  sourcegraph:
+    type: api
+    endpoint: "https://sourcegraph.com/.api/search/stream?q={query}&display=10"
+    auth: none
+    cost_per_call_usd: 0.0
+    notes: "Use when GitHub Code Search rate-limits."
+
+  gitlab_code:
+    type: api
+    endpoint: "https://gitlab.com/api/v4/search?scope=projects&search={query}"
+    auth: env:GITLAB_TOKEN
+    # headers is the operative auth field; auth stays as documentation.
+    headers:
+      PRIVATE-TOKEN: "env:GITLAB_TOKEN"
+    cost_per_call_usd: 0.0
+    rate_limit_qps: 2
+    notes: "GitLab.com global code (blob) search is disabled server-side (403); this lane uses global PROJECT (repo) search instead, which works with a read_api PAT in GITLAB_TOKEN."
+
+  codeberg_code:
+    type: api
+    endpoint: "https://codeberg.org/api/v1/repos/search?q={query}&limit=20"
+    auth: none
+    cost_per_call_usd: 0.0
+    rate_limit_qps: 5
+    notes: "Codeberg (Forgejo) public repo search. No token required."
+
+  sourcehut_code:
+    type: api
+    endpoint: "http://localhost:8888/search?q=site%3Asr.ht+{query}&format=json"
+    auth: none
+    cost_per_call_usd: 0.0
+    notes: "SourceHut has no public global code-search API; routes a site:sr.ht query through local SearXNG (token-free). Authenticated repo/paste access uses the `hut` CLI."
+
+  stack_exchange:
+    type: api
+    endpoint: "https://api.stackexchange.com/2.3/search/advanced?q={query}&site=stackoverflow"
+    auth: optional_key
+    cost_per_call_usd: 0.0
+
+  # ------- AI hub / data -------
+  hf_hub:
+    type: mcp
+    mcp_server: claude_ai_Hugging_Face
+    notes: "Uses HuggingFace MCP (already configured)."
+
+  hf_datasets:
+    type: mcp
+    mcp_server: claude_ai_Hugging_Face
+    notes: "Same MCP, dataset search vs model search."
+
+  kaggle:
+    type: api
+    endpoint: "https://www.kaggle.com/api/v1/datasets/list?search={query}"
+    auth: file:~/.kaggle/kaggle.json
+    cost_per_call_usd: 0.0
+
+  # ------- Real-time social -------
+  reddit_rss:
+    type: api
+    endpoint: "https://www.reddit.com/search.rss?q={query}&sort=relevance&limit=25"
+    auth: none
+    headers:
+      User-Agent: "IanResearch/1.0 (123icpe@gmail.com)"
+    cost_per_call_usd: 0.0
+    response_format: atom
+
+  # DEPRECATED 2026-06-19: JSON endpoint returns 403; use reddit_rss.
+  reddit_json:
+    type: api
+    endpoint: "https://www.reddit.com/search.json?q={query}&t=week"
+    auth: none
+    headers:
+      User-Agent: "IanResearch/1.0 (123icpe@gmail.com)"
+    cost_per_call_usd: 0.0
+
+  reddit_failures:
+    type: api
+    endpoint: "https://www.reddit.com/search.json?q={query}+failed+OR+broken+OR+banned&sort=relevance&t=month"
+    auth: none
+    headers:
+      User-Agent: "IanResearch/1.0 (123icpe@gmail.com)"
+    cost_per_call_usd: 0.0
+
+  x_pulse:
+    type: cli
+    command: "~/bin/x-pulse-research"
+    args: ["{query}"]
+    cost_per_call_usd: 0.01  # Gemini-summarized; small
+    notes: "Real-time X (~last hour). Faster than SearXNG twitter engine."
+
+  bluesky_jetstream:
+    type: cli
+    command: "/Users/cleo/buzz/buzz.py"
+    args: ["{query}", "--quick", "--emit=json", "--search=bluesky"]
+    auth: none
+    cost_per_call_usd: 0.0
+    notes: "Compatibility lane name; uses buzz's working HTTP Bluesky search instead of the dead Jetstream websocket."
+
+  hn_algolia:
+    type: api
+    endpoint: "https://hn.algolia.com/api/v1/search?query={query}&hitsPerPage=30"
+    auth: none
+    cost_per_call_usd: 0.0
+
+  # ------- Personal / memory -------
+  mentor_memory:
+    type: local
+    db_path: "/Users/cleo/lattice/data/agent_state/memory.db"
+    notes: "MENTOR memory; never call retired Brain API at port 18790."
+
+  claude_memory_files:
+    type: local
+    glob: "/Users/cleo/.claude/projects/-Users-cleo/memory/*.md"
+
+  obsidian:
+    type: local
+    glob: "/Users/cleo/ObsidianVault/**/*.md"
+
+# ---------------------------------------------------------------------------
+# Topic authority weights — multiplied into reranker scores per topic.
+# Seed values; expand as needed. Haiku fills unknowns and caches in
+# topic_authority_cache.json (auto-extended by the engine).
+# ---------------------------------------------------------------------------
+
+authority_weights:
+
+  legal:
+    "courtlistener.com": 1.0
+    "supremecourt.gov": 1.0
+    "uscourts.gov": 1.0
+    "law.cornell.edu": 0.95
+    "scotusblog.com": 0.85
+    "reuters.com": 0.8
+    "nytimes.com": 0.7
+    "wikipedia.org": 0.5
+
+  finance_filings:
+    "sec.gov": 1.0
+    "investor.gov": 0.9
+    "wsj.com": 0.85
+    "ft.com": 0.85
+    "bloomberg.com": 0.8
+    "reuters.com": 0.8
+    "yahoo.com": 0.4
+
+  politics:
+    "congress.gov": 1.0
+    "fec.gov": 1.0
+    "openstates.org": 1.0
+    "govinfo.gov": 1.0
+    "propublica.org": 0.9
+    "politico.com": 0.8
+    "reuters.com": 0.85
+    "nytimes.com": 0.8
+
+  medicine:
+    "pubmed.ncbi.nlm.nih.gov": 1.0
+    "nejm.org": 1.0
+    "thelancet.com": 1.0
+    "jamanetwork.com": 0.95
+    "cdc.gov": 0.95
+    "nih.gov": 0.95
+    "fda.gov": 0.95
+    "uptodate.com": 0.85
+    "nytimes.com": 0.5
+
+  academic:
+    "arxiv.org": 0.9
+    "semanticscholar.org": 0.85
+    "doi.org": 0.95
+    "nature.com": 0.95
+    "science.org": 0.95
+    "pnas.org": 0.9
+
+  code:
+    "github.com": 0.9
+    "stackoverflow.com": 0.85
+    "developer.mozilla.org": 0.95
+    "docs.python.org": 1.0
+    "pypi.org": 0.85
+    "rust-lang.org": 1.0
+
+  ml_ai:
+    "huggingface.co": 0.95
+    "paperswithcode.com": 0.9
+    "arxiv.org": 0.9
+    "openai.com": 0.85
+    "anthropic.com": 0.9
+    "ai.googleblog.com": 0.85
+
+  news:
+    "reuters.com": 0.9
+    "apnews.com": 0.9
+    "bbc.com": 0.85
+    "nytimes.com": 0.85
+    "wsj.com": 0.85
+    "ft.com": 0.85
+
+  social:
+    "reddit.com": 0.7  # raw signal — needs verification
+    "news.ycombinator.com": 0.65
+    "bsky.app": 0.6
+    "twitter.com": 0.5
+    "x.com": 0.5
+
+# ---------------------------------------------------------------------------
+# Fail-safe policy — evidence score decisions use per-query decoy calibration.
+# ---------------------------------------------------------------------------
+
+failsafe:
+  # If fewer than this fraction of candidate chunks clear the calibrated gate,
+  # the protocol must abstain rather than synthesize a weak answer.
+  min_pass_fraction: 0.25
+  min_distinct_passing_sources: 2
+  abstention_message: "Insufficient evidence — refine query or expand search."
+
+# ---------------------------------------------------------------------------
+# Gemini 3 Flash scout front stage.
+# ---------------------------------------------------------------------------
+
+scout:
+  lane: gemini_pro_scout
+  worker_model: gemini-flash
+  provider: agy_cli
+  cli_home: "agy-cli-1"
+  cli_profile: "agy-cli-1"
+  health_check_timeout_seconds: 60
+  fail_loud: true
+  discord_alert_channel: alerts
+  discord_alert_channel_id: "1495166380163596298"
+  # AGY RULE: model_candidates are used for health-check logging/cache only.
+  # agy-cli-1 is invoked WITHOUT --model/-m and relies on its configured
+  # default, locked as Gemini 3 Flash. Do not add --model back.
+  model_candidates:
+    - "gemini-3-flash"
+  fallback_flag: "--pro-synthesis-fallback"
+
+fleets:
+  research:
+    worker_count: 3
+    scout_model: gemini-3-flash
+    scout_home: "agy-cli-1"
+    workers:
+      - count: 1
+        model: codex-5.4
+        command_model: gpt-5.4-mini
+      - count: 1
+        model: mistral
+        command_model: mistral-small-latest
+        provider: mistral_free_api
+        key_file: "/Users/cleo/.secrets/mistral-free-keys.env"
+      - count: 1
+        model: grok
+        command_model: grok-4.20-0309-reasoning
+        provider: hermes
+  deep_research:
+    worker_count: 16
+    scout_model: gemini-3-flash
+    scout_home: "agy-cli-1"
+    workers:
+      - count: 5
+        model: haiku
+      - count: 5
+        model: codex-5.4
+        command_model: gpt-5.4-mini
+      - count: 5
+        model: haiku
+      - count: 1
+        model: grok
+        command_model: grok-4.20-0309-reasoning
+        provider: hermes
+
+# ---------------------------------------------------------------------------
+# Recursive planning tiers for /research and /deep-research.
+# ---------------------------------------------------------------------------
+
+recursion:
+  distinct_llm_threshold_for_deep_tier: 3
+  similarity_drop_threshold: 0.86
+  research:
+    deep:
+      max_depth_below_scout: 2
+      subquestions_per_node: 3
+      leaf_search_cap: 12
+      budget_ceiling_usd: 0.50
+    one_llm:
+      max_depth_below_scout: 0
+      subquestions_per_node: 0
+      leaf_search_cap: 4
+      budget_ceiling_usd: 0.15
+  deep_research:
+    deep:
+      max_depth_below_scout: 3
+      subquestions_per_node: 4
+      leaf_search_cap: 25
+      budget_ceiling_usd: 1.50
+    one_llm:
+      max_depth_below_scout: 1
+      subquestions_per_node: 2
+      leaf_search_cap: 6
+      budget_ceiling_usd: 0.30
+
+# ---------------------------------------------------------------------------
+# Cheap judge between reranker and final synthesis.
+# ---------------------------------------------------------------------------
+
+judge:
+  worker_model: haiku
+  require_crystal_check: true
+  drop_off_topic: true
+
+# ---------------------------------------------------------------------------
+# Graduated answer thresholds.
+# ---------------------------------------------------------------------------
+
+graduated_answer:
+  full_confidence_min: 0.70
+  partial_confidence_min: 0.35
+  abstain_confidence_below: 0.35
+
+# ---------------------------------------------------------------------------
+# Reranker (locked decision — do not change without new bakeoff).
+# ---------------------------------------------------------------------------
+
+reranker:
+  model_name: "cross-encoder/ms-marco-MiniLM-L-6-v2"
+  rationale: |
+    Locked 2026-04-26. BAAI/bge-reranker-v2-m3 was 0.35% worse on NDCG@10
+    (0.3930 vs 0.3944) and 5.8% slower (9251ms vs 8744ms) on a real
+    32-query bakeoff. See project_handoff_20260426_2355_5f9ce078.md.
+  blend_alpha: 0.7  # MENTOR_RERANK_BLEND_ALPHA — RRF / reranker blend
+  device: cpu  # M4 ANE-friendly; no GPU required
+
+# ---------------------------------------------------------------------------
+# Worker LLM routing (per Model Law v3, 2026-05-08).
+# ---------------------------------------------------------------------------
+
+worker_routing:
+  search_and_read: haiku  # MANDATORY for search/read/fetch
+  synthesis_short: sonnet  # plain-English explainer
+  synthesis_dense: opus  # find holes, redesign, push back
+  long_document_pile: codex_5_3  # 1M-context reads
+  code_oriented: codex_5_4  # default code worker
+  hard_architecture: codex_5_5  # only when architecture is genuinely hard
+  trivial_mechanical: codex_mini
+
+# ---------------------------------------------------------------------------
+# Iteration policy for /deep-research.
+# ---------------------------------------------------------------------------
+
+iteration:
+  max_loops: 3
+  trigger_on_gap_severities: [high, medium]
+  per_iteration_lane_cap: 2  # don't fire all lanes again — be focused
+  cost_cap_usd_per_session: 1.50  # matches /deep-research cost budget
+
+# ---------------------------------------------------------------------------
+# Proxy backend and fetch politeness for stealth reads.
+# ---------------------------------------------------------------------------
+
+proxy:
+  backend: nordvpn
+  min_interval_s: 2.0
+  sticky_default: false

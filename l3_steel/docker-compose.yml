@@ -1,0 +1,12 @@
+services:
+  steel:
+    image: ghcr.io/steel-dev/steel-browser@sha256:cbf4a44d575c0ae83d00d4ba6bb455d24980de0ced2b06fe8b890e835c923bd1
+    platform: linux/arm64
+    container_name: webread-steel
+    restart: unless-stopped
+    mem_limit: 2g
+    environment:
+      SKIP_FINGERPRINT_INJECTION: "true"
+    ports:
+      - "127.0.0.1:3000:3000"
+      - "127.0.0.1:9223:9223"
