@@ -368,7 +368,7 @@ def test_extract_ask_respects_max_layer_cap(monkeypatch, tmp_path) -> None:
     assert webread_service._L3_LOCK.exists() is False
 
 
-def test_extract_ask_allows_l3_when_max_layer_is_3(monkeypatch, tmp_path) -> None:
+def test_extract_ask_allows_agent_browser_when_max_layer_is_3(monkeypatch, tmp_path) -> None:
     raw_text_path = tmp_path / "allow-l3.txt"
     raw_text_path.write_text("allow l3 body text", encoding="utf-8")
     cache_dir = tmp_path / "cache-allow-l3"
@@ -389,7 +389,7 @@ def test_extract_ask_allows_l3_when_max_layer_is_3(monkeypatch, tmp_path) -> Non
             "author": None,
             "published_date": None,
             "content_hash": "7" * 64,
-            "extraction_method": ExtractionMethod.STEEL_STAGEHAND.value,
+            "extraction_method": ExtractionMethod.AGENT_BROWSER.value,
             "raw_text_path": str(raw_text_path),
             "char_count": len(raw_text_path.read_text(encoding="utf-8")),
             "char_text_preview": "allow l3 body text",
@@ -400,8 +400,8 @@ def test_extract_ask_allows_l3_when_max_layer_is_3(monkeypatch, tmp_path) -> Non
     status_code, payload = webread_service._extract("https://example.com", 3, "summarize the page")
 
     assert status_code == 200
-    assert payload["receipt"]["method"] == ExtractionMethod.STEEL_STAGEHAND.value
-    assert payload["receipt"]["layer"] == 3
+    assert payload["receipt"]["method"] == ExtractionMethod.AGENT_BROWSER.value
+    assert payload["receipt"]["layer"] == 1
     assert webread_service._L3_LOCK.exists() is False
     assert fake_lock.acquire_calls == [webread_service.LOCK_WAIT_S]
 

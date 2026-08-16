@@ -94,6 +94,31 @@ def test_proxy_logs_failed_call(tmp_path, monkeypatch) -> None:
     assert rows[0]["error"] == "proxy unavailable"
 
 
+def test_proxy_normalizes_direct_provider_aliases(tmp_path, monkeypatch) -> None:
+    call_log = tmp_path / "agent_state" / "research-call-log.jsonl"
+    monkeypatch.setattr(logged_search, "CALL_LOG", str(call_log))
+    captured = {}
+
+    def _capture(req, **_kwargs):
+        captured["req"] = req
+        return FakeResponse({"results": [{"url": "https://example.com"}]})
+
+    monkeypatch.setattr(logged_search.urllib.request, "urlopen", _capture)
+
+    result = logged_search.proxy(
+        "test query",
+        provider="tavily_direct",
+        protocol="/research",
+        topic="topic-slug",
+        agent="agent-c",
+    )
+
+    assert result == {"results": [{"url": "https://example.com"}]}
+    assert json.loads(captured["req"].data.decode("utf-8"))["provider"] == "tavily"
+    rows = _read_rows(call_log)
+    assert rows[0]["lane"] == "tavily"
+
+
 def test_searxng_still_returns_when_log_write_fails(monkeypatch) -> None:
     monkeypatch.setattr(logged_search, "CALL_LOG", "/dev/null/research-call-log.jsonl")
     monkeypatch.setattr(

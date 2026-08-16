@@ -48,8 +48,6 @@ def _cache_path(url: str) -> Path:
 
 
 def _layer_for_method(method: str) -> int:
-    if method == ExtractionMethod.STEEL_STAGEHAND.value:
-        return 3
     if method in L2_METHODS:
         return 2
     return 1

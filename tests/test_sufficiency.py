@@ -111,7 +111,7 @@ def _session(
             GeminiProRunRecord(
                 run_type=GeminiProRunKind.SCOUT,
                 success=True,
-                model_id="gemini-3-flash",
+                model_id="Gemini 3.7 Flash (Medium)",
             )
         ],
     )
@@ -122,7 +122,7 @@ class SufficiencyTests(unittest.TestCase):
         client = sufficiency.CLIJsonClient(
             provider_label="flash",
             model_id="gemini-3.1-flash-lite-preview",
-            executable="/Users/cleo/bin/agy-cli-1",
+            executable="agy-cli-1",
             timeout_seconds=5,
         )
         completed = subprocess.CompletedProcess(
@@ -143,7 +143,7 @@ class SufficiencyTests(unittest.TestCase):
         self.assertEqual(
             command,
             [
-                "/Users/cleo/bin/agy-cli-1",
+                "agy-cli-1",
                 "--dangerously-skip-permissions",
                 "--print",
                 "judge prompt",
@@ -151,7 +151,7 @@ class SufficiencyTests(unittest.TestCase):
         )
         self.assertNotIn("input", kwargs)
         self.assertEqual(kwargs["stdin"], subprocess.DEVNULL)
-        self.assertNotEqual(kwargs["cwd"], "/Users/cleo")
+        self.assertNotEqual(kwargs["cwd"], str(Path.home()))
         self.assertTrue(kwargs["cwd"].startswith(tempfile.gettempdir()))
         self.assertEqual(set(env), {"HOME", "LANG", "LC_ALL", "PATH", "TMPDIR"})
         self.assertEqual(env["HOME"], str(Path.home()))
@@ -185,7 +185,7 @@ class SufficiencyTests(unittest.TestCase):
         with patch.object(
             sufficiency,
             "_resolve_agy_executable",
-            return_value="/Users/cleo/bin/agy-cli-1",
+            return_value="agy-cli-1",
         ):
             with patch.object(
                 sufficiency,

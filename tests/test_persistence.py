@@ -85,7 +85,7 @@ def test_save_session_fail_closed_without_gemini_pro_record(tmp_path) -> None:
         with pytest.raises(GeminiProScoutError) as excinfo:
             save_session(session, root=tmp_path)
 
-    assert "Gemini 3 Flash interlock failed closed" in str(excinfo.value)
+    assert "Gemini 3.7 Flash interlock failed closed" in str(excinfo.value)
     assert CANONICAL_GEMINI_PRO_MODEL_ID in str(excinfo.value)
 
 
@@ -106,14 +106,15 @@ def test_save_session_rejects_successful_non_pro_scout_record(tmp_path) -> None:
             save_session(session, root=tmp_path)
 
 
-def test_save_session_accepts_canonical_gemini_pro_scout_record(tmp_path) -> None:
+def test_save_session_accepts_live_agy_gemini_scout_record(tmp_path) -> None:
+    assert CANONICAL_GEMINI_PRO_MODEL_ID == "Gemini 3.7 Flash (Medium)"
     session = _session(
         Protocol.RESEARCH,
         gemini_pro_runs=[
             GeminiProRunRecord(
                 run_type=GeminiProRunKind.SCOUT,
                 success=True,
-                model_id=CANONICAL_GEMINI_PRO_MODEL_ID,
+                model_id="Gemini 3.7 Flash (Medium)",
             )
         ],
     )
@@ -124,7 +125,7 @@ def test_save_session_accepts_canonical_gemini_pro_scout_record(tmp_path) -> Non
     assert path.exists()
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert payload["gemini_pro_runs"][0]["run_type"] == GeminiProRunKind.SCOUT.value
-    assert payload["gemini_pro_runs"][0]["model_id"] == CANONICAL_GEMINI_PRO_MODEL_ID
+    assert payload["gemini_pro_runs"][0]["model_id"] == "Gemini 3.7 Flash (Medium)"
 
 
 def test_save_session_accepts_canonical_pro_synthesis_fallback_record(tmp_path) -> None:

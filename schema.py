@@ -51,6 +51,7 @@ class Protocol(str, Enum):
 
 class ExtractionMethod(str, Enum):
     APIFY = "apify"
+    AGENT_BROWSER = "agent_browser"
     CLOUDFLARE_MARKDOWN = "cloudflare-markdown"
     CRAWL4AI = "crawl4ai"
     CRAWLEE = "crawlee"
@@ -61,10 +62,10 @@ class ExtractionMethod(str, Enum):
     JINA = "jina"
     MARKITDOWN = "markitdown"
     NEWSPAPER4K = "newspaper4k"
+    PUBLISHER_OA = "publisher_oa"
     PYMUPDF = "pymupdf"
     READABILITY = "readability"
     SCRAPLING = "scrapling"
-    STEEL_STAGEHAND = "steel_stagehand"
     TRAFILATURA = "trafilatura"
     UNSTRUCTURED = "unstructured"
     WAYBACK = "wayback"
@@ -180,6 +181,7 @@ class SourceRecord(BaseModel):
     tier: SourceTier
     topic_authority_score: float = Field(ge=0.0, le=1.0)
     counter_evidence_flagged: bool = False
+    listicle_flagged: bool = False  # "best of" style page is flagged, not filtered
     archive_url: Optional[UrlStr] = None  # archive.org snapshot for citation stability
 
     @field_validator("content_hash")

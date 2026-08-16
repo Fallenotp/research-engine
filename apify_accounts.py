@@ -11,16 +11,13 @@ from urllib.parse import urlparse
 
 import requests
 
+from . import paths
+
 
 CAP_USD = 4.90
 USAGE_TTL_S = 300
-MAX_ACCOUNTS = 6
+MAX_ACCOUNTS = 12
 _API = "https://api.apify.com/v2/users/me"
-SECRET_FILES = (
-    Path("/Users/cleo/.secrets/apify.env"),
-    Path("/Users/cleo/.openclaw/.env"),
-    Path("/Users/cleo/consequence-tracker/.env"),
-)
 logger = logging.getLogger("apify_accounts")
 
 
@@ -49,9 +46,22 @@ class ApifyActorRoute:
         return f"/v2/acts/{self.actor_id.replace('/', '~')}/runs"
 
 
-def _read_secret_files(paths: tuple[Path, ...] = SECRET_FILES) -> dict[str, str]:
+def _default_secret_files() -> tuple[Path, ...]:
+    configured = paths.env_file()
+    if configured is not None:
+        return (configured,)
+    return (
+        paths.home_path(".secrets", "apify.env"),
+        paths.home_path(".secrets", "apify-keys.env"),
+        paths.home_path(".openclaw", ".env"),
+        paths.home_path("consequence-tracker", ".env"),
+    )
+
+
+def _read_secret_files(paths_to_read: tuple[Path, ...] | None = None) -> dict[str, str]:
     values: dict[str, str] = {}
-    for path in paths:
+    paths_to_read = paths_to_read or _default_secret_files()
+    for path in paths_to_read:
         try:
             for line in path.read_text(encoding="utf-8").splitlines():
                 line = line.strip()
@@ -104,7 +114,10 @@ def load_accounts_from_env(max_accounts: int = MAX_ACCOUNTS) -> list[ApifyAccoun
     for idx in range(1, max_accounts + 1):
         if len(accounts) >= max_accounts:
             break
-        token = values.get(f"APIFY_TOKEN_{idx}", "")
+        token = values.get(f"APIFY_TOKEN_{idx}", "") or values.get(
+            f"APIFY_KEY_{idx}",
+            "",
+        )
         proxy_pass = values.get(f"APIFY_PROXY_PASS_{idx}", "") or values.get(
             f"APIFY_PROXY_PASSWORD_{idx}",
             "",
@@ -126,10 +139,12 @@ def load_accounts_from_env(max_accounts: int = MAX_ACCOUNTS) -> list[ApifyAccoun
     if len(accounts) < max_accounts:
         logger.warning(
             "apify account rotation loaded %s/%s accounts; checked APIFY_ACCOUNTS, "
-            "APIFY_TOKEN_1..6, APIFY_API_KEY and secret files: %s",
+            "APIFY_TOKEN_1..%s or APIFY_KEY_1..%s, APIFY_API_KEY and %s",
             len(accounts),
             max_accounts,
-            ", ".join(str(path) for path in SECRET_FILES),
+            max_accounts,
+            max_accounts,
+            paths.ENV_FILE_ENV,
         )
 
     return accounts

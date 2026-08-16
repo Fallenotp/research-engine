@@ -20,7 +20,6 @@ import requests
 import trafilatura
 from bs4 import BeautifulSoup
 
-import research_engine.l3_guard as l3_guard
 from research_engine.apify_accounts import (
     AccountPool,
     ApifyAccount,
@@ -28,18 +27,32 @@ from research_engine.apify_accounts import (
     actor_route_for_url,
     load_accounts_from_env,
 )
-from research_engine.schema import ExtractionMethod, SourceTier
 
-try:
-    from readability import Document as ReadabilityDocument
-except Exception:  # pragma: no cover - optional dependency
-    ReadabilityDocument = None
+from . import paths
+from research_engine.schema import ExtractionMethod, SourceTier
+from research_engine.politeness import Politeness, respect_robots
 
 logger = logging.getLogger("extractor")
-CACHE_DIR = Path("/Users/cleo/lattice/research_engine/cache")
-READER_TELEMETRY_LOG = Path("/Users/cleo/lattice/data/agent_state/research-reader-telemetry.jsonl")
-CRAWL4AI_SCRIPT = Path("/Users/cleo/.claude/skills/_lib/crawl4ai_fetch.py")
+CACHE_DIR = paths.package_path("cache")
+READER_TELEMETRY_LOG = paths.telemetry_path("research-reader-telemetry.jsonl")
+BLOCK_STATUSES = frozenset({401, 403, 407, 429, 451})
+BLOCKED_LOG_PATH = paths.telemetry_path("research-blocked-sources.jsonl")
+_BLOCK_EVENTS: list[dict] = []
+CRAWL4AI_SCRIPT = paths.optional_path(paths.CRAWL4AI_SCRIPT_ENV) or paths.package_path(
+    "scripts",
+    "crawl4ai_fetch.py",
+)
 HTML_SUFFIXES = {".html", ".htm", ".xhtml"}
+_LISTICLE_TITLE_RE = re.compile(
+    r"(?:\b(?:best|top|cheapest|worst|greatest)\b[^.]{0,40}?\b(?:\d{1,3}|picks|list|roundup)\b)"
+    r"|(?:\b\d{1,3}\s+(?:best|top|greatest)\b)"
+    r"|(?:\b(?:best|top)\s+\d{1,3}\b)",
+    re.IGNORECASE,
+)
+_LISTICLE_URL_RE = re.compile(
+    r"(?:/(?:top|best)(?:[-/]|$))|(?:/(?:top|best)-\d{1,3}(?:-|/|$))|(?:-vs-)",
+    re.IGNORECASE,
+)
 MARKITDOWN_SUFFIXES = {
     ".doc",
     ".docx",
@@ -102,7 +115,6 @@ REQUEST_HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
     )
 }
-APIFY_PROXY_BASE_URL = "http://127.0.0.1:18793"
 APIFY_CAMOUFOX_ACTOR = "apify/camoufox-scraper"
 APIFY_CAMOUFOX_RUNS_PATH = "/v2/acts/apify~camoufox-scraper/runs"
 APIFY_OUTPUT_RECORD_KEY = "OUTPUT"
@@ -123,7 +135,7 @@ async function pageFunction(context) {
 """.strip()
 FIRECRAWL_SCRAPE_URL = "https://api.firecrawl.dev/v2/scrape"
 FIRECRAWL_ADVANCE_STATUSES = {401, 403, 429}
-WEBREAD_SIDECAR_URL = "http://127.0.0.1:7799/extract"
+AGENT_BROWSER_BIN = "/opt/homebrew/bin/agent-browser"
 _PROXY_BACKEND = None
 _POLITENESS = None
 _APIFY_ACCOUNT_POOL = None
@@ -143,6 +155,21 @@ TRACKING_QUERY_PARAMS = {
     "utm_source",
     "utm_term",
 }
+PUBLISHER_HOSTS = (
+    "sciencedirect.com",
+    "researchgate.net",
+    "mdpi.com",
+    "springer.com",
+    "wiley.com",
+    "tandfonline.com",
+    "sagepub.com",
+    "nature.com",
+    "cell.com",
+    "jstor.org",
+    "academic.oup.com",
+)
+PAPER_DOI_RE = re.compile(r"10\.\d{4,9}/[^\s\"'<>&]+", re.IGNORECASE)
+PAPER_PII_RE = re.compile(r"S\d{15,17}", re.IGNORECASE)
 __all__ = ["compact_search_results", "extract_clean_text"]
 
 
@@ -162,6 +189,62 @@ def _source_ref(url_or_path: str) -> tuple[str, Path | None]:
 
 def _domain(source_url: str) -> str:
     return urlparse(source_url).netloc.lower() or "local"
+
+
+def _plausibly_paper_url(source_url: str) -> bool:
+    parsed = urlparse(source_url)
+    host = (parsed.hostname or "").lower()
+    return bool(PAPER_DOI_RE.search(source_url) or PAPER_PII_RE.search(parsed.path)) or any(
+        host == publisher or host.endswith(f".{publisher}")
+        for publisher in PUBLISHER_HOSTS
+    )
+
+
+def note_block(
+    url: str,
+    *,
+    method: str,
+    reason: str,
+    status: int | None = None,
+) -> None:
+    event = {
+        "url": url,
+        "domain": _domain(url),
+        "method": method,
+        "reason": reason,
+        "status": status,
+        "listicle_flagged": _is_listicle("", url),
+        "at": datetime.now(timezone.utc).isoformat(),
+    }
+    _BLOCK_EVENTS.append(event)
+    logger.warning(
+        "blocked source url=%s method=%s reason=%s status=%s",
+        url,
+        method,
+        reason,
+        status,
+    )
+    try:
+        BLOCKED_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with BLOCKED_LOG_PATH.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event, default=str) + "\n")
+    except Exception as exc:  # pragma: no cover - best-effort side log
+        logger.debug("failed to append blocked-source log: %s", exc)
+
+
+def blocked_events() -> list[dict]:
+    return list(_BLOCK_EVENTS)
+
+
+def clear_blocked_events() -> None:
+    _BLOCK_EVENTS.clear()
+
+
+def _is_listicle(title: str, url: str) -> bool:
+    if _LISTICLE_TITLE_RE.search(title):
+        return True
+    normalized_path = urlparse(url).path.lower().replace("_", "-")
+    return bool(_LISTICLE_URL_RE.search(normalized_path))
 
 
 def _proxy_config() -> dict:
@@ -187,8 +270,6 @@ def _get_proxy_backend():
 def _get_politeness():
     global _POLITENESS
     if _POLITENESS is None:
-        from research_engine.politeness import Politeness
-
         config = _proxy_config()
         _POLITENESS = Politeness(min_interval_s=float(config.get("min_interval_s", 2.0)))
     return _POLITENESS
@@ -404,30 +485,10 @@ def _get(
     request_headers = dict(REQUEST_HEADERS)
     if headers:
         request_headers.update(headers)
-    return requests.get(url, headers=request_headers, timeout=timeout)
-
-
-def _apify_proxy_request(
-    method: str,
-    path: str,
-    *,
-    json_body: dict | None = None,
-    params: dict[str, str | int] | None = None,
-    timeout: int = 60,
-):
-    response = requests.request(
-        method,
-        f"{APIFY_PROXY_BASE_URL}{path}",
-        headers=REQUEST_HEADERS,
-        json=json_body,
-        params=params,
-        timeout=timeout,
-    )
-    response.raise_for_status()
-    try:
-        return response.json()
-    except ValueError:
-        return response.text
+    response = requests.get(url, headers=request_headers, timeout=timeout)
+    if response.status_code in BLOCK_STATUSES:
+        note_block(url, method="http_get", reason="http_status", status=response.status_code)
+    return response
 
 
 def _apify_api_request(
@@ -533,7 +594,10 @@ def _tier_text(cleaned_text: str, tier: SourceTier | None) -> tuple[str, int]:
     return trimmed_text, min(len(cleaned_text), 1500)
 
 
-def _claim_seen_url(seen_urls_path: Path, source_url: str) -> bool:
+def _claim_seen_url(seen_urls_path: Path | str, source_url: str) -> bool:
+    if isinstance(seen_urls_path, str):
+        from pathlib import Path as PathLib
+        seen_urls_path = PathLib(seen_urls_path)
     canonical_url = _canonical_seen_url(source_url)
     seen_urls_path.parent.mkdir(parents=True, exist_ok=True)
     with seen_urls_path.open("a+", encoding="utf-8") as handle:
@@ -575,6 +639,7 @@ def _record(
         "raw_text_path": raw_text_path,
         "char_count": returned_char_count,
         "char_text_preview": returned_text[:200],
+        "listicle_flagged": _is_listicle(str(payload["title"]).strip(), source_url),
     }
     if extra:
         record.update(extra)
@@ -699,7 +764,17 @@ def _markitdown_payload(source_url: str, local_path: Path | None) -> dict[str, s
 
 
 def _jina(source_url: str) -> dict[str, str | None]:
-    response = _get(f"https://r.jina.ai/{source_url}", timeout=45)
+    from research_engine.fetch_proxy import env_value
+
+    token = env_value("JINA_API_KEY")
+    if token:
+        response = _get(
+            f"https://r.jina.ai/{source_url}",
+            timeout=45,
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    else:
+        response = _get(f"https://r.jina.ai/{source_url}", timeout=45)
     response.raise_for_status()
     title = ""
     author = None
@@ -849,7 +924,7 @@ def _crawl4ai(source_url: str) -> dict[str, str | None]:
         logger.debug("crawl4ai meta-probe failed for %s: %s", source_url, exc)
         meta = {}
     result = subprocess.run(
-        ["/Users/cleo/lattice/.venv/bin/python", str(CRAWL4AI_SCRIPT), source_url],
+        [paths.require_executable(paths.PYTHON_BIN_ENV, "python3"), str(CRAWL4AI_SCRIPT), source_url],
         check=False,
         capture_output=True,
         text=True,
@@ -921,8 +996,9 @@ def _crawlee_http(
     config = _proxy_config()
     use_sticky = bool(config.get("sticky_default", False)) if sticky is None else sticky
     politeness = _get_politeness()
-    if not politeness.allowed(source_url):
+    if respect_robots() and not politeness.allowed(source_url):
         logger.info("robots.txt disallows %s; skipping crawlee", source_url)
+        note_block(source_url, method="crawlee", reason="robots_disallow")
         return {}
 
     domain = _domain(source_url)
@@ -960,8 +1036,9 @@ def _scrapling_stealth(
     config = _proxy_config()
     use_sticky = bool(config.get("sticky_default", False)) if sticky is None else sticky
     politeness = _get_politeness()
-    if not politeness.allowed(source_url):
+    if respect_robots() and not politeness.allowed(source_url):
         logger.info("robots.txt disallows %s; skipping scrapling", source_url)
+        note_block(source_url, method="scrapling", reason="robots_disallow")
         return {}
 
     domain = _domain(source_url)
@@ -1009,174 +1086,71 @@ def _scrapling_stealth(
         return {}
 
 
-def _steel_stagehand(
-    source_url: str,
-    instruction: str | None = None,
-) -> dict[str, str | None] | None:
-    ok, code = l3_guard.preflight()
-    if not ok:
-        l3_guard.log_attempt(
-            url=source_url,
-            decision="blocked",
-            reason=code,
-            rung="steel_stagehand",
-        )
-        return None
-
+def _agent_browser(source_url: str) -> dict[str, str | None] | None:
     politeness = _get_politeness()
-    if not politeness.allowed(source_url):
-        logger.info("robots.txt disallows %s; skipping steel_stagehand", source_url)
-        return None
-
-    politeness.wait(_domain(source_url))
-    request_body: dict[str, str] = {"url": source_url}
-    if instruction:
-        request_body["instruction"] = instruction
-    timeout = int(os.environ.get("WEBREAD_L3_TIMEOUT_S", "120"))
-
-    try:
-        response = requests.post(
-            os.environ.get("WEBREAD_SIDECAR_URL", WEBREAD_SIDECAR_URL),
-            headers={"Content-Type": "application/json", **REQUEST_HEADERS},
-            json=request_body,
-            timeout=timeout,
-        )
-        response.raise_for_status()
-        data = response.json()
-    except Exception as exc:
-        l3_guard.record_failure()
-        try:
-            subprocess.run(
-                ["docker", "kill", "webread-steel"],
-                capture_output=True,
-                timeout=10,
-            )
-        except Exception:
-            pass
-        l3_guard.log_attempt(
-            url=source_url,
-            decision="failed",
-            reason=str(exc),
-            rung="steel_stagehand",
-        )
-        logger.info("steel_stagehand failed for %s: %s", source_url, exc)
-        return None
-
-    if not isinstance(data, dict) or data.get("error"):
-        l3_guard.record_failure()
-        l3_guard.log_attempt(
-            url=source_url,
-            decision="failed",
-            reason="sidecar error/invalid response",
-            rung="steel_stagehand",
-        )
-        return None
-
-    body = str(data.get("text") or "").strip()
-    if not body:
-        l3_guard.record_failure()
-        l3_guard.log_attempt(
-            url=source_url,
-            decision="failed",
-            reason="empty body",
-            rung="steel_stagehand",
-        )
-        return None
-
-    title = str(data.get("title") or _title_from_text(body)).strip()
-    author = str(data.get("author") or "").strip() or None
-    published_date = (
-        str(data.get("published_date") or data.get("publishedDate") or "").strip() or None
-    )
-    l3_guard.record_success()
-    return _payload(title, body, author, published_date)
-
-
-def _steel_scrape(source_url: str) -> dict[str, str | None] | None:
-    ok, code = l3_guard.preflight()
-    if not ok:
-        l3_guard.log_attempt(
-            url=source_url,
-            decision="blocked",
-            reason=code,
-            rung="steel_scrape",
-        )
-        return None
-
-    politeness = _get_politeness()
-    if not politeness.allowed(source_url):
-        logger.info("robots.txt disallows %s; skipping steel_scrape", source_url)
+    if respect_robots() and not politeness.allowed(source_url):
+        logger.info("robots.txt disallows %s; skipping agent_browser", source_url)
+        note_block(source_url, method="agent_browser", reason="robots_disallow")
         return None
 
     politeness.wait(_domain(source_url))
     timeout = int(os.environ.get("WEBREAD_L3_TIMEOUT_S", "120"))
+    session_seed = f"{source_url}:{os.getpid()}:{time.time_ns()}"
+    session_hash = hashlib.sha256(session_seed.encode("utf-8")).hexdigest()[:16]
+    session_name = f"reader-{os.getpid()}-{session_hash}"
 
-    try:
-        response = requests.post(
-            os.environ.get("STEEL_SCRAPE_URL", "http://127.0.0.1:3000/v1/scrape"),
-            headers={"Content-Type": "application/json", **REQUEST_HEADERS},
-            json={"url": source_url, "format": ["markdown", "html"]},
+    def run_command(*args: str, json_output: bool = True) -> subprocess.CompletedProcess[str]:
+        command = [AGENT_BROWSER_BIN, "--session", session_name, *args]
+        if json_output:
+            command.append("--json")
+        return subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
             timeout=timeout,
         )
-        response.raise_for_status()
-        data = response.json()
-    except Exception as exc:
-        l3_guard.record_failure()
+
+    def read_envelope(*args: str) -> dict[str, object] | None:
+        response = run_command(*args)
         try:
-            subprocess.run(
-                ["docker", "kill", "webread-steel"],
-                capture_output=True,
-                timeout=10,
-            )
+            envelope = json.loads(response.stdout)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(envelope, dict) or envelope.get("success") is not True:
+            return None
+        data = envelope.get("data")
+        return data if isinstance(data, dict) else None
+
+    try:
+        open_data = read_envelope("open", source_url)
+        if open_data is None:
+            return None
+        title_data = read_envelope("get", "title")
+        if title_data is None:
+            return None
+        text_data = read_envelope("get", "text", "body")
+        if text_data is None:
+            return None
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        logger.info("agent_browser failed for %s: %s", source_url, exc)
+        return None
+    finally:
+        try:
+            run_command("close", json_output=False)
+        except FileNotFoundError:
+            pass
         except Exception:
             pass
-        l3_guard.log_attempt(
-            url=source_url,
-            decision="failed",
-            reason=str(exc),
-            rung="steel_scrape",
-        )
-        logger.info("steel_scrape failed for %s: %s", source_url, exc)
-        return None
 
-    content = data.get("content") if isinstance(data, dict) else None
-    if not isinstance(content, dict):
-        l3_guard.record_failure()
-        l3_guard.log_attempt(
-            url=source_url,
-            decision="failed",
-            reason="empty scrape",
-            rung="steel_scrape",
-        )
-        return None
-
-    body = str(content.get("markdown") or "").strip()
+    body = str(text_data.get("text") or "").strip()
     if not body:
-        html = str(content.get("html") or "").strip()
-        if html:
-            body = BeautifulSoup(html, "html.parser").get_text("\n").strip()
-    if not body:
-        l3_guard.record_failure()
-        l3_guard.log_attempt(
-            url=source_url,
-            decision="failed",
-            reason="empty scrape",
-            rung="steel_scrape",
-        )
         return None
 
-    metadata = data.get("metadata") if isinstance(data, dict) else None
-    title = (
-        str(metadata.get("title") or "").strip()
-        if isinstance(metadata, dict)
-        else ""
-    ) or _title_from_text(body)
-    l3_guard.record_success()
-    l3_guard.log_attempt(
-        url=source_url,
-        decision="success",
-        rung="steel_scrape",
-    )
+    title = str(title_data.get("title") or open_data.get("title") or "").strip()
+    if not title:
+        title = _title_from_text(body)
     return _payload(title, body, author=None, published_date=None)
 
 
@@ -1328,35 +1302,6 @@ def _apify_actor_fetch(source_url: str) -> dict[str, str | None]:
     except Exception as exc:
         logger.info("apify fallback failed for %s: %s", source_url, exc)
         return {}
-
-
-def _curl_last(source_url: str) -> tuple[str, dict[str, str | None]]:
-    result = subprocess.run(
-        ["curl", "-LfsS", source_url],
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=45,
-    )
-    if result.returncode != 0:
-        return "", {}
-    html = result.stdout
-    meta = _html_meta(html)
-    if ReadabilityDocument is not None:
-        body = BeautifulSoup(
-            ReadabilityDocument(html).summary(html_partial=True), "html.parser"
-        ).get_text("\n")
-        method = ExtractionMethod.READABILITY.value
-    else:
-        body = BeautifulSoup(html, "html.parser").get_text("\n")
-        method = ExtractionMethod.CURL.value
-    payload = _payload(
-        str(meta.get("title") or "").strip(),
-        body,
-        meta.get("author"),
-        meta.get("published_date"),
-    )
-    return method, payload
 
 
 def _local_text(local_path: Path) -> dict[str, str | None]:
@@ -1529,9 +1474,6 @@ def extract_clean_text(
         if payload:
             return finalize(ExtractionMethod.GITINGEST.value, payload)
     if _is_web_url(source_url):
-        effective_allow_l3 = (
-            allow_l3 if allow_l3 is not None else os.environ.get("WEBREAD_ALLOW_L3") == "1"
-        )
         if actor_route_for_url(source_url):
             payload = _attempt(
                 ExtractionMethod.APIFY.value,
@@ -1545,15 +1487,13 @@ def extract_clean_text(
                 return finalize(ExtractionMethod.APIFY.value, payload, extra=extra)
             return None
 
-        if effective_allow_l3 and instruction:
-            payload = _attempt(
-                ExtractionMethod.STEEL_STAGEHAND.value,
-                lambda: _steel_stagehand(source_url, instruction=instruction),
-                min_chars=min_chars,
-            )
-            if payload:
-                return finalize(ExtractionMethod.STEEL_STAGEHAND.value, payload)
-
+        payload = _attempt(
+            ExtractionMethod.TRAFILATURA.value,
+            lambda: _trafilatura(source_url, None),
+            min_chars=min_chars,
+        )
+        if payload:
+            return finalize(ExtractionMethod.TRAFILATURA.value, payload)
         payload = _attempt(
             ExtractionMethod.CRAWL4AI.value,
             lambda: _crawl4ai(source_url),
@@ -1561,6 +1501,13 @@ def extract_clean_text(
         )
         if payload:
             return finalize(ExtractionMethod.CRAWL4AI.value, payload)
+        payload = _attempt(
+            ExtractionMethod.JINA.value,
+            lambda: _jina(source_url),
+            min_chars=min_chars,
+        )
+        if payload:
+            return finalize(ExtractionMethod.JINA.value, payload)
         payload = _attempt(
             ExtractionMethod.CRAWLEE.value,
             lambda: _crawlee_http(source_url),
@@ -1581,14 +1528,13 @@ def extract_clean_text(
             if payload.get("fetch_meta"):
                 extra = {"fetch_meta": payload["fetch_meta"]}
             return finalize(ExtractionMethod.SCRAPLING.value, payload, extra=extra)
-        if effective_allow_l3 and not instruction:
-            payload = _attempt(
-                ExtractionMethod.STEEL_STAGEHAND.value,
-                lambda: _steel_scrape(source_url),
-                min_chars=min_chars,
-            )
-            if payload:
-                return finalize(ExtractionMethod.STEEL_STAGEHAND.value, payload)
+        payload = _attempt(
+            ExtractionMethod.AGENT_BROWSER.value,
+            lambda: _agent_browser(source_url),
+            min_chars=min_chars,
+        )
+        if payload:
+            return finalize(ExtractionMethod.AGENT_BROWSER.value, payload)
         payload = _attempt(
             ExtractionMethod.FIRECRAWL.value,
             lambda: _firecrawl(source_url),
@@ -1596,6 +1542,26 @@ def extract_clean_text(
         )
         if payload:
             return finalize(ExtractionMethod.FIRECRAWL.value, payload)
+        if _plausibly_paper_url(source_url):
+            from research_engine.publisher_fallback import try_publisher_fallback
+
+            payload = _attempt(
+                ExtractionMethod.PUBLISHER_OA.value,
+                lambda: try_publisher_fallback(source_url),
+                min_chars=min_chars,
+            )
+            if payload:
+                return finalize(ExtractionMethod.PUBLISHER_OA.value, payload)
+        from research_engine.wayback_fallback import try_wayback
+
+        payload = _attempt(
+            ExtractionMethod.WAYBACK.value,
+            lambda: try_wayback(source_url),
+            min_chars=min_chars,
+        )
+        if payload:
+            return finalize(ExtractionMethod.WAYBACK.value, payload)
+        note_block(source_url, method="ladder", reason="all_rungs_failed")
         return None
 
     payload = _attempt(

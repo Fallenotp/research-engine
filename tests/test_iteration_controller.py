@@ -12,9 +12,13 @@ from research_engine.iteration_controller import (
     RecursionTierConfig,
     RecursiveNode,
     RecursivePlan,
+    decide_next_iteration,
+    detect_gaps,
     expand_recursive_node,
     judge_findings,
+    plan_recursive_research,
 )
+from research_engine.router import load_router
 from research_engine.schema import (
     AnswerKind,
     EvidenceChunk,
@@ -49,12 +53,19 @@ class FakeCheckerClient:
         return response
 
 
-def _source(index: int, *, raw_text: str | None = None) -> SourceRecord:
+def _source(
+    index: int,
+    *,
+    raw_text: str | None = None,
+    published_date: str | None = None,
+    counter_evidence_flagged: bool = False,
+) -> SourceRecord:
     text = raw_text or f"source text {index}"
     return SourceRecord(
         url=f"https://source-{index}.example/article",
         domain=f"source-{index}.example",
         title=f"Source {index}",
+        published_date=published_date,
         fetched_at=datetime.now(timezone.utc),
         content_hash=SourceRecord.hash_text(text),
         extraction_method=ExtractionMethod.CURL,
@@ -62,6 +73,7 @@ def _source(index: int, *, raw_text: str | None = None) -> SourceRecord:
         char_count=len(text),
         tier=SourceTier.T1,
         topic_authority_score=1.0,
+        counter_evidence_flagged=counter_evidence_flagged,
     )
 
 
@@ -152,6 +164,156 @@ class IterationControllerTests(unittest.TestCase):
                 )
 
                 self.assertEqual(children, [])
+
+    def test_decide_next_iteration_returns_iterate_for_weak_session_and_not_for_strong(self) -> None:
+        router = load_router()
+
+        strong_source_a = _source(201, raw_text="strong a", counter_evidence_flagged=True)
+        strong_source_b = _source(202, raw_text="strong b")
+        strong_chunk_a = _chunk(strong_source_a, "Claim A")
+        strong_chunk_b = _chunk(strong_source_b, "Claim A")
+        strong_session = ResearchSession(
+            protocol=Protocol.DEEP_RESEARCH,
+            question="What changed this morning in the merger talks?",
+            final_status=FinalStatus.COMPLETE,
+            answer="A grounded answer.",
+            sources=[strong_source_a, strong_source_b],
+            evidence_chunks=[strong_chunk_a, strong_chunk_b],
+            rerank_passed_count=2,
+            rerank_failed_count=0,
+            cross_model_verifications=[
+                {
+                    "claim": "Claim A",
+                    "grounding_chunks": [strong_chunk_a.chunk_id],
+                    "analytical_lens_passed": True,
+                    "analytical_lens_notes": "ok",
+                    "creative_lens_passed": True,
+                    "creative_lens_notes": "ok",
+                    "skeptical_lens_passed": True,
+                    "skeptical_lens_notes": "ok",
+                }
+            ],
+        )
+
+        stale_date = "2026-08-10"
+        weak_source_a = _source(203, raw_text="weak a", published_date=stale_date)
+        weak_source_b = _source(204, raw_text="weak b", published_date=stale_date)
+        weak_chunk_a = _chunk(weak_source_a, "Claim B")
+        weak_chunk_b = _chunk(weak_source_b, "Claim B")
+        weak_session = ResearchSession(
+            protocol=Protocol.DEEP_RESEARCH,
+            question="What was announced today about the merger?",
+            final_status=FinalStatus.COMPLETE,
+            answer="Thin answer.",
+            sources=[weak_source_a, weak_source_b],
+            evidence_chunks=[weak_chunk_a, weak_chunk_b],
+            rerank_passed_count=1,
+            rerank_failed_count=3,
+            open_questions=["What did regulators say?"],
+            cross_model_verifications=[],
+        )
+
+        strong_decision = decide_next_iteration(strong_session.question, strong_session)
+        weak_decision = decide_next_iteration(weak_session.question, weak_session)
+
+        self.assertEqual(router.iteration_policy.max_loops, 3)
+        self.assertFalse(strong_decision.should_iterate)
+        self.assertEqual(strong_decision.reason, "no triggering gaps")
+        self.assertTrue(weak_decision.should_iterate)
+        self.assertIn("stale data", weak_decision.reason)
+        self.assertTrue(any(gap.triggered_iteration for gap in weak_session.gaps_detected))
+
+    def test_detect_gaps_flags_stale_source_for_freshness_bounded_route(self) -> None:
+        stale_source = _source(301, raw_text="stale", published_date="2026-08-10")
+        stale_chunk = _chunk(stale_source, "Merger claim")
+        session = ResearchSession(
+            protocol=Protocol.DEEP_RESEARCH,
+            question="What was announced today about the merger?",
+            final_status=FinalStatus.COMPLETE,
+            answer="Answer.",
+            sources=[stale_source],
+            evidence_chunks=[stale_chunk],
+            rerank_passed_count=1,
+            rerank_failed_count=0,
+            cross_model_verifications=[
+                {
+                    "claim": "Merger claim",
+                    "grounding_chunks": [stale_chunk.chunk_id],
+                    "analytical_lens_passed": True,
+                    "analytical_lens_notes": "ok",
+                    "creative_lens_passed": True,
+                    "creative_lens_notes": "ok",
+                    "skeptical_lens_passed": True,
+                    "skeptical_lens_notes": "ok",
+                }
+            ],
+        )
+
+        gaps = detect_gaps(session)
+
+        self.assertIn(
+            "stale data",
+            [gap.detection_reason for gap in gaps],
+        )
+
+    def test_detect_gaps_treats_offset_timestamp_as_utc_instead_of_relabeling_it(self) -> None:
+        fresh_offset_source = _source(
+            302,
+            raw_text="fresh offset",
+            published_date="2026-08-14T23:30:00-06:00",
+        )
+        fresh_offset_chunk = _chunk(fresh_offset_source, "Fresh claim")
+        session = ResearchSession(
+            protocol=Protocol.DEEP_RESEARCH,
+            question="What was announced today about the merger?",
+            final_status=FinalStatus.COMPLETE,
+            answer="Answer.",
+            sources=[fresh_offset_source],
+            evidence_chunks=[fresh_offset_chunk],
+            rerank_passed_count=1,
+            rerank_failed_count=0,
+            cross_model_verifications=[
+                {
+                    "claim": "Fresh claim",
+                    "grounding_chunks": [fresh_offset_chunk.chunk_id],
+                    "analytical_lens_passed": True,
+                    "analytical_lens_notes": "ok",
+                    "creative_lens_passed": True,
+                    "creative_lens_notes": "ok",
+                    "skeptical_lens_passed": True,
+                    "skeptical_lens_notes": "ok",
+                }
+            ],
+        )
+
+        with patch("research_engine.iteration_controller.datetime") as mocked_datetime:
+            mocked_datetime.now.return_value = datetime(2026, 8, 15, 4, 0, tzinfo=timezone.utc)
+            mocked_datetime.fromisoformat.side_effect = datetime.fromisoformat
+            gaps = detect_gaps(session)
+
+        self.assertNotIn(
+            "stale data",
+            [gap.detection_reason for gap in gaps],
+        )
+
+    def test_plan_recursive_research_returns_no_roots_when_tier_depth_is_zero(self) -> None:
+        session = ResearchSession(
+            protocol=Protocol.RESEARCH,
+            question="How should a launch work?",
+            final_status=FinalStatus.COMPLETE,
+            answer="Draft answer.",
+        )
+
+        plan = plan_recursive_research(
+            session,
+            load_router(),
+            ["Question A", "Question B", "Question C"],
+        )
+
+        self.assertEqual(plan.tier.max_depth_below_scout, 0)
+        self.assertEqual(plan.roots, [])
+        self.assertEqual(plan.leaf_count, 0)
+        self.assertEqual(plan.asked_questions, [])
 
     def test_judge_findings_keeps_supported_session(self) -> None:
         session = _session(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import re
 import subprocess
@@ -13,30 +14,42 @@ from typing import Literal
 from urllib.parse import urlparse
 
 import research_engine.logged_search as logged_search
+
+from . import paths
 from research_engine.extractor import compact_search_results, extract_clean_text
+from research_engine.research_cli import (
+    SESSION_CONFIDENCE_AUTHORITY_WEIGHT,
+    SESSION_CONFIDENCE_SOURCE_TARGET,
+    SESSION_CONFIDENCE_SOURCE_WEIGHT,
+    TIER_1_AUTHORITY_MIN,
+    clamp_unit_interval,
+    graduated_answer_thresholds,
+)
+from research_engine.router import source_authority_score
+from research_engine.router import load_router
 from research_engine.schema import ExtractionMethod, SourceRecord, SourceTier
 
 
 GroundStatus = Literal["grounded", "partial", "not_found"]
 
 GROUNDING_PROTOCOL = "/grounding"
-DEFAULT_GROK_BIN = Path("/Users/cleo/.local/bin/hermes")
-DEFAULT_GROK_MODEL = "grok-4.20-0309-reasoning"
-DEFAULT_AGY_BIN = Path("/Users/cleo/bin/agy-cli-1")
-DEFAULT_AGY_FALLBACKS = (
-    Path("/Users/cleo/bin/agy-cli-2"),
-    Path("/Users/cleo/.local/bin/agy"),
-)
+DEFAULT_GROK_BIN = paths.home_path("bin", "grok")
+DEFAULT_GROK_MODEL = "grok-4.5"
 AGY_SKIP_PERMISSIONS_FLAG = "--dangerously-skip-permissions"
-TELEMETRY_PATH = Path(
-    os.environ.get("NO_BLUFF_TELEMETRY_PATH", "/Users/cleo/.claude/no-bluff-telemetry.jsonl")
+TELEMETRY_PATH = paths.optional_path(paths.NO_BLUFF_TELEMETRY_ENV) or paths.telemetry_path(
+    "no-bluff-telemetry.jsonl"
 )
 MAX_SEARCH_RESULTS = 5
 MAX_SOURCE_URLS = 3
 SOURCE_EXCERPT_CHARS = 2500
 LOOKUP_TIMEOUT_SECONDS = 60
+TIER_2_AUTHORITY_MIN = 0.5
 URL_RE = re.compile(r"https?://[^\s<>()\]]+")
 JSON_RE = re.compile(r"\{[\s\S]*\}")
+GROUNDING_NOT_FOUND_CONFIDENCE = 0.0
+GROUNDING_SOURCE_WEIGHT_TOTAL = (
+    SESSION_CONFIDENCE_SOURCE_WEIGHT + SESSION_CONFIDENCE_AUTHORITY_WEIGHT
+)
 STOPWORDS = {
     "a",
     "an",
@@ -74,6 +87,8 @@ __all__ = [
     "main",
 ]
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass(frozen=True, slots=True)
 class GroundSource:
@@ -103,6 +118,22 @@ class _VerifiedSource:
     record: SourceRecord
     full_text: str
     snippet_hint: str
+
+
+def _authority_tier(
+    domain: str,
+    *,
+    topic: str | None,
+    authority_score: float | None = None,
+) -> SourceTier:
+    if topic is None:
+        return SourceTier.T2
+    score = source_authority_score(domain, topic) if authority_score is None else authority_score
+    if score >= TIER_1_AUTHORITY_MIN:
+        return SourceTier.T1
+    if score >= TIER_2_AUTHORITY_MIN:
+        return SourceTier.T2
+    return SourceTier.T3
 
 
 def ground(query: str, *, topic_slug: str | None = None) -> GroundResult:
@@ -138,6 +169,7 @@ def ground(query: str, *, topic_slug: str | None = None) -> GroundResult:
             search_urls,
             seen_urls_path=seen_urls_path,
             snippet_by_url=search_snippets,
+            topic=topic,
         )
         used_fallback = False
         if _should_escalate(search_results, cleaned_query) or not sources:
@@ -148,6 +180,7 @@ def ground(query: str, *, topic_slug: str | None = None) -> GroundResult:
                     seen_urls_path=seen_urls_path,
                     backends_used=backends_used,
                     backend_answers=backend_answers,
+                    topic=topic,
                 ),
             )
             used_fallback = True
@@ -166,6 +199,7 @@ def ground(query: str, *, topic_slug: str | None = None) -> GroundResult:
                     seen_urls_path=seen_urls_path,
                     backends_used=backends_used,
                     backend_answers=backend_answers,
+                    topic=topic,
                 ),
             )
             synthesized = _synthesize_from_sources(
@@ -269,6 +303,7 @@ def _lookup_fallback_sources(
     seen_urls_path: Path,
     backends_used: list[str],
     backend_answers: list[str],
+    topic: str | None,
 ) -> list[_VerifiedSource]:
     collected: list[_VerifiedSource] = []
     for backend in ("grok", "gemini"):
@@ -284,6 +319,7 @@ def _lookup_fallback_sources(
                 lookup.urls[:MAX_SOURCE_URLS],
                 seen_urls_path=seen_urls_path,
                 snippet_by_url={},
+                topic=topic,
             ),
         )
         if collected:
@@ -309,6 +345,7 @@ def _run_backend_lookup(backend: str, query: str) -> BackendLookupResult:
         else:
             return BackendLookupResult(answer="", urls=[])
     except Exception:
+        logger.exception("Grounding backend lookup failed for backend=%s", backend)
         return BackendLookupResult(answer="", urls=[])
 
     answer, urls = _parse_backend_output(output)
@@ -316,13 +353,13 @@ def _run_backend_lookup(backend: str, query: str) -> BackendLookupResult:
 
 
 def _run_grok(prompt: str) -> str:
-    hermes_bin = Path(os.environ.get("GROUNDING_GROK_BIN", str(DEFAULT_GROK_BIN)))
+    grok_bin = Path(os.environ.get("GROUNDING_GROK_BIN") or paths.executable(paths.GROK_BIN_ENV, "grok") or DEFAULT_GROK_BIN)
     grok_model = os.environ.get("GROUNDING_GROK_MODEL") or DEFAULT_GROK_MODEL
-    command = [str(hermes_bin), "-m", grok_model, "-z", prompt]
+    command = [str(grok_bin), "-p", prompt]
     response_text = ""
     try:
-        if not _is_executable(hermes_bin):
-            raise FileNotFoundError(str(hermes_bin))
+        if not _is_executable(grok_bin):
+            raise FileNotFoundError(str(grok_bin))
         completed = subprocess.run(
             command,
             capture_output=True,
@@ -383,11 +420,11 @@ def _run_gemini(prompt: str) -> str:
 
 
 def _agy_binary() -> str | None:
-    configured = Path(os.environ.get("GROUNDING_AGY_BIN", str(DEFAULT_AGY_BIN)))
-    for candidate in (configured, *DEFAULT_AGY_FALLBACKS):
-        if _is_executable(candidate):
-            return str(candidate)
-    return None
+    override = os.environ.get("GROUNDING_AGY_BIN")
+    if override:
+        candidate = Path(override)
+        return str(candidate) if _is_executable(candidate) else None
+    return paths.executable(paths.AGY_BIN_ENV, "agy-cli-1", "agy-cli-2", "agy")
 
 
 def _agy_prompt_arg(prompt: str) -> str:
@@ -427,6 +464,7 @@ def _extract_verified_sources(
     *,
     seen_urls_path: Path,
     snippet_by_url: dict[str, str],
+    topic: str | None = None,
 ) -> list[_VerifiedSource]:
     verified: list[_VerifiedSource] = []
     seen: set[str] = set()
@@ -437,7 +475,7 @@ def _extract_verified_sources(
         extracted = extract_clean_text(
             url,
             seen_urls_path=seen_urls_path,
-            tier=SourceTier.T2,
+            tier=_authority_tier(urlparse(url).netloc or "unknown", topic=topic),
         )
         if not extracted:
             continue
@@ -450,7 +488,7 @@ def _extract_verified_sources(
         full_text = raw_text_path.read_text(encoding="utf-8", errors="ignore").strip()
         if not full_text:
             continue
-        record = _source_record_from_extract(extracted, full_text)
+        record = _source_record_from_extract(extracted, full_text, topic=topic)
         verified.append(
             _VerifiedSource(
                 source=GroundSource(
@@ -468,17 +506,24 @@ def _extract_verified_sources(
     return verified
 
 
-def _source_record_from_extract(extracted: dict, full_text: str) -> SourceRecord:
+def _source_record_from_extract(
+    extracted: dict,
+    full_text: str,
+    *,
+    topic: str | None = None,
+) -> SourceRecord:
     method_value = str(extracted.get("extraction_method") or "")
     try:
         method = ExtractionMethod(method_value)
     except ValueError:
         method = ExtractionMethod.CURL
     url = str(extracted.get("url") or "")
+    domain = str(extracted.get("domain") or urlparse(url).netloc or "unknown")
     raw_text_path = Path(str(extracted["raw_text_path"]))
+    authority_score = source_authority_score(domain, topic)
     return SourceRecord(
         url=url,
-        domain=str(extracted.get("domain") or urlparse(url).netloc or "unknown"),
+        domain=domain,
         title=str(extracted.get("title") or url or "Untitled"),
         author=extracted.get("author"),
         published_date=extracted.get("published_date"),
@@ -487,8 +532,8 @@ def _source_record_from_extract(extracted: dict, full_text: str) -> SourceRecord
         extraction_method=method,
         raw_text_path=raw_text_path,
         char_count=int(extracted.get("char_count") or len(full_text)),
-        tier=SourceTier.T2,
-        topic_authority_score=0.6,
+        tier=_authority_tier(domain, topic=topic, authority_score=authority_score),
+        topic_authority_score=authority_score,
     )
 
 
@@ -516,7 +561,7 @@ def _synthesize_from_sources(
     backend_answers: list[str],
 ) -> tuple[GroundStatus, str, float]:
     if not sources:
-        return "not_found", "", 0.0
+        return "not_found", "", GROUNDING_NOT_FOUND_CONFIDENCE
 
     llm_result = None
     if os.environ.get("GROUNDING_DISABLE_LLM_SYNTHESIS") != "1":
@@ -526,11 +571,54 @@ def _synthesize_from_sources(
 
     answer = _heuristic_answer(query, sources, search_results, backend_answers)
     if not answer:
-        return "not_found", "", 0.0
+        return "not_found", "", GROUNDING_NOT_FOUND_CONFIDENCE
 
-    if len(sources) >= 2:
-        return "grounded", answer, 0.72
-    return "partial", answer, 0.55
+    confidence = _grounding_confidence(sources)
+    status = _grounding_status_from_confidence(confidence)
+    if status == "not_found":
+        return "not_found", "", GROUNDING_NOT_FOUND_CONFIDENCE
+    return status, answer, confidence
+
+
+def _grounding_confidence(sources: list[_VerifiedSource]) -> float:
+    if not sources:
+        return GROUNDING_NOT_FOUND_CONFIDENCE
+    source_count_factor = clamp_unit_interval(
+        len(sources) / SESSION_CONFIDENCE_SOURCE_TARGET
+    )
+    authority_mean = sum(source.record.topic_authority_score for source in sources) / len(
+        sources
+    )
+    source_count_weight = (
+        SESSION_CONFIDENCE_SOURCE_WEIGHT / GROUNDING_SOURCE_WEIGHT_TOTAL
+    )
+    authority_weight = (
+        SESSION_CONFIDENCE_AUTHORITY_WEIGHT / GROUNDING_SOURCE_WEIGHT_TOTAL
+    )
+    return clamp_unit_interval(
+        (source_count_weight * source_count_factor)
+        + (authority_weight * authority_mean)
+    )
+
+
+def _grounding_status_from_confidence(confidence: float) -> GroundStatus:
+    try:
+        thresholds = graduated_answer_thresholds(load_router())
+    except Exception:
+        logger.exception(
+            "Grounding could not load router thresholds; failing down to not_found"
+        )
+        return "not_found"
+    if thresholds is None:
+        logger.error(
+            "Grounding thresholds unavailable from router; failing down to not_found"
+        )
+        return "not_found"
+    if confidence >= thresholds.full_confidence_min:
+        return "grounded"
+    if confidence >= thresholds.partial_confidence_min:
+        return "partial"
+    return "not_found"
 
 
 def _llm_synthesis(
@@ -540,6 +628,7 @@ def _llm_synthesis(
     try:
         from research_engine import llm_call
     except Exception:
+        logger.exception("Grounding LLM synthesis unavailable because llm_call import failed")
         return None
 
     source_blocks = []
@@ -599,6 +688,7 @@ def _append_telemetry(
         with TELEMETRY_PATH.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, sort_keys=True) + "\n")
     except Exception:
+        logger.exception("Grounding telemetry append failed for kind=%s", kind)
         return
 
 

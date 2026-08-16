@@ -2,28 +2,37 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import glob
 import io
+import itertools
 import json
 import logging
 import os
 import re
+import sqlite3
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 if __package__ in {None, ""}:  # pragma: no cover - direct file execution
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from research_engine import llm_call, logged_search, telemetry_observer
 from research_engine.anti_hallucination_gate import validate as validate_model_output
+
+from . import paths
 from research_engine.dispatcher import (
     AGY_SKIP_PERMISSIONS_FLAG,
+    AGY_INTERACTIVE_GEMINI_MODEL,
     GEMINI_CLI_HOME,
+    GEMINI_DAILY_COUNTER_FILE,
     GEMINI_SCOUT_CLI_HOME,
     GEMINI_TIMEOUT_SECONDS,
     GeminiProScoutError,
@@ -32,12 +41,18 @@ from research_engine.dispatcher import (
     build_api_lane_request,
     dispatch,
     dispatch_scout,
+    finalize_gemini_daily_budget,
+    gemini_daily_budget_available,
+    is_unattended_research_run as dispatcher_is_unattended_research_run,
+    reserve_gemini_daily_budget,
+    resolve_agy_model,
 )
 from research_engine.extractor import extract_clean_text
-from research_engine.router import load_router
+from research_engine.router import load_router, source_authority_score
 from research_engine.schema import (
     AgentRole,
     AnswerKind,
+    Disagreement,
     EvidenceChunk,
     ExtractionMethod,
     FinalStatus,
@@ -58,9 +73,12 @@ SPECIALIZED_PROVIDERS = ("tavily", "linkup", "exa", "youcom")
 ABSTAIN_MESSAGE = "Insufficient evidence to answer from the retrieved sources."
 CODEX_TIMEOUT_SECONDS = 180
 CODEX_MODEL_ID = "gpt-5.4-mini"
-MISTRAL_FREE_KEYS_PATH = Path("/Users/cleo/.secrets/mistral-free-keys.env")
+MISTRAL_FREE_KEYS_PATH = paths.optional_path(paths.MISTRAL_KEYS_FILE_ENV) or paths.data_path(
+    "missing-mistral-free-keys.env"
+)
 MISTRAL_FREE_MODEL = os.environ.get("MISTRAL_FREE_MODEL", "mistral-small-latest")
 MISTRAL_TIMEOUT_SECONDS = 120
+_MISTRAL_KEY_COUNTER = itertools.count()
 FINAL_SYNTHESIS_BACKEND = WorkerModel.OPUS.value
 FINAL_SYNTHESIS_CHAIN: tuple[tuple[str, str | None, str], ...] = (
     (WorkerModel.OPUS.value, None, WorkerModel.OPUS.value),
@@ -117,8 +135,99 @@ QUERY_PHRASING_PLAYBOOK_LINES = (
     "- Cap reformulation at 2 retries before escalating or abstaining.",
     "- Pair premise-confirming queries with premise-challenging counter-case queries.",
 )
+TIER_1_AUTHORITY_MIN = 0.85
+TIER_2_AUTHORITY_MIN = 0.5
+NON_T1_SOURCE_MARKER = "[NON-T1] "
+# Calibrated 2026-08-16 on 12 source/answer pairs from sessions
+# 199ef0e9-7899-46a3-b012-34d08cb3c1a5 and cb5df857-29a2-4a79-850a-e2ac37113534
+# using claim-token containment (|paragraph ∩ claim| / |claim|).
+EVIDENCE_OVERLAP_PASS_THRESHOLD = 0.45
+LEGACY_COMPLETE_CONFIDENCE = 0.7
+ABSTAIN_CONFIDENCE_FLOOR = 0.0
+SESSION_CONFIDENCE_SOURCE_TARGET = 3
+SESSION_CONFIDENCE_SOURCE_WEIGHT = 0.2
+SESSION_CONFIDENCE_AUTHORITY_WEIGHT = 0.3
+SESSION_CONFIDENCE_RERANK_WEIGHT = 0.3
+SESSION_CONFIDENCE_SUPPORT_WEIGHT = 0.2
+LOCAL_LANE_RESULT_LIMIT = 5
+LOCAL_MEMORY_SCAN_LIMIT = 200
+LOCAL_SOURCE_TEXT_LIMIT = 4000
+LOCAL_MEMORY_CACHE_DIR = Path(tempfile.gettempdir()) / "research-engine-local-memory"
+EVIDENCE_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "by",
+    "for",
+    "from",
+    "has",
+    "have",
+    "in",
+    "is",
+    "it",
+    "of",
+    "on",
+    "or",
+    "that",
+    "the",
+    "their",
+    "this",
+    "to",
+    "was",
+    "were",
+    "with",
+}
+EVIDENCE_META_SECTION_HEADINGS = frozenset({"next action", "what i would do"})
+EVIDENCE_META_LINE_PREFIXES = ("caveats/disagreements:",)
+EVIDENCE_META_LINE_STARTS = ("**moq**", "**gots**")
+EVIDENCE_CLAIM_SKIP_PHRASES = (
+    "not stated in the source",
+    "not stated in source",
+    "not written down",
+    "no source proves",
+)
+EVIDENCE_TABLE_HEADER_TITLES = frozenset(
+    {
+        "company",
+        "what they actually do",
+        "what it does",
+        "small runs?",
+        "organic cotton?",
+        "organic cotton",
+    }
+)
 
 logger = logging.getLogger(__name__)
+
+
+def is_gemini_quota_model(model_id: str | None) -> bool:
+    normalized = str(model_id or "").strip().lower()
+    return normalized.startswith("gemini ") or normalized.startswith("gemini-")
+
+
+def is_unattended_research_run() -> bool:
+    return dispatcher_is_unattended_research_run()
+
+
+def model_for_agy_worker(spec: WorkerSpec) -> str:
+    requested_model = spec.model_id or AGY_INTERACTIVE_GEMINI_MODEL
+    if not is_gemini_quota_model(requested_model):
+        return requested_model
+    budget_available = gemini_daily_budget_available(path=GEMINI_DAILY_COUNTER_FILE)
+    model_id = resolve_agy_model(
+        requested_model,
+        gemini_budget_available=budget_available,
+    )
+    if model_id != requested_model and not is_unattended_research_run():
+        logger.warning(
+            "Gemini daily budget exhausted; routing agy worker to %s",
+            model_id,
+        )
+    return model_id
 
 
 @dataclass(frozen=True)
@@ -127,6 +236,7 @@ class SearchRunResult:
     path: Path | None
     backend: str
     n_sources: int
+    fleet_warning: str | None = None
 
 
 @dataclass(frozen=True)
@@ -150,6 +260,359 @@ class GeminiInterlockAttempt:
     @property
     def success(self) -> bool:
         return self.record is not None
+
+
+@dataclass(frozen=True)
+class GraduatedAnswerThresholds:
+    full_confidence_min: float
+    partial_confidence_min: float
+    abstain_confidence_below: float
+
+
+# Fail-closed default when router graduated_answer_config is missing or unreadable.
+# Mirrors research_engine/router_config.yaml graduated_answer so the engine still
+# grades FULL/PARTIAL/ABSTAIN from measured confidence instead of inventing
+# FULL + COMPLETE without measurement (B-001).
+DEFAULT_GRADUATED_ANSWER_THRESHOLDS = GraduatedAnswerThresholds(
+    full_confidence_min=0.70,
+    partial_confidence_min=0.35,
+    abstain_confidence_below=0.35,
+)
+
+
+@dataclass(frozen=True)
+class AnswerDecision:
+    answer_kind: AnswerKind
+    final_status: FinalStatus
+    confidence: float
+    open_questions: tuple[str, ...] = ()
+
+
+def clamp_unit_interval(value: float) -> float:
+    return max(0.0, min(1.0, float(value)))
+
+
+def _overlap_tokens(text: str) -> set[str]:
+    return {
+        token
+        for token in re.findall(r"[a-z0-9]+", text.lower())
+        if len(token) > 1 and token not in EVIDENCE_STOPWORDS
+    }
+
+
+def lexical_overlap_score(paragraph_text: str, claim_text: str) -> float:
+    """Return claim-token containment for paragraph-vs-claim support.
+
+    Both strings are lowercased, reduced to alphanumeric tokens, stripped of a small
+    stopword list, then scored as |paragraph_tokens ∩ claim_tokens| / |claim_tokens|.
+    Empty claim token sets score 0.0, and the result is clamped to [0.0, 1.0].
+    """
+
+    paragraph_tokens = _overlap_tokens(paragraph_text)
+    claim_tokens = _overlap_tokens(claim_text)
+    if not paragraph_tokens or not claim_tokens:
+        return 0.0
+    return clamp_unit_interval(len(paragraph_tokens & claim_tokens) / len(claim_tokens))
+
+
+def _is_markdown_table_separator(line: str) -> bool:
+    return bool(
+        re.fullmatch(r"\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?", line)
+    )
+
+
+def _register_claim_candidate(
+    claim_text: str,
+    *,
+    cited_claims: list[str],
+    fallback_claims: list[str],
+    seen: set[str],
+) -> None:
+    normalized = " ".join(claim_text.split()).strip()
+    if not normalized:
+        return
+    lowered = normalized.lower()
+    if any(phrase in lowered for phrase in EVIDENCE_CLAIM_SKIP_PHRASES):
+        return
+    if len(_overlap_tokens(normalized)) < 4:
+        return
+    if normalized in seen:
+        return
+    seen.add(normalized)
+    if re.search(r"\[\d+\]", normalized):
+        cited_claims.append(normalized)
+    else:
+        fallback_claims.append(normalized)
+
+
+def _claim_candidates(answer_text: str, explicit_claim: str | None = None) -> list[str]:
+    if explicit_claim is not None:
+        normalized = " ".join(explicit_claim.split()).strip()
+        return [normalized] if normalized else []
+
+    cited_claims: list[str] = []
+    fallback_claims: list[str] = []
+    seen: set[str] = set()
+    current_heading = ""
+    table_headers: list[str] | None = None
+
+    for raw_line in answer_text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            table_headers = None
+            continue
+        if line.startswith("#"):
+            current_heading = line.lstrip("#").strip().lower()
+            table_headers = None
+            continue
+
+        lowered = line.lower()
+        if current_heading in EVIDENCE_META_SECTION_HEADINGS:
+            continue
+        if any(lowered.startswith(prefix) for prefix in EVIDENCE_META_LINE_PREFIXES):
+            continue
+        if any(lowered.startswith(prefix) for prefix in EVIDENCE_META_LINE_STARTS):
+            continue
+        if _is_markdown_table_separator(line):
+            continue
+
+        if line.startswith("|") and line.endswith("|"):
+            cells = [cell.strip() for cell in line.strip("|").split("|")]
+            if not cells:
+                continue
+            lowered_cells = [cell.lower() for cell in cells]
+            if all(
+                cell in EVIDENCE_TABLE_HEADER_TITLES or cell.endswith("?")
+                for cell in lowered_cells
+            ):
+                table_headers = cells
+                continue
+
+            label = cells[0]
+            headers = table_headers or [""] * len(cells)
+            for index, cell in enumerate(cells[1:], start=1):
+                if not cell:
+                    continue
+                header = headers[index].rstrip("?").strip() if index < len(headers) else ""
+                _register_claim_candidate(
+                    " ".join(part for part in (label, header, cell) if part),
+                    cited_claims=cited_claims,
+                    fallback_claims=fallback_claims,
+                    seen=seen,
+                )
+            continue
+
+        _register_claim_candidate(
+            line,
+            cited_claims=cited_claims,
+            fallback_claims=fallback_claims,
+            seen=seen,
+        )
+
+    claims = cited_claims or fallback_claims
+    if claims:
+        return claims
+    fallback = " ".join(answer_text.split()).strip()
+    return [fallback] if fallback else []
+
+
+def _paragraph_candidates(full_text: str) -> list[str]:
+    candidates: list[str] = []
+    for block in re.split(r"\n\s*\n+", full_text):
+        normalized = " ".join(block.split()).strip()
+        if not normalized:
+            continue
+        if len(normalized) <= 500:
+            candidates.append(normalized)
+            continue
+        start = 0
+        while start < len(normalized):
+            end = min(len(normalized), start + 500)
+            if end < len(normalized):
+                split = normalized.rfind(" ", start, end)
+                if split > start + 250:
+                    end = split
+            window = normalized[start:end].strip()
+            if window:
+                candidates.append(window)
+            start = end
+    fallback = " ".join(full_text.split()).strip()
+    if not candidates and fallback:
+        candidates.append(fallback)
+    return candidates or ["n/a"]
+
+
+def best_supporting_paragraph(
+    full_text: str,
+    answer_text: str,
+    *,
+    claim: str | None = None,
+) -> tuple[str, str, float]:
+    best_paragraph = "n/a"
+    claim_candidates = _claim_candidates(answer_text, explicit_claim=claim)
+    best_claim = claim_candidates[0] if claim_candidates else "n/a"
+    best_score = 0.0
+    for paragraph in _paragraph_candidates(full_text):
+        for claim_text in claim_candidates:
+            score = lexical_overlap_score(paragraph, claim_text)
+            if score > best_score:
+                best_paragraph = paragraph
+                best_claim = claim_text
+                best_score = score
+    return best_paragraph[:300] or "n/a", best_claim or "n/a", best_score
+
+
+def authority_tier(
+    domain: str,
+    *,
+    topic: str | None,
+    authority_score: float | None = None,
+) -> SourceTier:
+    if topic is None:
+        return SourceTier.T2
+    score = source_authority_score(domain, topic) if authority_score is None else authority_score
+    if score >= TIER_1_AUTHORITY_MIN:
+        return SourceTier.T1
+    if score >= TIER_2_AUTHORITY_MIN:
+        return SourceTier.T2
+    return SourceTier.T3
+
+
+def compute_session_confidence(
+    sources: list[SourceRecord],
+    evidence_chunks: list[EvidenceChunk],
+) -> float:
+    """Blend measured source count, authority, overlap, and support into one score.
+
+    Formula:
+    - source_count_factor = min(number_of_sources / 3, 1.0)
+    - authority_mean = average topic_authority_score across sources
+    - rerank_mean = average rerank_score across evidence chunks
+    - support_ratio = fraction of chunks that passed the overlap threshold
+
+    Confidence = 0.2*source_count_factor + 0.3*authority_mean
+               + 0.3*rerank_mean + 0.2*support_ratio
+    """
+
+    if not sources or not evidence_chunks:
+        return ABSTAIN_CONFIDENCE_FLOOR
+    source_count_factor = clamp_unit_interval(
+        len(sources) / SESSION_CONFIDENCE_SOURCE_TARGET
+    )
+    authority_mean = sum(source.topic_authority_score for source in sources) / len(sources)
+    rerank_mean = sum(chunk.rerank_score for chunk in evidence_chunks) / len(evidence_chunks)
+    support_ratio = sum(
+        1.0 for chunk in evidence_chunks if chunk.crystal_check_passed
+    ) / len(evidence_chunks)
+    return clamp_unit_interval(
+        (SESSION_CONFIDENCE_SOURCE_WEIGHT * source_count_factor)
+        + (SESSION_CONFIDENCE_AUTHORITY_WEIGHT * authority_mean)
+        + (SESSION_CONFIDENCE_RERANK_WEIGHT * rerank_mean)
+        + (SESSION_CONFIDENCE_SUPPORT_WEIGHT * support_ratio)
+    )
+
+
+def graduated_answer_thresholds(router) -> GraduatedAnswerThresholds | None:
+    getter = getattr(router, "graduated_answer_config", None)
+    if not callable(getter):
+        logger.warning(
+            "graduated_answer_config missing or not callable on router type %s; "
+            "caller will use fail-closed DEFAULT_GRADUATED_ANSWER_THRESHOLDS",
+            type(router).__name__,
+        )
+        return None
+    try:
+        config = getter()
+    except Exception as exc:
+        logger.warning(
+            "graduated_answer_config raised %s: %s; "
+            "caller will use fail-closed DEFAULT_GRADUATED_ANSWER_THRESHOLDS",
+            type(exc).__name__,
+            exc,
+        )
+        return None
+    if not isinstance(config, dict):
+        logger.warning(
+            "graduated_answer_config returned %s, not dict; "
+            "caller will use fail-closed DEFAULT_GRADUATED_ANSWER_THRESHOLDS",
+            type(config).__name__,
+        )
+        return None
+    try:
+        return GraduatedAnswerThresholds(
+            full_confidence_min=clamp_unit_interval(config["full_confidence_min"]),
+            partial_confidence_min=clamp_unit_interval(config["partial_confidence_min"]),
+            abstain_confidence_below=clamp_unit_interval(
+                config["abstain_confidence_below"]
+            ),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        logger.warning(
+            "graduated_answer_config keys/values invalid (%s); "
+            "caller will use fail-closed DEFAULT_GRADUATED_ANSWER_THRESHOLDS",
+            exc,
+        )
+        return None
+
+
+def session_answer_decision(
+    sources: list[SourceRecord],
+    evidence_chunks: list[EvidenceChunk],
+    *,
+    router,
+) -> AnswerDecision:
+    thresholds = graduated_answer_thresholds(router)
+    if thresholds is None:
+        # Fail closed: grade on measured confidence with defaults, never invent FULL.
+        thresholds = DEFAULT_GRADUATED_ANSWER_THRESHOLDS
+
+    try:
+        measured_confidence = compute_session_confidence(sources, evidence_chunks)
+    except Exception as exc:
+        logger.warning(
+            "compute_session_confidence failed (%s); abstaining at confidence 0.0",
+            exc,
+        )
+        return AnswerDecision(
+            answer_kind=AnswerKind.ABSTAIN,
+            final_status=FinalStatus.WEAK_SOURCES,
+            confidence=ABSTAIN_CONFIDENCE_FLOOR,
+            open_questions=(
+                "Session confidence could not be measured from sources and evidence.",
+            ),
+        )
+
+    if measured_confidence >= thresholds.full_confidence_min:
+        return AnswerDecision(
+            answer_kind=AnswerKind.FULL,
+            final_status=FinalStatus.COMPLETE,
+            confidence=measured_confidence,
+        )
+
+    open_question = (
+        f"Measured confidence {measured_confidence:.2f} stayed below the full-answer "
+        "threshold; gather more high-authority sources or stronger paragraph overlap."
+    )
+    if measured_confidence >= thresholds.partial_confidence_min:
+        return AnswerDecision(
+            answer_kind=AnswerKind.PARTIAL,
+            final_status=FinalStatus.WEAK_SOURCES,
+            confidence=measured_confidence,
+            open_questions=(open_question,),
+        )
+    if measured_confidence < thresholds.abstain_confidence_below:
+        return AnswerDecision(
+            answer_kind=AnswerKind.ABSTAIN,
+            final_status=FinalStatus.WEAK_SOURCES,
+            confidence=ABSTAIN_CONFIDENCE_FLOOR,
+            open_questions=(open_question,),
+        )
+    return AnswerDecision(
+        answer_kind=AnswerKind.PARTIAL,
+        final_status=FinalStatus.WEAK_SOURCES,
+        confidence=measured_confidence,
+        open_questions=(open_question,),
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -220,65 +683,92 @@ def run_search(
     chosen_provider = "tavily"
     router = None
     route_lanes: list[str] = []
+    authority_topic: str | None = None
+    require_tier_1 = False
+    skip_web = False
     try:
         router = load_router()
         route = router.route(question)
         route_lanes = list(getattr(route, "lanes", []))
+        authority_topic = getattr(route, "topic", None)
+        require_tier_1 = bool(getattr(route, "require_tier_1", False))
+        skip_web = bool(getattr(route, "skip_web", False))
         chosen_provider = choose_provider(route_lanes)
     except Exception as exc:  # noqa: BLE001 - router failure degrades later
         errors.append(f"router failed: {type(exc).__name__}: {exc}")
 
-    sx = run_logged_search(
-        logged_search.searxng,
-        question,
-        protocol=Protocol.SEARCH.value,
-        topic=topic,
-        agent=agent,
-        errors=errors,
-    )
-    specialty_payloads: list[tuple[str, dict[str, Any]]] = []
-    if not has_enough_free_results(sx):
-        specialty_payloads = run_free_api_lanes(
+    local_payloads: list[tuple[str, dict[str, Any]]] = []
+    if skip_web:
+        sx = {"results": [], "skipped": "skip_web"}
+        px = {"results": [], "skipped": "skip_web"}
+        specialty_payloads: list[tuple[str, dict[str, Any]]] = []
+        local_payloads = run_local_search_lanes(
             route_lanes,
             router=router,
             question=question,
-            protocol=Protocol.SEARCH.value,
-            topic=topic,
-            agent=agent,
             errors=errors,
         )
-
-    free_payloads = [sx, *(payload for _lane, payload in specialty_payloads)]
-    if any(has_enough_free_results(payload) for payload in free_payloads) or (
-        sum(len(_results(payload)) for payload in free_payloads) >= MIN_FREE_SEARCH_RESULTS
-    ):
-        px: dict[str, Any] = {"results": [], "skipped": "free_first_sufficient"}
+        queries_run = build_local_query_calls(question, local_payloads=local_payloads)
+        grok_x_summary = ""
+        source_urls = candidate_urls(*(payload for _lane, payload in local_payloads))
     else:
-        px = run_logged_search(
-            logged_search.proxy,
+        sx = run_logged_search(
+            logged_search.searxng,
             question,
-            provider=chosen_provider,
             protocol=Protocol.SEARCH.value,
             topic=topic,
             agent=agent,
             errors=errors,
         )
-    queries_run = build_query_calls(
-        question,
-        sx=sx,
-        px=px,
-        chosen_provider=chosen_provider,
-        api_payloads=specialty_payloads,
-    )
-    grok_x_summary, grok_x_query = run_grok_x_search(
-        question,
-        protocol=Protocol.SEARCH,
-        topic=topic,
-        router=router,
-    )
-    queries_run.append(grok_x_query)
+        specialty_payloads = []
+        if not has_enough_free_results(sx):
+            specialty_payloads = run_free_api_lanes(
+                route_lanes,
+                router=router,
+                question=question,
+                protocol=Protocol.SEARCH.value,
+                topic=topic,
+                agent=agent,
+                errors=errors,
+            )
 
-    source_pairs = extract_sources(candidate_urls(sx, *free_payloads[1:], px), errors=errors)
+        free_payloads = [sx, *(payload for _lane, payload in specialty_payloads)]
+        if any(has_enough_free_results(payload) for payload in free_payloads) or (
+            sum(len(_results(payload)) for payload in free_payloads) >= MIN_FREE_SEARCH_RESULTS
+        ):
+            px = {"results": [], "skipped": "free_first_sufficient"}
+        else:
+            px = run_logged_search(
+                logged_search.proxy,
+                question,
+                provider=chosen_provider,
+                protocol=Protocol.SEARCH.value,
+                topic=topic,
+                agent=agent,
+                errors=errors,
+            )
+        queries_run = build_query_calls(
+            question,
+            sx=sx,
+            px=px,
+            chosen_provider=chosen_provider,
+            api_payloads=specialty_payloads,
+        )
+        grok_x_summary, grok_x_query = run_grok_x_search(
+            question,
+            protocol=Protocol.SEARCH,
+            topic=topic,
+            router=router,
+        )
+        queries_run.append(grok_x_query)
+        source_urls = candidate_urls(sx, *free_payloads[1:], px)
+
+    source_pairs = extract_sources(
+        source_urls,
+        errors=errors,
+        topic=authority_topic,
+        require_tier_1=require_tier_1,
+    )
     if not source_pairs:
         session = build_abstain_session(
             question,
@@ -324,6 +814,7 @@ def run_search(
         agent=agent,
         queries_run=queries_run,
         source_pairs=source_pairs,
+        router=router,
     )
     path = save_session_safely(session)
     telemetry_safely()
@@ -342,14 +833,16 @@ def run_research(
     agent: str | None = None,
     llm_prefer: str | None = None,
 ) -> SearchRunResult:
+    plan = research_fleet_plan()
     return run_multi_territory_research(
         question,
         protocol=Protocol.RESEARCH,
-        territory_specs=research_territory_specs(),
+        territory_specs=plan.specs,
         topic=topic,
         agent=agent,
         llm_prefer=llm_prefer,
         allow_iteration=False,
+        fleet_warning=plan.warning,
     )
 
 
@@ -360,14 +853,16 @@ def run_deep_research(
     agent: str | None = None,
     llm_prefer: str | None = None,
 ) -> SearchRunResult:
+    plan = deep_research_fleet_plan()
     return run_multi_territory_research(
         question,
         protocol=Protocol.DEEP_RESEARCH,
-        territory_specs=deep_research_territory_specs(),
+        territory_specs=plan.specs,
         topic=topic,
         agent=agent,
         llm_prefer=llm_prefer,
         allow_iteration=True,
+        fleet_warning=plan.warning,
     )
 
 
@@ -380,10 +875,21 @@ def run_multi_territory_research(
     agent: str | None = None,
     llm_prefer: str | None = None,
     allow_iteration: bool = False,
+    fleet_warning: str | None = None,
 ) -> SearchRunResult:
     topic = topic or slugify_question(question)
     agent = agent or os.environ.get("RESEARCH_AGENT") or "harness"
     router = load_router_or_none()
+    authority_topic: str | None = None
+    require_tier_1 = False
+    if router is not None:
+        try:
+            route = router.route(question)
+            authority_topic = route.topic
+            require_tier_1 = bool(getattr(route, "require_tier_1", False))
+        except Exception:
+            authority_topic = None
+            require_tier_1 = False
     scout_attempt = run_gemini_scout(
         question,
         router=router,
@@ -425,6 +931,8 @@ def run_multi_territory_research(
             counter=counter,
             seen_urls=seen_urls,
             llm_prefer=llm_prefer,
+            authority_topic=authority_topic,
+            require_tier_1=require_tier_1,
         )
         runs.append(run)
         workers_run += 1
@@ -447,6 +955,7 @@ def run_multi_territory_research(
             path=path,
             backend=backend,
             n_sources=len(saved_session.sources),
+            fleet_warning=fleet_warning,
         )
 
     if (
@@ -465,6 +974,8 @@ def run_multi_territory_research(
             worker_model=weakest.territory.assigned_worker_model,
             counter=weakest.counter,
             seen_urls=seen_urls,
+            authority_topic=authority_topic,
+            require_tier_1=require_tier_1,
         )
         workers_run += 1
         extra_summary = ""
@@ -504,6 +1015,7 @@ def run_multi_territory_research(
                 path=path,
                 backend=backend,
                 n_sources=len(saved_session.sources),
+                fleet_warning=fleet_warning,
             )
 
     telemetry_safely()
@@ -512,6 +1024,7 @@ def run_multi_territory_research(
         path=path,
         backend=backend,
         n_sources=len(saved_session.sources),
+        fleet_warning=fleet_warning,
     )
 
 
@@ -562,33 +1075,83 @@ def protocol_for_mode(mode: str) -> Protocol:
     return Protocol.SEARCH
 
 
-def research_territory_specs() -> list[tuple[AgentRole, str, bool, WorkerModel]]:
-    return [
-        (AgentRole.KEYWORD, "github_code", False, WorkerModel.CODEX_5_4),
-        (AgentRole.DOMAIN_SPECIALIST, "reddit_rss", False, WorkerModel.MISTRAL),
-        (AgentRole.COUNTER_EVIDENCE, "counter_evidence", True, WorkerModel.GROK),
+RESEARCH_FLEET_NAME = "research"
+DEEP_RESEARCH_FLEET_NAME = "deep_research"
+
+RESEARCH_LANE_PLAN: tuple[tuple[AgentRole, str, bool], ...] = (
+    (AgentRole.KEYWORD, "github_code", False),
+    (AgentRole.DOMAIN_SPECIALIST, "reddit_rss", False),
+    (AgentRole.COUNTER_EVIDENCE, "counter_evidence", True),
+)
+
+DEEP_RESEARCH_LANE_PLAN: tuple[tuple[AgentRole, str, bool], ...] = (
+    *((AgentRole.SEMANTIC, lane, False) for lane in ("arxiv", "semantic_scholar", "core", "papers_with_code", "pubmed")),
+    *((AgentRole.KEYWORD, lane, False) for lane in ("github_code", "sourcegraph", "stack_exchange", "github_code", "sourcegraph")),
+    *((AgentRole.DOMAIN_SPECIALIST, lane, False) for lane in ("reddit_rss", "reddit_failures", "x_pulse", "bluesky_jetstream", "hn_algolia")),
+    (AgentRole.COUNTER_EVIDENCE, "counter_evidence", True),
+)
+
+
+@dataclass(frozen=True)
+class FleetPlan:
+    specs: list[tuple[AgentRole, str, bool, WorkerModel]]
+    warning: str | None
+
+
+def fleet_plan(
+    fleet_name: str,
+    lane_plan: tuple[tuple[AgentRole, str, bool], ...],
+    *,
+    router=None,
+) -> FleetPlan:
+    router = router if router is not None else load_router()
+    raw_models = router.fleet_worker_models(fleet_name)
+    if len(raw_models) != len(lane_plan):
+        raise ValueError(
+            f"fleet '{fleet_name}' declares {len(raw_models)} workers but "
+            f"the lane plan has {len(lane_plan)} slots"
+        )
+
+    models = [WorkerModel(value) for value in raw_models]
+    specs = [
+        (role, lane, counter, model)
+        for (role, lane, counter), model in zip(lane_plan, models, strict=True)
     ]
+    return FleetPlan(specs=specs, warning=None)
 
 
-def deep_research_territory_specs() -> list[tuple[AgentRole, str, bool, WorkerModel]]:
-    haiku_lanes = ["arxiv", "semantic_scholar", "core", "papers_with_code", "pubmed"]
-    codex_lanes = ["github_code", "sourcegraph", "stack_exchange", "github_code", "sourcegraph"]
-    gemini_lanes = ["reddit_rss", "reddit_failures", "x_pulse", "bluesky_jetstream", "hn_algolia"]
-    specs: list[tuple[AgentRole, str, bool, WorkerModel]] = []
-    specs.extend(
-        (AgentRole.SEMANTIC, lane, False, WorkerModel.HAIKU)
-        for lane in haiku_lanes
-    )
-    specs.extend(
-        (AgentRole.KEYWORD, lane, False, WorkerModel.CODEX_5_4)
-        for lane in codex_lanes
-    )
-    specs.extend(
-        (AgentRole.DOMAIN_SPECIALIST, lane, False, WorkerModel.HAIKU)
-        for lane in gemini_lanes
-    )
-    specs.append((AgentRole.COUNTER_EVIDENCE, "counter_evidence", True, WorkerModel.GROK))
-    return specs
+def _fleet_warning(fleet_name: str, exc: Exception) -> str:
+    return f"fleet '{fleet_name}' router fleets config unusable: {type(exc).__name__}: {exc}"
+
+
+def research_fleet_plan(*, router=None) -> FleetPlan:
+    try:
+        return fleet_plan(RESEARCH_FLEET_NAME, RESEARCH_LANE_PLAN, router=router)
+    except Exception as exc:
+        warning = _fleet_warning(RESEARCH_FLEET_NAME, exc)
+        logger.error("ROUTER FLEETS ERROR - %s", warning)
+        return FleetPlan(specs=[], warning=warning)
+
+
+def deep_research_fleet_plan(*, router=None) -> FleetPlan:
+    try:
+        return fleet_plan(DEEP_RESEARCH_FLEET_NAME, DEEP_RESEARCH_LANE_PLAN, router=router)
+    except Exception as exc:
+        warning = _fleet_warning(DEEP_RESEARCH_FLEET_NAME, exc)
+        logger.error("ROUTER FLEETS ERROR - %s", warning)
+        return FleetPlan(specs=[], warning=warning)
+
+
+def research_territory_specs(
+    *, router=None
+) -> list[tuple[AgentRole, str, bool, WorkerModel]]:
+    return research_fleet_plan(router=router).specs
+
+
+def deep_research_territory_specs(
+    *, router=None
+) -> list[tuple[AgentRole, str, bool, WorkerModel]]:
+    return deep_research_fleet_plan(router=router).specs
 
 
 def run_gemini_scout(
@@ -605,12 +1168,16 @@ def run_gemini_scout(
                 run_type=GeminiProRunKind.SCOUT,
                 failure_reason="Gemini scout skipped after failed health check",
             )
-        output_text = execute_gemini_worker_spec(spec, router=router)
+        output_text, actual_model_id = _execute_agy_worker_spec(spec, router=router)
     except Exception as exc:  # noqa: BLE001 - scout failure must degrade to fallback
         return failed_gemini_attempt(GeminiProRunKind.SCOUT, exc)
     return GeminiInterlockAttempt(
         run_type=GeminiProRunKind.SCOUT,
-        record=successful_gemini_record(GeminiProRunKind.SCOUT, spec=spec),
+        record=successful_gemini_record(
+            GeminiProRunKind.SCOUT,
+            spec=spec,
+            model_id=actual_model_id,
+        ),
         output_text=output_text,
     )
 
@@ -642,6 +1209,7 @@ def run_final_synthesis(
     prompt = final_research_prompt(
         question,
         territory_summaries=[run.summary for run in runs],
+        worker_disagreements=detect_worker_disagreements(question, runs),
         source_pairs=source_pairs_from_runs(runs),
         worker_output_paths=worker_output_paths_from_runs(runs),
     )
@@ -756,6 +1324,11 @@ def grok_x_query_call(
 
 
 def execute_gemini_worker_spec(spec: WorkerSpec, *, router) -> str:
+    output_text, _model_id = _execute_agy_worker_spec(spec, router=router)
+    return output_text
+
+
+def _execute_agy_worker_spec(spec: WorkerSpec, *, router) -> tuple[str, str]:
     prompt = Path(spec.brief_path).read_text(encoding="utf-8")
     if prompt.lstrip().startswith("-"):
         prompt = f"Brief:\n{prompt}"
@@ -767,19 +1340,40 @@ def execute_gemini_worker_spec(spec: WorkerSpec, *, router) -> str:
 
     output_path = Path(spec.output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    completed = subprocess.run(
-        [
-            GEMINI_CLI_HOME,  # dispatcher.AGY_CLI is the locked canonical agy command.
-            AGY_SKIP_PERMISSIONS_FLAG,
-            "--print",
-            prompt,
-        ],
-        text=True,
-        capture_output=True,
-        check=False,
-        stdin=subprocess.DEVNULL,
-        timeout=gemini_timeout_for_spec(spec, router=router),
-    )
+    requested_model = spec.model_id or AGY_INTERACTIVE_GEMINI_MODEL
+    model_id = model_for_agy_worker(spec)
+    budget_reserved = False
+    if is_gemini_quota_model(model_id):
+        budget_reserved = reserve_gemini_daily_budget(path=GEMINI_DAILY_COUNTER_FILE)
+        if not budget_reserved:
+            model_id = resolve_agy_model(
+                requested_model,
+                gemini_budget_available=False,
+            )
+    successful_exit = False
+    try:
+        completed = subprocess.run(
+            [
+                GEMINI_CLI_HOME,  # dispatcher.AGY_CLI is the locked canonical agy command.
+                AGY_SKIP_PERMISSIONS_FLAG,
+                "-p",
+                prompt,
+                "--model",
+                model_id,
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+            stdin=subprocess.DEVNULL,
+            timeout=gemini_timeout_for_spec(spec, router=router),
+        )
+        successful_exit = completed.returncode == 0
+    finally:
+        if budget_reserved:
+            finalize_gemini_daily_budget(
+                success=successful_exit,
+                path=GEMINI_DAILY_COUNTER_FILE,
+            )
     stdout_text = completed.stdout.strip()
     stderr_text = completed.stderr.strip()
     combined_output = "\n".join(
@@ -796,12 +1390,16 @@ def execute_gemini_worker_spec(spec: WorkerSpec, *, router) -> str:
         logger.warning("agy Gemini worker stderr: %s", trim_for_log(stderr_text))
     if not stdout_text:
         raise GeminiProScoutError("agy Gemini returned empty output")
+    if _looks_like_worker_failure(stdout_text):
+        raise GeminiProScoutError(
+            f"agy Gemini returned failure stub: {trim_for_log(stdout_text)}"
+        )
     stdout_text = apply_anti_hallucination_gate(
         stdout_text,
         label="gemini_worker",
     )
     output_path.write_text(stdout_text + "\n", encoding="utf-8")
-    return stdout_text
+    return stdout_text, model_id
 
 
 def gemini_home_for_spec(spec: WorkerSpec, *, router) -> str:
@@ -916,6 +1514,7 @@ def execute_mistral_worker_spec(spec: WorkerSpec) -> str:
 def next_mistral_free_key() -> str:
     if not MISTRAL_FREE_KEYS_PATH.is_file():
         raise RuntimeError(f"Mistral free key file not found: {MISTRAL_FREE_KEYS_PATH}")
+    keys: list[str] = []
     for raw_line in MISTRAL_FREE_KEYS_PATH.read_text(
         encoding="utf-8",
         errors="ignore",
@@ -925,8 +1524,10 @@ def next_mistral_free_key() -> str:
             continue
         key, _, value = line.partition("=")
         if key.strip().startswith("MISTRAL_FREE_KEY_") and value.strip():
-            return value.strip().strip('"').strip("'")
-    raise RuntimeError(f"No MISTRAL_FREE_KEY_* entries found in {MISTRAL_FREE_KEYS_PATH}")
+            keys.append(value.strip().strip('"').strip("'"))
+    if not keys:
+        raise RuntimeError(f"No MISTRAL_FREE_KEY_* entries found in {MISTRAL_FREE_KEYS_PATH}")
+    return keys[(os.getpid() + next(_MISTRAL_KEY_COUNTER)) % len(keys)]
 
 
 def mistral_worker_tools() -> list[dict[str, Any]]:
@@ -986,10 +1587,8 @@ def execute_grok_worker_spec(spec: WorkerSpec) -> str:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     completed = subprocess.run(
         [
-            "hermes",
-            "-m",
-            spec.model_id,
-            "-z",
+            paths.executable(paths.GROK_BIN_ENV, "grok") or "grok",
+            "--single",
             prompt,
         ],
         text=True,
@@ -1036,11 +1635,12 @@ def successful_gemini_record(
     run_type: GeminiProRunKind,
     *,
     spec: WorkerSpec,
+    model_id: str,
 ) -> GeminiProRunRecord:
     return GeminiProRunRecord(
         run_type=run_type,
         success=True,
-        model_id=persistence.CANONICAL_GEMINI_PRO_MODEL_ID,
+        model_id=model_id,
         brief_path=Path(spec.brief_path),
         output_path=Path(spec.output_path),
     )
@@ -1101,7 +1701,7 @@ def gemini_pro_synthesis_brief(
     source_pairs = source_pairs_from_runs(runs)
     worker_paths = worker_output_paths_from_runs(runs)
     sections = [
-        f"You are Gemini 3 Flash on CLI1 doing final synthesis for {protocol.value}.",
+        f"You are Gemini 3.7 Flash through agy doing final synthesis for {protocol.value}.",
         "Use only the numbered sources below. If they do not directly answer "
         "the question, abstain.",
         "No-tool input contract: use the original question, territory summaries, "
@@ -1142,6 +1742,11 @@ def run_logged_search(search_fn, question: str, *, errors: list[str], **kwargs) 
     if not isinstance(payload, dict):
         errors.append("search returned a non-object payload")
         return {"results": [], "error": "non-object payload"}
+    error = payload.get("error")
+    if isinstance(error, str) and error.strip():
+        errors.append(f"search degraded: {error.strip()}")
+    elif not _results(payload):
+        errors.append("search degraded: 0 results")
     return payload
 
 
@@ -1190,6 +1795,129 @@ def run_free_api_lanes(
     return payloads
 
 
+def run_local_search_lanes(
+    lanes: list[str],
+    *,
+    router,
+    question: str,
+    errors: list[str],
+) -> list[tuple[str, dict[str, Any]]]:
+    if router is None:
+        return []
+    lane_endpoint = getattr(router, "lane_endpoint", None)
+    if not callable(lane_endpoint):
+        return []
+
+    payloads: list[tuple[str, dict[str, Any]]] = []
+    seen: set[str] = set()
+    for lane in lanes:
+        if lane in seen:
+            continue
+        seen.add(lane)
+        try:
+            lane_config = lane_endpoint(lane)
+        except Exception as exc:  # noqa: BLE001 - bad lane config should not abort search
+            errors.append(f"{lane} local lane config failed: {type(exc).__name__}: {exc}")
+            continue
+        if str(lane_config.get("type")) != "local":
+            continue
+        try:
+            payload = local_lane_payload(lane_config, question)
+        except Exception as exc:  # noqa: BLE001 - one lane should not abort search
+            errors.append(f"{lane} local lane failed: {type(exc).__name__}: {exc}")
+            payload = {"results": [], "error": str(exc)}
+        payloads.append((lane, payload))
+    return payloads
+
+
+def local_lane_payload(lane_config: dict[str, Any], question: str) -> dict[str, Any]:
+    db_path = str(lane_config.get("db_path") or "").strip()
+    if db_path:
+        return {"results": _local_db_results(Path(db_path), question)}
+    glob_pattern = str(lane_config.get("glob") or "").strip()
+    if glob_pattern:
+        return {"results": _local_file_results(glob_pattern, question)}
+    return {"results": [], "error": "unsupported local lane config"}
+
+
+def _local_db_results(db_path: Path, question: str) -> list[dict[str, Any]]:
+    if not db_path.is_file():
+        return []
+    try:
+        with sqlite3.connect(db_path) as conn:
+            rows = conn.execute(
+                """
+                SELECT id, project, topic, content
+                FROM memory_records
+                WHERE stale = 0
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (LOCAL_MEMORY_SCAN_LIMIT,),
+            ).fetchall()
+    except sqlite3.Error:
+        return []
+
+    scored: list[tuple[float, int, str, str]] = []
+    for record_id, project, topic, content in rows:
+        text = "\n".join(
+            [
+                f"Project: {project}",
+                f"Topic: {topic}",
+                str(content or "").strip(),
+            ]
+        ).strip()
+        if not text:
+            continue
+        paragraph, score = best_supporting_paragraph(text, question)
+        if score <= 0.0:
+            continue
+        scored.append((score, int(record_id), text[:LOCAL_SOURCE_TEXT_LIMIT], paragraph))
+
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    results: list[dict[str, Any]] = []
+    for score, record_id, text, paragraph in scored[:LOCAL_LANE_RESULT_LIMIT]:
+        results.append(
+            {
+                "url": _materialize_local_memory_record(record_id, text).as_uri(),
+                "snippet": paragraph,
+                "score": score,
+            }
+        )
+    return results
+
+
+def _materialize_local_memory_record(record_id: int, text: str) -> Path:
+    LOCAL_MEMORY_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    path = LOCAL_MEMORY_CACHE_DIR / f"memory-record-{record_id}.md"
+    path.write_text(text, encoding="utf-8")
+    return path.resolve()
+
+
+def _local_file_results(glob_pattern: str, question: str) -> list[dict[str, Any]]:
+    scored: list[tuple[float, Path, str]] = []
+    for raw_path in glob.glob(os.path.expanduser(glob_pattern), recursive=True):
+        path = Path(raw_path)
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        if not text.strip():
+            continue
+        paragraph, score = best_supporting_paragraph(text[:LOCAL_SOURCE_TEXT_LIMIT], question)
+        if score <= 0.0:
+            continue
+        scored.append((score, path.resolve(), paragraph))
+
+    scored.sort(key=lambda item: (-item[0], str(item[1])))
+    return [
+        {"url": path.as_uri(), "snippet": paragraph, "score": score}
+        for score, path, paragraph in scored[:LOCAL_LANE_RESULT_LIMIT]
+    ]
+
+
 def is_free_api_lane(lane_config: dict[str, Any]) -> bool:
     if str(lane_config.get("type")) != "api":
         return False
@@ -1210,6 +1938,8 @@ def _run_worker(
     worker_model: WorkerModel,
     counter: bool = False,
     seen_urls: set[str],
+    authority_topic: str | None = None,
+    require_tier_1: bool = False,
 ) -> tuple[list[SourceRecord], list[str], list[QueryCall]]:
     errors: list[str] = []
     payloads: list[tuple[str, str, dict[str, Any]]] = []
@@ -1249,6 +1979,8 @@ def _run_worker(
         max_sources=2,
         seen_urls=seen_urls,
         counter_evidence=counter,
+        topic=authority_topic,
+        require_tier_1=require_tier_1,
     )
     return (
         [source for source, _full_text in source_pairs],
@@ -1303,6 +2035,8 @@ def extract_sources(
     max_sources: int = 3,
     seen_urls: set[str] | None = None,
     counter_evidence: bool = False,
+    topic: str | None = None,
+    require_tier_1: bool = False,
 ) -> list[tuple[SourceRecord, str]]:
     source_pairs: list[tuple[SourceRecord, str]] = []
     for url in urls:
@@ -1311,7 +2045,11 @@ def extract_sources(
         if seen_urls is not None and url in seen_urls:
             continue
         try:
-            extracted = extract_clean_text(url, tier=SourceTier.T2)
+            requested_tier = authority_tier(
+                urlparse(url).netloc or "unknown",
+                topic=topic,
+            )
+            extracted = extract_clean_text(url, tier=requested_tier)
             if not extracted or int(extracted.get("char_count") or 0) <= 0:
                 continue
             if not extracted.get("url"):
@@ -1320,13 +2058,21 @@ def extract_sources(
             full_text = raw_text_path.read_text(encoding="utf-8", errors="ignore")
             if not full_text.strip():
                 continue
+            record = source_record(
+                extracted,
+                full_text,
+                counter_evidence=counter_evidence,
+                topic=topic,
+                require_tier_1=require_tier_1,
+            )
+            if require_tier_1 and record.tier != SourceTier.T1:
+                errors.append(
+                    f"tier-1 required but {record.domain} scored {record.tier.name} "
+                    f"(authority={record.topic_authority_score:.2f})"
+                )
             source_pairs.append(
                 (
-                    source_record(
-                        extracted,
-                        full_text,
-                        counter_evidence=counter_evidence,
-                    ),
+                    record,
                     full_text,
                 )
             )
@@ -1342,22 +2088,30 @@ def source_record(
     full_text: str,
     *,
     counter_evidence: bool = False,
+    topic: str | None = None,
+    require_tier_1: bool = False,
 ) -> SourceRecord:
     try:
         method = ExtractionMethod(str(extracted.get("extraction_method") or ""))
     except ValueError:
         method = ExtractionMethod.CURL
+    domain = str(extracted.get("domain") or "unknown")
+    authority_score = source_authority_score(domain, topic)
+    tier = authority_tier(domain, topic=topic, authority_score=authority_score)
+    title = str(extracted.get("title") or "Untitled")
+    if require_tier_1 and tier != SourceTier.T1 and not title.startswith(NON_T1_SOURCE_MARKER):
+        title = f"{NON_T1_SOURCE_MARKER}{title}"
     return SourceRecord(
         url=str(extracted.get("url") or ""),
-        domain=str(extracted.get("domain") or "unknown"),
-        title=str(extracted.get("title") or "Untitled"),
+        domain=domain,
+        title=title,
         fetched_at=datetime.now(timezone.utc),
         content_hash=SourceRecord.hash_text(full_text),
         extraction_method=method,
         raw_text_path=Path(str(extracted["raw_text_path"])),
         char_count=int(extracted.get("char_count") or len(full_text)),
-        tier=SourceTier.T2,
-        topic_authority_score=0.6,
+        tier=tier,
+        topic_authority_score=authority_score,
         counter_evidence_flagged=counter_evidence,
     )
 
@@ -1523,27 +2277,29 @@ def generated_example_queries(question: str) -> list[str]:
     quoted_phrases = re.findall(r'"([^"]+)"|' "'([^']+)'", normalized_question)
     phrases = [next(part for part in match if part).strip() for match in quoted_phrases]
     phrase = phrases[0] if phrases else ""
-    phrase_queries = []
-    if phrase:
-        phrase_queries = [
-            f'"{phrase}" company examples industry',
-            f'"{phrase}" startup examples list',
-            f'"{phrase}" well-known companies industries',
-            f'"{phrase}" founder investor quote company',
-            f'site:techcrunch.com "{phrase}" startup company industry',
-            f'site:forbes.com "{phrase}" company industry',
-        ]
-    return [
-        f"{question} concrete named examples companies industries",
-        *phrase_queries,
-        '"Uber for" startup examples industry',
-        '"Uber of" companies examples industry',
-        '"called the Uber of" company industry',
-        '"Uber for X" startups examples industries',
-        'well-known "Uber for" companies examples',
-        'VC quote "Uber of" startup company',
-        'journalist called "Uber of" company industry',
+    queries = [
+        f"{question} named examples",
+        f"{question} list of examples",
+        f"{question} real named cases",
+        f"{question} real-world instances",
     ]
+    if phrase:
+        queries.extend(
+            [
+                f'"{phrase}" examples',
+                f'"{phrase}" list',
+                f'"{phrase}" named cases',
+                f'"{phrase}" real-world instances',
+            ]
+        )
+    else:
+        queries.extend(
+            [
+                f"{question} documented examples",
+                f"{question} specific cases with names",
+            ]
+        )
+    return queries
 
 
 def classify_question_topic(question: str) -> str:
@@ -1707,6 +2463,8 @@ def execute_territory(
     counter: bool,
     seen_urls: set[str],
     llm_prefer: str | None,
+    authority_topic: str | None = None,
+    require_tier_1: bool = False,
 ) -> TerritoryRun:
     spec = dispatch(territory, router, topic_slug=topic, protocol=protocol)
     sources, full_texts, queries = _run_worker(
@@ -1718,6 +2476,8 @@ def execute_territory(
         worker_model=territory.assigned_worker_model,
         counter=counter,
         seen_urls=seen_urls,
+        authority_topic=authority_topic,
+        require_tier_1=require_tier_1,
     )
     summary = ""
     source_pairs = list(zip(sources, full_texts, strict=True))
@@ -1971,6 +2731,7 @@ def final_research_prompt(
     question: str,
     *,
     territory_summaries: list[str],
+    worker_disagreements: list[Disagreement] | None = None,
     source_pairs: list[tuple[SourceRecord, str]],
     worker_output_paths: list[str] | None = None,
     scout_summary: str = "",
@@ -2009,6 +2770,12 @@ def final_research_prompt(
             sections.append(f"{index}. {summary.strip()}")
     if not any(summary.strip() for summary in territory_summaries):
         sections.append("No territory summaries were produced; use the sources directly.")
+    if worker_disagreements:
+        sections.extend(["", "Worker disagreements that must be addressed:"])
+        sections.extend(
+            f"- {disagreement.topic}: {disagreement.agent_a_position} || {disagreement.agent_b_position}"
+            for disagreement in worker_disagreements
+        )
     sections.extend(["", "Numbered sources:"])
     sections.extend(numbered_sources(source_pairs, max_chars=1500))
     return "\n".join(sections).strip()
@@ -2063,25 +2830,34 @@ def build_complete_session(
     agent: str,
     queries_run: list[QueryCall],
     source_pairs: list[tuple[SourceRecord, str]],
+    router,
 ) -> ResearchSession:
     sources = [source for source, _ in source_pairs]
     evidence_chunks = [
         evidence_chunk(source, full_text, answer)
         for source, full_text in source_pairs
     ]
+    decision = session_answer_decision(sources, evidence_chunks, router=router)
+    rerank_passed_count = sum(
+        1 for chunk in evidence_chunks if chunk.rerank_score >= EVIDENCE_OVERLAP_PASS_THRESHOLD
+    )
+    rerank_failed_count = len(evidence_chunks) - rerank_passed_count
     return ResearchSession(
         protocol=Protocol.SEARCH,
         question=question,
         triggered_by=agent,
-        final_status=FinalStatus.COMPLETE,
-        answer=answer,
-        answer_kind=AnswerKind.FULL,
-        confidence=0.7,
-        answer_confidence=0.7,
+        final_status=decision.final_status,
+        answer=answer if decision.answer_kind != AnswerKind.ABSTAIN else None,
+        answer_kind=decision.answer_kind,
+        confidence=decision.confidence,
+        answer_confidence=decision.confidence,
         sources=sources,
         evidence_chunks=evidence_chunks,
-        rerank_passed_count=len(evidence_chunks),
+        rerank_threshold_used=EVIDENCE_OVERLAP_PASS_THRESHOLD,
+        rerank_passed_count=rerank_passed_count,
+        rerank_failed_count=rerank_failed_count,
         queries_run=queries_run,
+        open_questions=list(decision.open_questions),
     )
 
 
@@ -2126,6 +2902,7 @@ def build_and_save_research_session(
             territories=territories,
             runs=runs,
             llm_prefer=llm_prefer,
+            router=router,
             iteration_count=iteration_count,
             final_answer_override=final_attempt.output_text,
             final_backend_override=final_attempt.record.model_id,
@@ -2153,6 +2930,7 @@ def build_and_save_research_session(
             territories=territories,
             runs=runs,
             llm_prefer=llm_prefer,
+            router=router,
             iteration_count=iteration_count,
             final_answer_override=final_answer,
             final_backend_override=fallback_attempt.record.model_id,
@@ -2212,6 +2990,7 @@ def build_research_session_from_runs(
     territories: list[Territory],
     runs: list[TerritoryRun],
     llm_prefer: str | None,
+    router,
     iteration_count: int = 0,
     final_answer_override: str | None = None,
     final_backend_override: str | None = None,
@@ -2240,6 +3019,7 @@ def build_research_session_from_runs(
                 final_research_prompt(
                     question,
                     territory_summaries=[run.summary for run in runs],
+                    worker_disagreements=detect_worker_disagreements(question, runs),
                     source_pairs=source_pairs,
                     worker_output_paths=worker_output_paths_from_runs(runs),
                 ),
@@ -2264,24 +3044,35 @@ def build_research_session_from_runs(
                 "none",
             )
 
+    sources = [source for source, _full_text in source_pairs]
+    evidence_chunks = [
+        evidence_chunk(source, full_text, answer)
+        for source, full_text in source_pairs
+    ]
+    decision = session_answer_decision(sources, evidence_chunks, router=router)
+    rerank_passed_count = sum(
+        1 for chunk in evidence_chunks if chunk.rerank_score >= EVIDENCE_OVERLAP_PASS_THRESHOLD
+    )
+    rerank_failed_count = len(evidence_chunks) - rerank_passed_count
     session = ResearchSession(
         protocol=protocol,
         question=question,
         triggered_by=agent,
-        final_status=FinalStatus.COMPLETE,
+        final_status=decision.final_status,
         territories=territories,
-        sources=[source for source, _full_text in source_pairs],
-        evidence_chunks=[
-            evidence_chunk(source, full_text, answer)
-            for source, full_text in source_pairs
-        ],
-        rerank_passed_count=len(source_pairs),
+        sources=sources,
+        evidence_chunks=evidence_chunks,
+        rerank_threshold_used=EVIDENCE_OVERLAP_PASS_THRESHOLD,
+        rerank_passed_count=rerank_passed_count,
+        rerank_failed_count=rerank_failed_count,
         queries_run=queries_run,
-        answer=answer,
-        answer_kind=AnswerKind.FULL,
-        confidence=0.7,
-        answer_confidence=0.7,
+        answer=answer if decision.answer_kind != AnswerKind.ABSTAIN else None,
+        answer_kind=decision.answer_kind,
+        confidence=decision.confidence,
+        answer_confidence=decision.confidence,
+        open_questions=list(decision.open_questions),
         iteration_count=iteration_count,
+        agent_disagreements=detect_worker_disagreements(question, runs),
     )
     return session, backend
 
@@ -2315,18 +3106,105 @@ def build_abstain_session(
     )
 
 
-def evidence_chunk(source: SourceRecord, full_text: str, answer: str) -> EvidenceChunk:
-    paragraph = full_text.strip()[:300] or "n/a"
+def evidence_chunk(
+    source: SourceRecord,
+    full_text: str,
+    answer: str,
+    *,
+    claim: str | None = None,
+) -> EvidenceChunk:
+    paragraph, matched_claim, overlap_score = best_supporting_paragraph(
+        full_text,
+        answer,
+        claim=claim,
+    )
     return EvidenceChunk(
         source_id=source.source_id,
         paragraph_text=paragraph,
         char_offset=0,
         char_length=max(1, len(paragraph)),
-        rerank_score=0.7,
-        supports_claim=answer[:120] or "n/a",
-        crystal_check_passed=True,
-        crystal_check_score=0.8,
+        rerank_score=overlap_score,
+        supports_claim=matched_claim,
+        crystal_check_passed=overlap_score >= EVIDENCE_OVERLAP_PASS_THRESHOLD,
+        crystal_check_score=overlap_score,
     )
+
+
+def detect_worker_disagreements(
+    question: str,
+    runs: list[TerritoryRun],
+) -> list[Disagreement]:
+    summaries = [
+        (run, run.summary.strip())
+        for run in runs
+        if run.summary.strip()
+    ]
+    if len(summaries) < 2:
+        return []
+
+    negative_markers = (
+        "no study",
+        "does not exist",
+        "doesn't exist",
+        "not found",
+        "nothing found",
+        "measurement vacuum",
+        "couldn't find",
+    )
+    affirmative_markers = (
+        "arxiv",
+        "doi",
+        "paper",
+        "study",
+        "comparison",
+        "vs",
+        "0.",
+    )
+
+    negative_run = next(
+        (
+            run
+            for run, summary in summaries
+            if any(marker in summary.lower() for marker in negative_markers)
+        ),
+        None,
+    )
+    affirmative_run = next(
+        (
+            run
+            for run, summary in summaries
+            if any(marker in summary.lower() for marker in affirmative_markers)
+        ),
+        None,
+    )
+    if negative_run is None or affirmative_run is None or negative_run is affirmative_run:
+        return []
+
+    return [
+        Disagreement(
+            topic=question,
+            agent_a_role=negative_run.territory.assigned_agent_role,
+            agent_a_position=negative_run.summary.strip(),
+            agent_a_evidence=[],
+            agent_b_role=affirmative_run.territory.assigned_agent_role,
+            agent_b_position=affirmative_run.summary.strip(),
+            agent_b_evidence=[],
+        )
+    ]
+
+
+def _looks_like_worker_failure(text: str) -> bool:
+    lowered = text.strip().lower()
+    if not lowered:
+        return True
+    failure_markers = (
+        "error:",
+        "timeout waiting for response",
+        "authentication failed",
+        "invalid_grant",
+        "no response received",
+    )
+    return any(marker in lowered for marker in failure_markers)
 
 
 def build_query_calls(
@@ -2374,6 +3252,26 @@ def build_query_calls(
             )
         )
     return calls
+
+
+def build_local_query_calls(
+    question: str,
+    *,
+    local_payloads: list[tuple[str, dict[str, Any]]],
+) -> list[QueryCall]:
+    now = datetime.now(timezone.utc)
+    return [
+        QueryCall(
+            query_text=question,
+            lane=lane,
+            worker_model=WorkerModel.HAIKU,
+            started_at=now,
+            duration_ms=0,
+            result_count=len(_results(payload)),
+            error=payload.get("error") if isinstance(payload.get("error"), str) else None,
+        )
+        for lane, payload in local_payloads
+    ]
 
 
 def needs_deep_iteration(session: ResearchSession) -> bool:

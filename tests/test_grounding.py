@@ -141,7 +141,7 @@ def test_gemini_grounding_escalation_uses_agy_cli_not_retired_gemini(monkeypatch
             stderr="",
         )
 
-    monkeypatch.setattr(grounding, "_agy_binary", lambda: "/Users/cleo/bin/agy-cli-1")
+    monkeypatch.setattr(grounding, "_agy_binary", lambda: "agy-cli-1")
     monkeypatch.setattr(grounding.subprocess, "run", fake_run)
     monkeypatch.setattr(grounding, "_append_telemetry", lambda *args, **kwargs: None)
 
@@ -151,7 +151,7 @@ def test_gemini_grounding_escalation_uses_agy_cli_not_retired_gemini(monkeypatch
     assert calls
     cmd, kwargs = calls[0]
     assert cmd == [
-        "/Users/cleo/bin/agy-cli-1",
+        "agy-cli-1",
         "--dangerously-skip-permissions",
         "--print",
         "lookup prompt",
@@ -253,15 +253,132 @@ def test_synthesize_falls_back_to_heuristic_when_llm_unavailable(monkeypatch) ->
         "_heuristic_answer",
         lambda *args, **kwargs: "Paris is the capital of France.",
     )
+    source = grounding._VerifiedSource(
+        source=grounding.GroundSource(
+            url="https://example.com/paris",
+            tier=grounding.SourceTier.T2,
+            raw_text_path="/tmp/paris.txt",
+        ),
+        record=SimpleNamespace(topic_authority_score=0.5),
+        full_text="Paris is the capital of France.",
+        snippet_hint="",
+    )
 
     result = grounding._synthesize_from_sources(
         "What is the capital of France?",
-        [object()],
+        [source],
         search_results=[],
         backend_answers=[],
     )
 
-    assert result == ("partial", "Paris is the capital of France.", 0.55)
+    assert result == (
+        "partial",
+        "Paris is the capital of France.",
+        pytest.approx(0.43333333333333335),
+    )
+
+
+def _verified_source(
+    tmp_path: Path,
+    *,
+    url: str,
+    authority: float,
+) -> grounding._VerifiedSource:
+    raw_text_path = tmp_path / f"{url.rsplit('/', 1)[-1]}.txt"
+    full_text = f"Evidence for {url}."
+    raw_text_path.write_text(full_text, encoding="utf-8")
+    record = grounding.SourceRecord(
+        url=url,
+        domain="example.com",
+        title=f"Title for {url}",
+        fetched_at=grounding.datetime.now(grounding.timezone.utc),
+        content_hash=grounding.SourceRecord.hash_text(full_text),
+        extraction_method=grounding.ExtractionMethod.CURL,
+        raw_text_path=raw_text_path,
+        char_count=len(full_text),
+        tier=grounding.SourceTier.T2,
+        topic_authority_score=authority,
+    )
+    return grounding._VerifiedSource(
+        source=grounding.GroundSource(
+            url=url,
+            tier=record.tier,
+            raw_text_path=str(raw_text_path),
+        ),
+        record=record,
+        full_text=full_text,
+        snippet_hint="",
+    )
+
+
+def test_synthesize_confidence_changes_with_authority_same_source_count(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.delenv("GROUNDING_DISABLE_LLM_SYNTHESIS", raising=False)
+    monkeypatch.setattr(grounding, "_llm_synthesis", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        grounding,
+        "_heuristic_answer",
+        lambda *args, **kwargs: "Measured answer.",
+    )
+    monkeypatch.setattr(
+        grounding,
+        "_grounding_status_from_confidence",
+        lambda confidence: "grounded" if confidence >= 0.7 else "partial",
+    )
+
+    low_authority_sources = [
+        _verified_source(
+            tmp_path,
+            url="https://example.com/low-1",
+            authority=0.2,
+        ),
+        _verified_source(
+            tmp_path,
+            url="https://example.com/low-2",
+            authority=0.2,
+        ),
+    ]
+    high_authority_sources = [
+        _verified_source(
+            tmp_path,
+            url="https://example.com/high-1",
+            authority=0.9,
+        ),
+        _verified_source(
+            tmp_path,
+            url="https://example.com/high-2",
+            authority=0.9,
+        ),
+    ]
+
+    low_result = grounding._synthesize_from_sources(
+        "question",
+        low_authority_sources,
+        search_results=[],
+        backend_answers=[],
+    )
+    high_result = grounding._synthesize_from_sources(
+        "question",
+        high_authority_sources,
+        search_results=[],
+        backend_answers=[],
+    )
+
+    assert low_result == ("partial", "Measured answer.", pytest.approx(0.38666666666666666))
+    assert high_result == ("grounded", "Measured answer.", pytest.approx(0.8066666666666666))
+
+
+def test_grounding_status_fails_down_when_thresholds_unloadable(
+    monkeypatch,
+) -> None:
+    def fail_load_router():
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(grounding, "load_router", fail_load_router)
+
+    assert grounding._grounding_status_from_confidence(0.95) == "not_found"
 
 
 def test_ground_live_smoke_capital_of_france(monkeypatch) -> None:
@@ -281,30 +398,30 @@ def test_ground_live_smoke_capital_of_france(monkeypatch) -> None:
     assert all(Path(source.raw_text_path).exists() for source in result.sources)
 
 
-def test_run_grok_uses_hermes_with_locked_model(monkeypatch) -> None:
+def test_run_grok_uses_grok_cli_with_locked_model(monkeypatch) -> None:
     commands: list[list[str]] = []
+    telemetry_calls: list[tuple[str, str, str, str]] = []
 
     def fake_run(argv: list[str], **kwargs):  # type: ignore[no-untyped-def]
         commands.append(list(argv))
         return SimpleNamespace(returncode=0, stdout="ok", stderr="")
 
     monkeypatch.setattr(grounding, "_is_executable", lambda *args, **kwargs: True)
-    monkeypatch.setattr(grounding, "_append_telemetry", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        grounding,
+        "_append_telemetry",
+        lambda *args: telemetry_calls.append(args),
+    )
     monkeypatch.setattr(grounding.subprocess, "run", fake_run)
 
     monkeypatch.setenv("GROUNDING_GROK_BIN", str(grounding.DEFAULT_GROK_BIN))
     monkeypatch.delenv("GROUNDING_GROK_MODEL", raising=False)
-    assert grounding._run_grok("Hermes Grok prompt") == "ok"
+    assert grounding._run_grok("Grok CLI prompt") == "ok"
     assert commands[0] == [
         str(grounding.DEFAULT_GROK_BIN),
-        "-m",
-        grounding.DEFAULT_GROK_MODEL,
-        "-z",
-        "Hermes Grok prompt",
+        "-p",
+        "Grok CLI prompt",
     ]
-
-    hermes_model = "grok-test-model"
-    monkeypatch.setenv("GROUNDING_GROK_MODEL", hermes_model)
-    assert grounding._run_grok("hermes prompt") == "ok"
-    assert "-m" in commands[1]
-    assert commands[1][commands[1].index("-m") + 1] == hermes_model
+    assert telemetry_calls == [
+        ("grounding_escalation_grok", "grok-4.5", "Grok CLI prompt", "ok")
+    ]

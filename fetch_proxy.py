@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import functools
 import importlib.util
 import itertools
 import logging
@@ -15,11 +16,19 @@ from urllib.parse import quote
 import httpx
 from research_engine.apify_accounts import AccountPool, load_accounts_from_env
 
+from . import paths
 
-_SCRAPERAPI_PROXY_MODULE_PATH = Path("/Users/cleo/apify-proxy.py")
+
 _SCRAPERAPI_PROXY_USERNAME = "scraperapi"
 _SCRAPERAPI_PROXY_MODULE = None
-_NORDVPN_CREDENTIALS_PATH = Path("/Users/cleo/.secrets/nordvpn.env")
+_SCRAPERAPI_PROXY_MODULE_PATH = paths.optional_path(paths.APIFY_PROXY_MODULE_ENV) or paths.home_path(
+    "apify-proxy-app",
+    "apify-proxy.py",
+)
+_NORDVPN_CREDENTIALS_PATH = paths.optional_path(paths.NORDVPN_ENV_FILE_ENV) or paths.home_path(
+    ".secrets",
+    "nordvpn.env",
+)
 _NORDVPN_SERVERS_URL = "https://api.nordvpn.com/v1/servers"
 _NORDVPN_SOCKS_PORT = 1080
 _NORDVPN_BAD_TTL_SECONDS = 300
@@ -28,7 +37,7 @@ _NORDVPN_FALLBACK_HOSTS = [
     "socks-nl2.nordvpn.com",
 ]
 logger = logging.getLogger("fetch_proxy")
-FIRECRAWL_ENV_VARS = tuple(f"FIRECRAWL_API_KEY_{idx}" for idx in range(1, 7))
+FIRECRAWL_ENV_VARS = tuple(f"FIRECRAWL_API_KEY_{idx}" for idx in range(1, 9))
 
 
 @dataclass(frozen=True)
@@ -52,19 +61,49 @@ class NoProxyBackend(ProxyBackend):
         return ProxySession(proxy_url=None, label="no_proxy", sticky=sticky)
 
 
-def load_firecrawl_keys_from_env(max_keys: int = 6) -> list[tuple[str, str]]:
+@functools.lru_cache(maxsize=None)
+def env_file_values(path: Path | None = None) -> dict[str, str]:
+    """Parse the engine's env file. Cached. NEVER writes to os.environ."""
+    path = path or paths.env_file()
+    try:
+        if path is None or not path.exists():
+            return {}
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return {}
+    values: dict[str, str] = {}
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in values:
+            values[key] = value
+    return values
+
+
+def env_value(name: str) -> str:
+    """os.environ wins; fall back to the env file. Read-only."""
+    return (os.environ.get(name) or env_file_values().get(name) or "").strip()
+
+
+def load_firecrawl_keys_from_env(max_keys: int = 8) -> list[tuple[str, str]]:
     keys = [
-        (env_var, os.environ[env_var])
+        (env_var, value)
         for env_var in FIRECRAWL_ENV_VARS[:max_keys]
-        if os.environ.get(env_var)
+        if (value := env_value(env_var))
     ]
-    if len(keys) < max_keys:
+    if not keys:
         logger.warning(
             "firecrawl key rotation loaded %s/%s keys; checked %s",
             len(keys),
             max_keys,
             ", ".join(FIRECRAWL_ENV_VARS[:max_keys]),
         )
+    else:
+        logger.info("firecrawl key rotation loaded %s keys", len(keys))
     return keys
 
 
@@ -108,7 +147,8 @@ class OwnProxyBackend(ProxyBackend):
         )
 
 
-def _load_nordvpn_credentials(path: Path = _NORDVPN_CREDENTIALS_PATH) -> tuple[str, str]:
+def _load_nordvpn_credentials(path: Path | None = None) -> tuple[str, str]:
+    path = path or _NORDVPN_CREDENTIALS_PATH
     if not path.exists():
         msg = f"NordVPN credentials file missing: {path}"
         logger.error(msg)
@@ -157,7 +197,7 @@ def _fetch_nordvpn_socks_hosts() -> list[str]:
 
 
 class NordVPNSocksBackend(ProxyBackend):
-    def __init__(self, credentials_path: Path = _NORDVPN_CREDENTIALS_PATH):
+    def __init__(self, credentials_path: Path | None = None):
         self._user, self._password = _load_nordvpn_credentials(credentials_path)
         try:
             self._hosts = _fetch_nordvpn_socks_hosts()
@@ -194,14 +234,30 @@ def _load_scraperapi_proxy_module():
     if _SCRAPERAPI_PROXY_MODULE is not None:
         return _SCRAPERAPI_PROXY_MODULE
 
+    proxy_module_path = _SCRAPERAPI_PROXY_MODULE_PATH
+    if not proxy_module_path.exists():
+        raise FileNotFoundError(
+            f"ScraperAPI proxy module missing: {proxy_module_path}"
+        )
     spec = importlib.util.spec_from_file_location(
         "apify_proxy_runtime",
-        _SCRAPERAPI_PROXY_MODULE_PATH,
+        proxy_module_path,
     )
     if spec is None or spec.loader is None:
-        raise RuntimeError(f"unable to load {_SCRAPERAPI_PROXY_MODULE_PATH}")
+        raise RuntimeError(
+            f"unable to load ScraperAPI proxy module at {proxy_module_path}"
+        )
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    try:
+        spec.loader.exec_module(module)
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            f"ScraperAPI proxy module missing: {proxy_module_path}"
+        ) from exc
+    except Exception as exc:
+        raise RuntimeError(
+            f"unable to load ScraperAPI proxy module at {proxy_module_path}: {exc}"
+        ) from exc
     _SCRAPERAPI_PROXY_MODULE = module
     return module
 
@@ -225,6 +281,17 @@ class _ScraperAPIProxyRotator:
 
 def _get_scraperapi_rotator() -> _ScraperAPIProxyRotator:
     return _ScraperAPIProxyRotator(_load_scraperapi_proxy_module())
+
+
+def _load_scraperapi_backend(*, fail_open: bool) -> ProxyBackend:
+    try:
+        return ScraperAPIBackend()
+    except Exception as exc:
+        msg = f"scraperapi backend unavailable: {exc}"
+        if fail_open:
+            logger.warning("%s", msg)
+            return NoProxyBackend()
+        raise RuntimeError(msg) from exc
 
 
 class ScraperAPIBackend(ProxyBackend):
@@ -259,19 +326,11 @@ def load_proxy_backend(config: dict) -> ProxyBackend:
         proxies = [item for item in os.environ.get("OWN_PROXIES", "").split(",") if item]
         return OwnProxyBackend(proxies) if proxies else NoProxyBackend()
     if choice == "scraperapi":
-        try:
-            return ScraperAPIBackend()
-        except Exception as exc:
-            logger.warning("scraperapi backend unavailable, using no proxy backend: %s", exc)
-            return NoProxyBackend()
+        return _load_scraperapi_backend(fail_open=False)
     if choice == "nordvpn":
         try:
             return NordVPNSocksBackend()
         except Exception as exc:
             logger.warning("nordvpn backend unavailable, trying scraperapi backend: %s", exc)
-        try:
-            return ScraperAPIBackend()
-        except Exception as exc:
-            logger.warning("scraperapi backend unavailable, using no proxy backend: %s", exc)
-            return NoProxyBackend()
+        return _load_scraperapi_backend(fail_open=True)
     return NoProxyBackend()

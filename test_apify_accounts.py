@@ -1,3 +1,4 @@
+import os
 from unittest.mock import patch
 
 import pytest
@@ -8,6 +9,7 @@ from research_engine.apify_accounts import (
     AllAccountsExhausted,
     ApifyAccount,
     actor_route_for_url,
+    _read_secret_files,
     load_accounts_from_env,
 )
 
@@ -44,11 +46,11 @@ def test_all_capped_raises() -> None:
             pool.next_account()
 
 
-def test_load_accounts_uses_up_to_six_numbered_tokens(monkeypatch, caplog) -> None:
+def test_load_accounts_uses_up_to_twelve_numbered_tokens(monkeypatch, caplog) -> None:
     monkeypatch.setattr("research_engine.apify_accounts._read_secret_files", lambda: {})
     monkeypatch.delenv("APIFY_ACCOUNTS", raising=False)
     monkeypatch.delenv("APIFY_API_KEY", raising=False)
-    for idx in range(1, 8):
+    for idx in range(1, 14):
         monkeypatch.delenv(f"APIFY_ACCOUNT_ID_{idx}", raising=False)
         monkeypatch.delenv(f"APIFY_PROXY_PASS_{idx}", raising=False)
         monkeypatch.delenv(f"APIFY_PROXY_PASSWORD_{idx}", raising=False)
@@ -56,15 +58,15 @@ def test_load_accounts_uses_up_to_six_numbered_tokens(monkeypatch, caplog) -> No
 
     accounts = load_accounts_from_env()
 
-    assert [account.id for account in accounts] == [f"apify_{idx}" for idx in range(1, 7)]
+    assert [account.id for account in accounts] == [f"apify_{idx}" for idx in range(1, 13)]
     assert "apify account rotation loaded" not in caplog.text
 
 
-def test_load_accounts_warns_when_fewer_than_six(monkeypatch, caplog) -> None:
+def test_load_accounts_warns_when_fewer_than_twelve(monkeypatch, caplog) -> None:
     monkeypatch.setattr("research_engine.apify_accounts._read_secret_files", lambda: {})
     monkeypatch.delenv("APIFY_ACCOUNTS", raising=False)
     monkeypatch.delenv("APIFY_API_KEY", raising=False)
-    for idx in range(1, 7):
+    for idx in range(1, 13):
         monkeypatch.delenv(f"APIFY_TOKEN_{idx}", raising=False)
         monkeypatch.delenv(f"APIFY_ACCOUNT_ID_{idx}", raising=False)
         monkeypatch.delenv(f"APIFY_PROXY_PASS_{idx}", raising=False)
@@ -74,7 +76,39 @@ def test_load_accounts_warns_when_fewer_than_six(monkeypatch, caplog) -> None:
     accounts = load_accounts_from_env()
 
     assert len(accounts) == 1
-    assert "apify account rotation loaded 1/6 accounts" in caplog.text
+    assert "apify account rotation loaded 1/12 accounts" in caplog.text
+
+
+def test_load_accounts_does_not_mutate_environment(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "research_engine.apify_accounts._read_secret_files",
+        lambda: {"APIFY_TOKEN_1": "file-token-1"},
+    )
+    monkeypatch.delenv("APIFY_ACCOUNTS", raising=False)
+    monkeypatch.delenv("APIFY_API_KEY", raising=False)
+    monkeypatch.delenv("APIFY_ACCOUNT_ID", raising=False)
+    for idx in range(1, 14):
+        monkeypatch.delenv(f"APIFY_TOKEN_{idx}", raising=False)
+        monkeypatch.delenv(f"APIFY_KEY_{idx}", raising=False)
+        monkeypatch.delenv(f"APIFY_ACCOUNT_ID_{idx}", raising=False)
+        monkeypatch.delenv(f"APIFY_PROXY_PASS_{idx}", raising=False)
+        monkeypatch.delenv(f"APIFY_PROXY_PASSWORD_{idx}", raising=False)
+    baseline = dict(os.environ)
+
+    accounts = load_accounts_from_env()
+
+    assert [account.token for account in accounts] == ["file-token-1"]
+    assert dict(os.environ) == baseline
+
+
+def test_read_secret_files_skips_missing_entries(tmp_path) -> None:
+    present = tmp_path / "apify-present.env"
+    present.write_text("APIFY_TOKEN_1=token-one\n", encoding="utf-8")
+    missing = tmp_path / "missing.env"
+
+    values = _read_secret_files((missing, present))
+
+    assert values == {"APIFY_TOKEN_1": "token-one"}
 
 
 def test_social_actor_routes_cover_instagram_and_tiktok(monkeypatch) -> None:

@@ -16,6 +16,8 @@ from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import urlparse
 
+from . import paths
+
 
 SUFFICIENCY_FLASH_MODEL = os.getenv(
     "MENTOR_SUFFICIENCY_FLASH_MODEL",
@@ -518,11 +520,9 @@ def final_judge(result: dict[str, Any]) -> dict[str, Any]:
 
 
 def should_downgrade(result: dict[str, Any]) -> bool:
-    return result.get("terminal_state") in {"partial", "exhausted"}
-
-
-def collect_report_source_texts(report: object) -> list[SourceText]:
-    return collect_items_by_source(getattr(report, "items_by_source", {}) or {})
+    if result.get("low_confidence") is True:
+        return True
+    return str(result.get("terminal_state") or "").strip().lower() in {"partial", "exhausted"}
 
 
 def collect_items_by_source(items_by_source: dict[str, Sequence[object]]) -> list[SourceText]:
@@ -1053,13 +1053,15 @@ def _client_route(client: SufficiencyClient) -> str:
 def _resolve_agy_executable() -> str | None:
     candidates = (
         SUFFICIENCY_AGY_BIN,
-        str(Path("/Users/cleo/bin/agy-cli-1")),
-        str(Path("/Users/cleo/bin/agy-cli-2")),
         str(Path.home() / "bin" / "agy-cli-1"),
         str(Path.home() / "bin" / "agy-cli-2"),
         str(Path.home() / ".local" / "bin" / "agy"),
+        paths.executable(paths.AGY_BIN_ENV, "agy-cli-1", "agy-cli-2", "agy") or "",
     )
-    return _first_executable(candidates)
+    resolved = _first_executable(candidates)
+    if resolved and resolved.endswith("/agy") and SUFFICIENCY_AGY_BIN == "agy":
+        return "agy"
+    return resolved
 
 
 def _agy_prompt_arg(prompt: str) -> str:
@@ -1133,8 +1135,16 @@ def _first_executable(candidates: Sequence[str]) -> str | None:
         if not expanded or expanded in seen:
             continue
         seen.add(expanded)
-        if _is_executable(expanded):
-            return expanded
+        path = Path(expanded).expanduser()
+        if path.is_file() and os.access(path, os.X_OK):
+            return str(path)
+        # Bare command names must be resolved to an absolute path NOW: the
+        # checker subprocess runs with a sealed PATH that will not contain
+        # the caller's shell PATH, so returning a bare name causes
+        # FileNotFoundError ([Errno 2]) at exec time.
+        resolved = shutil.which(expanded)
+        if resolved:
+            return resolved
     return None
 
 

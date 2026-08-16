@@ -1,4 +1,8 @@
+import os
+import logging
 from unittest.mock import patch
+
+import pytest
 
 from research_engine.apify_accounts import AccountPool, ApifyAccount
 from research_engine.fetch_proxy import (
@@ -85,6 +89,19 @@ def test_scraperapi_backend_builds_proxy_mode_url(monkeypatch) -> None:
     assert session.sticky is False
 
 
+def test_factory_raises_when_scraperapi_module_is_missing(monkeypatch, tmp_path) -> None:
+    missing_path = tmp_path / "missing-apify-proxy.py"
+    monkeypatch.setattr("research_engine.fetch_proxy._SCRAPERAPI_PROXY_MODULE", None)
+    monkeypatch.setattr("research_engine.fetch_proxy._SCRAPERAPI_PROXY_MODULE_PATH", missing_path)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        load_proxy_backend({"proxy": {"backend": "scraperapi"}})
+
+    message = str(excinfo.value)
+    assert "ScraperAPI proxy module missing" in message
+    assert str(missing_path) in message
+
+
 def test_factory_loads_scraperapi_backend() -> None:
     assert isinstance(load_proxy_backend({"proxy": {"backend": "scraperapi"}}), ScraperAPIBackend)
 
@@ -103,11 +120,15 @@ def test_scraperapi_backend_falls_back_to_direct_fetch_when_rotator_fails(monkey
     assert session.label == "scraperapi_unavailable"
 
 
-def test_firecrawl_key_loader_uses_present_slots_and_warns(monkeypatch, caplog) -> None:
-    for idx in range(1, 7):
+def test_firecrawl_key_loader_uses_present_slots_and_logs_by_availability(
+    monkeypatch, caplog
+) -> None:
+    monkeypatch.setattr("research_engine.fetch_proxy.env_file_values", lambda: {})
+    for idx in range(1, 9):
         monkeypatch.delenv(f"FIRECRAWL_API_KEY_{idx}", raising=False)
     monkeypatch.setenv("FIRECRAWL_API_KEY_1", "test-firecrawl-one")
     monkeypatch.setenv("FIRECRAWL_API_KEY_3", "test-firecrawl-three")
+    caplog.set_level(logging.INFO, logger="fetch_proxy")
 
     keys = load_firecrawl_keys_from_env()
 
@@ -115,4 +136,28 @@ def test_firecrawl_key_loader_uses_present_slots_and_warns(monkeypatch, caplog) 
         "FIRECRAWL_API_KEY_1",
         "FIRECRAWL_API_KEY_3",
     ]
-    assert "firecrawl key rotation loaded 2/6 keys" in caplog.text
+    assert "firecrawl key rotation loaded 2 keys" in caplog.text
+    assert not any(record.levelno >= logging.WARNING for record in caplog.records)
+
+    caplog.clear()
+    monkeypatch.delenv("FIRECRAWL_API_KEY_1")
+    monkeypatch.delenv("FIRECRAWL_API_KEY_3")
+
+    assert load_firecrawl_keys_from_env() == []
+    assert "firecrawl key rotation loaded 0/8 keys" in caplog.text
+    assert any(record.levelno == logging.WARNING for record in caplog.records)
+
+
+def test_firecrawl_key_loader_does_not_mutate_environment(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "research_engine.fetch_proxy.env_file_values",
+        lambda: {"FIRECRAWL_API_KEY_2": "file-firecrawl-two"},
+    )
+    for idx in range(1, 9):
+        monkeypatch.delenv(f"FIRECRAWL_API_KEY_{idx}", raising=False)
+    baseline = dict(os.environ)
+
+    keys = load_firecrawl_keys_from_env()
+
+    assert keys == [("FIRECRAWL_API_KEY_2", "file-firecrawl-two")]
+    assert dict(os.environ) == baseline

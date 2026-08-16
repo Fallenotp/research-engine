@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import importlib.util
-from pathlib import Path
+
+from research_engine import paths
 
 
 def _load_proxy_module():
-    path = Path("/Users/cleo/semantic-search-proxy.py")
+    path = paths.optional_path(paths.SEMANTIC_PROXY_ENV) or paths.home_path("semantic-search-proxy.py")
     spec = importlib.util.spec_from_file_location("semantic_search_proxy_test", path)
     assert spec is not None
     assert spec.loader is not None

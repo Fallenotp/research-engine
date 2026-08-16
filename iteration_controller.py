@@ -1,3 +1,14 @@
+"""Dormant auto-iteration subsystem for `research_engine`.
+
+This module is currently not called from the live `/research` or
+`/deep-research` pipeline. The intended entry point is
+`decide_next_iteration(question, session_so_far)`.
+
+Callers must pass the current question string plus a `ResearchSession`
+containing the session's sources, evidence chunks, rerank counts,
+iteration count, and cost telemetry.
+"""
+
 from __future__ import annotations
 
 import logging
@@ -86,6 +97,25 @@ def detect_gaps(session: ResearchSession) -> list[Gap]:
         LOGGER.warning("Could not load router for detect_gaps; skipping freshness rule")
         routed = None
     return _detect_gaps(session, routed)
+
+
+def decide_next_iteration(
+    question: str,
+    session_so_far: ResearchSession,
+) -> IterationDecision:
+    """Load the router and decide whether the session should iterate again.
+
+    This is the intended entry point for a live caller that has a question
+    string and the current in-memory session state.
+    """
+
+    session = session_so_far
+    if session.question != question:
+        session = session_so_far.model_copy(update={"question": question})
+    decision = decide_iteration(session, load_router(DEFAULT_CONFIG_PATH))
+    if session is not session_so_far:
+        session_so_far.gaps_detected = session.gaps_detected
+    return decision
 
 
 def decide_iteration(session: ResearchSession, router: Router) -> IterationDecision:
@@ -231,7 +261,7 @@ def plan_recursive_research(
     scout_summary: str = "",
     distinct_llm_count: int | None = None,
 ) -> RecursivePlan:
-    """Create level-1 recursive work from the Gemini 3 Flash scout's depth targets."""
+    """Create level-1 recursive work from the Gemini 3.7 Flash scout's depth targets."""
 
     tier = select_recursion_tier(
         session,
@@ -243,19 +273,17 @@ def plan_recursive_research(
         tier.budget_ceiling_usd - float(session.total_cost_usd_estimate),
     )
     if session.total_cost_usd_estimate >= tier.budget_ceiling_usd:
-        return RecursivePlan(
+        return _empty_recursive_plan(
             session=session,
-            protocol=session.protocol,
             tier=tier,
-            distinct_llm_count=(
-                count_distinct_answering_llms(session)
-                if distinct_llm_count is None
-                else distinct_llm_count
-            ),
-            roots=[],
-            asked_questions=[],
-            dropped_repeated_questions=[],
-            leaf_count=0,
+            distinct_llm_count=distinct_llm_count,
+            budget_remaining_usd=budget_remaining,
+        )
+    if tier.max_depth_below_scout <= 0 or tier.leaf_search_cap <= 0:
+        return _empty_recursive_plan(
+            session=session,
+            tier=tier,
+            distinct_llm_count=distinct_llm_count,
             budget_remaining_usd=budget_remaining,
         )
     routed = _safe_route(router, session.question)
@@ -528,6 +556,30 @@ def _safe_route(router: Router, question: str) -> RoutingDecision | None:
         return None
 
 
+def _empty_recursive_plan(
+    session: ResearchSession,
+    tier: RecursionTierConfig,
+    *,
+    distinct_llm_count: int | None,
+    budget_remaining_usd: float,
+) -> RecursivePlan:
+    return RecursivePlan(
+        session=session,
+        protocol=session.protocol,
+        tier=tier,
+        distinct_llm_count=(
+            count_distinct_answering_llms(session)
+            if distinct_llm_count is None
+            else distinct_llm_count
+        ),
+        roots=[],
+        asked_questions=[],
+        dropped_repeated_questions=[],
+        leaf_count=0,
+        budget_remaining_usd=budget_remaining_usd,
+    )
+
+
 def _dedupe_questions(
     questions: list[str],
     asked_questions: list[str],
@@ -633,7 +685,9 @@ def _parse_published_date(value: str | None) -> datetime | None:
             continue
         try:
             parsed = datetime.fromisoformat(candidate)
-            return parsed.replace(tzinfo=timezone.utc)
+            if parsed.tzinfo is None:
+                return parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc)
         except ValueError:
             continue
     LOGGER.warning("Could not parse published_date=%r", value)

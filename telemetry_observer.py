@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import fcntl
 import json
 import os
@@ -7,15 +8,19 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from . import paths
+
 try:
     from research_engine.verbatim_check import check_verbatim
 except ModuleNotFoundError:  # pragma: no cover - direct script execution fallback
     from verbatim_check import check_verbatim
 
 
-SESSIONS_DIR = Path.home() / ".claude" / "research-sessions"
-MASTER_LOG = Path("/Users/cleo/lattice/data/agent_state/research-telemetry.jsonl")
-CALL_LOG = Path("/Users/cleo/lattice/data/agent_state/research-call-log.jsonl")
+SESSIONS_DIR = paths.optional_path(paths.RESEARCH_SESSIONS_DIR_ENV) or paths.data_path(
+    "research-sessions"
+)
+MASTER_LOG = paths.telemetry_path("research-telemetry.jsonl")
+CALL_LOG = paths.telemetry_path("research-call-log.jsonl")
 ROW_FIELDS = (
     "ts",
     "run_ts",
@@ -239,38 +244,51 @@ def existing_session_ids() -> set[str]:
     return seen
 
 
-def summarize_calls() -> dict[str, dict[str, float | int]]:
-    try:
-        if not CALL_LOG.exists():
-            return {}
+def _read_jsonl_dict_rows(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
 
-        buckets: dict[str, dict[str, float | int]] = {}
-        with CALL_LOG.open("r", encoding="utf-8") as handle:
+    rows: list[dict[str, Any]] = []
+    try:
+        with path.open("r", encoding="utf-8") as handle:
             for line in handle:
                 try:
                     row = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if not isinstance(row, dict):
-                    continue
-                lane = str(row.get("lane") or "").strip()
-                if not lane:
-                    continue
-                duration_ms = row.get("duration_ms")
-                try:
-                    duration_value = float(duration_ms or 0)
-                except (TypeError, ValueError):
-                    duration_value = 0.0
-                bucket = buckets.setdefault(
-                    lane,
-                    {"calls": 0, "ok": 0, "failed": 0, "avg_ms": 0.0, "_total_ms": 0.0},
-                )
-                bucket["calls"] += 1
-                bucket["_total_ms"] += duration_value
-                if row.get("ok") is True:
-                    bucket["ok"] += 1
-                else:
-                    bucket["failed"] += 1
+                if isinstance(row, dict):
+                    rows.append(row)
+    except Exception:
+        return []
+    return rows
+
+
+def summarize_calls(
+    rows: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None = None
+) -> dict[str, dict[str, float | int]]:
+    try:
+        buckets: dict[str, dict[str, float | int]] = {}
+        for row in rows if rows is not None else _read_jsonl_dict_rows(CALL_LOG):
+            if not isinstance(row, dict):
+                continue
+            lane = str(row.get("lane") or "").strip()
+            if not lane:
+                continue
+            duration_ms = row.get("duration_ms")
+            try:
+                duration_value = float(duration_ms or 0)
+            except (TypeError, ValueError):
+                duration_value = 0.0
+            bucket = buckets.setdefault(
+                lane,
+                {"calls": 0, "ok": 0, "failed": 0, "avg_ms": 0.0, "_total_ms": 0.0},
+            )
+            bucket["calls"] += 1
+            bucket["_total_ms"] += duration_value
+            if row.get("ok") is True:
+                bucket["ok"] += 1
+            else:
+                bucket["failed"] += 1
 
         summary: dict[str, dict[str, float | int]] = {}
         for lane, bucket in buckets.items():
@@ -285,6 +303,24 @@ def summarize_calls() -> dict[str, dict[str, float | int]]:
         return summary
     except Exception:
         return {}
+
+
+def format_call_summary(summary: dict[str, dict[str, float | int]]) -> str:
+    if not summary:
+        return "No call rows found."
+
+    lines: list[str] = []
+    for lane, bucket in sorted(summary.items()):
+        calls = int(bucket["calls"])
+        ok = int(bucket["ok"])
+        failed = int(bucket["failed"])
+        avg_ms = float(bucket["avg_ms"])
+        success_rate = (ok / calls * 100.0) if calls else 0.0
+        lines.append(
+            f"{lane}: calls={calls} ok={ok} failed={failed} "
+            f"success_rate={success_rate:.1f}% avg_ms={avg_ms:.1f}"
+        )
+    return "\n".join(lines)
 
 
 def run() -> dict[str, Any]:
@@ -333,5 +369,44 @@ def run() -> dict[str, Any]:
     return summary
 
 
+def main(argv: list[str] | None = None) -> dict[str, Any]:
+    parser = argparse.ArgumentParser()
+    actions = parser.add_mutually_exclusive_group()
+    actions.add_argument("--summarize-calls", action="store_true")
+    actions.add_argument("--log-buzz", metavar="TOPIC")
+    parser.add_argument("--json", action="store_true", dest="emit_json")
+    parser.add_argument("--n-signals", type=int, default=0)
+    parser.add_argument("--platform", action="append", default=[])
+    parser.add_argument("--agent")
+    args = parser.parse_args(argv)
+
+    if args.log_buzz is not None:
+        log_buzz(
+            args.log_buzz,
+            n_signals=args.n_signals,
+            platforms_with_data=args.platform,
+            agent=args.agent,
+        )
+        result = {
+            "logged": True,
+            "topic": args.log_buzz,
+            "n_signals": args.n_signals,
+            "platforms": _sorted_strings(args.platform),
+            "master_log": str(MASTER_LOG),
+        }
+        print(json.dumps(result, sort_keys=True) if args.emit_json else result)
+        return result
+
+    if args.summarize_calls:
+        summary = summarize_calls()
+        if args.emit_json:
+            print(json.dumps(summary, indent=2, sort_keys=True))
+        else:
+            print(format_call_summary(summary))
+        return summary
+
+    return run()
+
+
 if __name__ == "__main__":
-    run()
+    main()

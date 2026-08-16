@@ -1,7 +1,43 @@
-cache/
+# Python
 __pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Test + lint caches
+.pytest_cache/
 .ruff_cache/
-.tasks/
-*.pyc
-*.bak
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Secrets — never commit these
+.env
+*.env
+!.env.example
+*.key
+*.pem
+secrets/
+.secrets/
+
+# Runtime output — machine-specific, never publish
+cache/
 *.log
+*.jsonl
+tools/*_report.json
+scripts/key-health-state.json
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Backups — these hold pre-cleanup absolute paths
+*.bak
+*.bak-*
+*.orig
+*.rej

@@ -2,7 +2,7 @@
 
 A self-hosted web research pipeline. Give it a question and it finds sources, pulls clean text out of them (even from hard-to-scrape sites), grounds every claim in the fetched evidence, and returns a cited answer — or honestly abstains when the evidence is too thin.
 
-> **Read this first:** this repo is a working snapshot lifted from the author's machine. It leans on local services, hard-coded paths, and credential files that live on that machine (all listed under [Setup](#setup)). Treat it as reference code to learn from or adapt, not a `pip install`-and-go package.
+> **Read this first:** this is a working system, not a polished library. Every machine-specific path is now an environment variable with a sensible default (see [Configuration](#configuration)), so it runs off your machine — but it still expects several local services and third-party API keys you supply yourself. There is no packaging file yet; see [Making imports work](#making-imports-work). Treat it as a system to stand up, not a `pip install`-and-go package.
 
 It powers three research modes, all in `research_cli.py`:
 
@@ -50,19 +50,18 @@ For a normal web URL, `extract_clean_text()` tries, in order:
 
 1. **Repo ingest** — GitHub/GitLab-style repo URLs get packed into one text file first
 2. **Apify actors** — platform-specific scrapers for routed platforms (X, Instagram…), via an account pool (`apify_accounts.py`) and a local Apify proxy
-3. **L3 Steel browser** — a real browser session (only when explicitly enabled; guarded by `l3_guard.py`/`l3_reaper.py`)
+3. **agent-browser** — a real browser session driven by the `agent-browser` CLI (only when explicitly enabled)
 4. **Crawl4AI** — JavaScript pages rendered in local Chromium (shells out to a helper script)
 5. **Crawlee** — a second crawler engine as backup
 6. **Scrapling + Camoufox** — stealth browser for bot walls (Cloudflare, Turnstile)
-7. **Steel scrape endpoint** — optional local scraping service
-8. **Firecrawl** — API-based scraping as the final web rung
+7. **Firecrawl** — API-based scraping as the final web rung
 
 Special content branches:
 
 - **Local files and `file://` links** work too — not just web URLs
 - **Documents and media** — Word, PowerPoint, Excel, PDF, images, and audio (`.mp3/.m4a/.wav`) go through MarkItDown; PDFs can also use PyMuPDF/Docling
 - **Blocked IPs** — `fetch_proxy.py` can route retries through a rotating VPN proxy
-- (`wayback_fallback.py` for dead links exists in the repo but is not wired into this ladder)
+- **Dead links** — `wayback_fallback.py` is wired into the ladder in `extractor.py` and retries via the Wayback Machine
 
 Every attempt is logged by `telemetry_observer.py` with what it returned.
 
@@ -122,15 +121,35 @@ Deep-research deliberately mixes vendors — agreement across unrelated model fa
 - Python 3.11+ with the scrape stack: `trafilatura`, `curl_cffi`, `crawl4ai`, `scrapling`
 - A local [SearXNG](https://github.com/searxng/searxng) instance on `localhost:8888`
 - The subscription LLM CLIs: `codex`, `claude`, and `agy` (Gemini — required for research/deep-research modes)
-- Optional services on localhost: semantic search proxy (`:18791`), Apify proxy (`:18793`), L3 browser readers (`:7799`, `:3000`), and a `webread-steel` Docker container for the browser tier
+- The `agent-browser` CLI, if you want the real-browser reading rung
+- Optional services on localhost: semantic search proxy (`:18791`), Apify proxy (`:18793`), local read service (`:8077`)
 
 ### Keys and credential files (never stored in this repo)
 - Free API keys read from the environment for some lanes: `GITHUB_TOKEN`, `GITLAB_TOKEN`, `DATA_GOV_API_KEY`, `FEC_API_KEY`, `OPENSTATES_API_KEY`, `FDA_API_KEY`, plus `~/.kaggle/kaggle.json` for Kaggle
-- A Mistral free-key pool file (the CLI reads it from a local `.secrets` path)
+- A Mistral free-key pool file, pointed at by `RESEARCH_ENGINE_MISTRAL_KEYS_FILE`
 - Optional VPN credentials for the rotating fetch proxy
 
-### Hard-coded paths to adapt
-Several spots point at the author's machine (for example the Crawl4AI helper script path and the Python venv path near the top of `extractor.py`, and the secrets path in `research_cli.py`). Search for `/Users/` and adjust before running elsewhere.
+## Configuration
+
+Nothing is hard-coded to one machine. Every path and binary is resolved through `paths.py`, which reads
+environment variables and falls back to sensible defaults. Copy `.env.example`, fill in what you need, and
+point `RESEARCH_ENGINE_ENV_FILE` at it — or just export the variables.
+
+The ones most people will set:
+
+| Variable | Default | What it does |
+| --- | --- | --- |
+| `RESEARCH_ENGINE_DATA_DIR` | `~/.research_engine` | Where telemetry, logs and the session store are written |
+| `RESEARCH_ENGINE_CONTACT_EMAIL` | *(unset)* | Your contact address for outbound `User-Agent` headers. Crossref and the Wayback Machine give better rate limits when you supply one |
+| `RESEARCH_ENGINE_ENV_FILE` | *(unset)* | Optional `.env` file to load API keys from |
+| `RESEARCH_ENGINE_AGY_BIN` | found on `PATH` | Path to the `agy` (Gemini) CLI |
+| `RESEARCH_ENGINE_GROK_BIN` | found on `PATH` | Path to the `grok` CLI |
+
+Binaries are located with `shutil.which()` first, so if the CLIs are on your `PATH` you do not need to set
+anything. When a required binary is genuinely missing, the error names the exact variable to set.
+
+Integrations with the author's other tools (Obsidian, a local buzz script, a semantic-search proxy) are
+**off unless you set their variable**. See `.env.example` for the full list of 24 variables.
 
 ### Making imports work
 The code imports `from research_engine ...`, and this repo has no packaging file (`pyproject.toml`/`setup.py`). Clone it into a folder **named `research_engine`** and run from the parent directory, or add the parent directory to `PYTHONPATH`.
@@ -176,4 +195,27 @@ pytest tests/ -q
 
 ## Status
 
-Working snapshot, 2026-07-03, of a live personal system. The code runs daily on its home machine; running it anywhere else means standing up the services and adapting the paths listed under Setup. The `docs/` folder holds the deeper protocol and decision-guide documents the engine was built from.
+Working snapshot, 2026-08-16, of a live personal system that runs daily. Running it elsewhere means
+standing up the services listed under Setup and supplying your own API keys — but it no longer means
+editing paths in the source.
+
+**What changed since the 2026-07-03 snapshot**
+
+- Every `/Users/...` path replaced by an environment variable with a default (`paths.py`).
+- Contact email in outbound `User-Agent` headers is now yours to set, not baked in.
+- The dead Steel browser backend was removed; `agent-browser` covers that rung.
+- A wiring audit found that several quality scores — source authority, rerank score, answer confidence —
+  were hardcoded constants that measured nothing. They now derive from real signals, and confidence
+  fails *down* to an abstain rather than up to a confident-looking answer when config cannot be read.
+- Router `fleets:` config is now actually read by the research path instead of being ignored.
+- Test suite: 362 passing.
+
+**Known gaps, stated plainly**
+
+- No `pyproject.toml`/`setup.py` yet — see [Making imports work](#making-imports-work).
+- One test (`test_proxy_json_enforce`) fails without a local proxy service running.
+- The internal `docs/` folder is not published; it is working notes, not documentation.
+
+## Licence
+
+MIT. See [LICENSE](LICENSE).

@@ -11,11 +11,22 @@ import urllib.parse
 from pathlib import Path
 from typing import Any
 
-ENV_FILE = Path("/Users/cleo/consequence-tracker/.env")
-OPENCLAW_ENV_FILE = Path("/Users/cleo/.openclaw/.env")
-COUNTER_FILE = Path("/Users/cleo/.ct-api-keys.json")
-STATE_FILE = Path("/Users/cleo/lattice/research_engine/scripts/key-health-state.json")
-LOG_FILE = Path("/Users/cleo/lattice/research_engine/scripts/key-health-log.jsonl")
+from research_engine import paths
+
+ENV_FILE = paths.optional_path(paths.CONSEQUENCE_TRACKER_ENV_FILE_ENV) or paths.data_path(
+    "missing-consequence-tracker.env"
+)
+OPENCLAW_ENV_FILE = paths.optional_path(paths.OPENCLAW_ENV_FILE_ENV) or paths.data_path(
+    "missing-openclaw.env"
+)
+MISTRAL_ENV_FILE = paths.optional_path(paths.MISTRAL_KEYS_FILE_ENV) or paths.data_path(
+    "missing-mistral-free-keys.env"
+)
+COUNTER_FILE = paths.optional_path(paths.CT_API_KEYS_STATE_ENV) or paths.data_path(
+    "ct-api-keys.json"
+)
+STATE_FILE = paths.package_path("scripts", "key-health-state.json")
+LOG_FILE = paths.package_path("scripts", "key-health-log.jsonl")
 CURL_BIN = "/usr/bin/curl"
 LAUNCHCTL_BIN = "/bin/launchctl"
 PROXY_LABEL = "com.semantic-search-proxy"
@@ -39,6 +50,19 @@ KEYS = [
     ("youcom_4", "youcom", "YOUCOM_API_KEY_4", "main", 12),
     ("tavily_1", "tavily", "TAVILY_API_KEY", "tavily", 0),
     ("tavily_2", "tavily", "TAVILY_API_KEY_2", "tavily", 1),
+    ("mistral_1", "mistral", "MISTRAL_FREE_KEY_1", "mistral", 0),
+    ("mistral_2", "mistral", "MISTRAL_FREE_KEY_2", "mistral", 1),
+    ("mistral_3", "mistral", "MISTRAL_FREE_KEY_3", "mistral", 2),
+    ("mistral_4", "mistral", "MISTRAL_FREE_KEY_4", "mistral", 3),
+    ("mistral_5", "mistral", "MISTRAL_FREE_KEY_5", "mistral", 4),
+    ("mistral_6", "mistral", "MISTRAL_FREE_KEY_6", "mistral", 5),
+    ("mistral_7", "mistral", "MISTRAL_FREE_KEY_7", "mistral", 6),
+    ("mistral_8", "mistral", "MISTRAL_FREE_KEY_8", "mistral", 7),
+    ("mistral_9", "mistral", "MISTRAL_FREE_KEY_9", "mistral", 8),
+    ("mistral_10", "mistral", "MISTRAL_FREE_KEY_10", "mistral", 9),
+    ("mistral_11", "mistral", "MISTRAL_FREE_KEY_11", "mistral", 10),
+    ("mistral_12", "mistral", "MISTRAL_FREE_KEY_12", "mistral", 11),
+    ("mistral_13", "mistral", "MISTRAL_FREE_KEY_13", "mistral", 12),
 ]
 
 CTX = ssl.create_default_context()
@@ -162,6 +186,13 @@ def test_key(provider: str, api_key: str) -> tuple[int | None, str, str | None]:
             "GET",
             {"X-API-Key": api_key},
         )
+    if provider == "mistral":
+        return request(
+            "api.mistral.ai",
+            "/v1/models",
+            "GET",
+            {"Authorization": f"Bearer {api_key}", "Accept": "application/json"},
+        )
     body = json.dumps(
         {"api_key": api_key, "query": "test", "max_results": 1}
     ).encode("utf-8")
@@ -275,6 +306,7 @@ def send_discord_alert(
 def main() -> int:
     now = time.strftime("%Y-%m-%dT%H:%M:%S%z")
     env = load_env_file(ENV_FILE)
+    env.update(load_env_file(MISTRAL_ENV_FILE))
     previous = read_json(STATE_FILE, {})
     previous_results = previous.get("results", {}) if isinstance(previous, dict) else {}
 

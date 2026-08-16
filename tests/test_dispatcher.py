@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+import json
 from pathlib import Path
+import time
 from unittest.mock import patch
 from urllib.parse import quote
 
@@ -9,14 +13,28 @@ import pytest
 
 import research_engine.dispatcher as dispatcher
 import research_engine.logged_search as logged_search
+from research_engine import paths
 from research_engine.dispatcher import (
     build_api_lane_request,
     discover_gemini_pro_model,
     dispatch,
+    dispatch_pro_synthesis_fallback,
     dispatch_scout,
     routing_table,
 )
 from research_engine.schema import AgentRole, Protocol, Territory, WorkerModel
+
+
+@pytest.fixture(autouse=True)
+def _isolate_gemini_budget(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(
+        dispatcher,
+        "GEMINI_DAILY_COUNTER_FILE",
+        tmp_path / "gemini-counter.json",
+    )
+    monkeypatch.setenv("RESEARCH_ENGINE_GEMINI_DAILY_BUDGET", "300")
+    monkeypatch.delenv("RESEARCH_ENGINE_UNATTENDED", raising=False)
+    monkeypatch.delenv("MENTOR_NIGHTLY_RUN", raising=False)
 
 
 def _completed(
@@ -26,7 +44,7 @@ def _completed(
     stderr: str = "",
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.CompletedProcess(
-        args=["agy-cli-1"],
+        args=[dispatcher.AGY_CLI],
         returncode=returncode,
         stdout=stdout,
         stderr=stderr,
@@ -46,9 +64,6 @@ class _RouterStub:
 
 
 def test_discover_gemini_pro_model_uses_canonical_flash_candidate(tmp_path) -> None:
-    # The command never contains a model_id token. It relies on agy-cli-1's
-    # configured default and returns GEMINI_PRO_MODEL_CANDIDATES[0] as the
-    # logical model_id.
     dispatcher._GEMINI_PRO_MODEL_ID_CACHE = None
 
     call_count = {"n": 0}
@@ -57,13 +72,13 @@ def test_discover_gemini_pro_model_uses_canonical_flash_candidate(tmp_path) -> N
         call_count["n"] += 1
         cmd = args[0]
         assert cmd == [
-            "agy-cli-1",
+            dispatcher.AGY_CLI,
+            "--dangerously-skip-permissions",
             "-p",
             "Reply with exactly OK.",
-            "--dangerously-skip-permissions",
+            "--model",
+            "Gemini 3.7 Flash (Medium)",
         ]
-        assert "--model" not in cmd, f"--model must not appear in agy command: {cmd}"
-        assert "-m" not in cmd, f"-m must not appear in agy command: {cmd}"
         assert "env" not in kwargs
         return _completed(0, stdout="OK\n")
 
@@ -76,6 +91,13 @@ def test_discover_gemini_pro_model_uses_canonical_flash_candidate(tmp_path) -> N
     assert result.ok is True
     assert result.model_id == dispatcher.GEMINI_PRO_MODEL_CANDIDATES[0]
     assert call_count["n"] == 1
+    counter = json.loads(dispatcher.GEMINI_DAILY_COUNTER_FILE.read_text(encoding="utf-8"))
+    assert counter == {
+        "date": datetime.now().date().isoformat(),
+        "used": 1,
+        "reserved": 0,
+        "reservation_leases": [],
+    }
 
 
 def test_discover_gemini_pro_model_retries_transient_failures(tmp_path) -> None:
@@ -94,14 +116,14 @@ def test_discover_gemini_pro_model_retries_transient_failures(tmp_path) -> None:
         return _completed(0, stdout="OK\n")
 
     result = discover_gemini_pro_model(
-        candidates=("gemini-3-flash",),
+        candidates=("Gemini 3.7 Flash (Medium)",),
         cli_home=str(tmp_path),
         runner=runner,
         sleeper=sleeps.append,
         use_cache=False,
     )
 
-    assert result.model_id == "gemini-3-flash"
+    assert result.model_id == "Gemini 3.7 Flash (Medium)"
     assert calls["count"] == 3
     assert sleeps == [2, 6]
 
@@ -116,7 +138,7 @@ def test_discover_gemini_pro_model_does_not_retry_auth_failure(tmp_path) -> None
         return _completed(1, stderr="Opening authentication page in your browser")
 
     result = discover_gemini_pro_model(
-        candidates=("gemini-3-flash",),
+        candidates=("Gemini 3.7 Flash (Medium)",),
         cli_home=str(tmp_path),
         runner=runner,
         use_cache=False,
@@ -146,6 +168,164 @@ def test_dispatch_scout_degrades_to_skip_when_gemini_is_down(tmp_path) -> None:
     assert spec is None
 
 
+@pytest.mark.parametrize(
+    ("env_name", "env_value"),
+    [
+        ("RESEARCH_ENGINE_UNATTENDED", "nightly"),
+        ("MENTOR_NIGHTLY_RUN", "1"),
+    ],
+)
+def test_dispatch_scout_never_probes_gemini_when_unattended(
+    monkeypatch,
+    tmp_path,
+    env_name,
+    env_value,
+) -> None:
+    dispatcher._GEMINI_PRO_MODEL_ID_CACHE = None
+    monkeypatch.setenv(env_name, env_value)
+
+    def runner(*args, **kwargs):  # type: ignore[no-untyped-def]
+        raise AssertionError("Gemini probe must not run unattended")
+
+    spec = dispatch_scout(
+        "nightly question",
+        _RouterStub(str(tmp_path)),
+        protocol=Protocol.RESEARCH,
+        runner=runner,
+    )
+
+    assert spec is None
+
+
+def test_dispatch_scout_ignores_warm_cache_when_unattended(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(
+        dispatcher,
+        "_GEMINI_PRO_MODEL_ID_CACHE",
+        dispatcher.GEMINI_PRO_MODEL_CANDIDATES[0],
+    )
+    monkeypatch.setenv("MENTOR_NIGHTLY_RUN", "1")
+
+    def runner(*args, **kwargs):  # type: ignore[no-untyped-def]
+        raise AssertionError("Gemini probe must not run unattended")
+
+    spec = dispatch_scout(
+        "nightly question with a warm cache",
+        _RouterStub(str(tmp_path)),
+        protocol=Protocol.RESEARCH,
+        runner=runner,
+    )
+
+    assert spec is None
+
+
+def test_dispatch_scout_never_probes_gemini_when_budget_exhausted(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    dispatcher._GEMINI_PRO_MODEL_ID_CACHE = None
+    monkeypatch.setenv("RESEARCH_ENGINE_GEMINI_DAILY_BUDGET", "1")
+    dispatcher.GEMINI_DAILY_COUNTER_FILE.write_text(
+        json.dumps(
+            {
+                "date": datetime.now().date().isoformat(),
+                "used": 1,
+                "reserved": 0,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def runner(*args, **kwargs):  # type: ignore[no-untyped-def]
+        raise AssertionError("Gemini probe must not run after the cap")
+
+    spec = dispatch_scout(
+        "capped question",
+        _RouterStub(str(tmp_path)),
+        protocol=Protocol.RESEARCH,
+        runner=runner,
+    )
+
+    assert spec is None
+
+
+def test_dispatch_pro_synthesis_fallback_soft_fails_without_assert(tmp_path) -> None:
+    dispatcher._GEMINI_PRO_MODEL_ID_CACHE = None
+
+    def runner(*args, **kwargs):  # type: ignore[no-untyped-def]
+        return _completed(1, stderr="Opening authentication page in your browser")
+
+    spec = dispatch_pro_synthesis_fallback(
+        "test question",
+        _RouterStub(str(tmp_path)),
+        protocol=Protocol.RESEARCH,
+        runner=runner,
+    )
+
+    assert spec is None
+
+
+def test_corrupt_counter_fails_closed(tmp_path) -> None:
+    counter_path = tmp_path / "corrupt-counter.json"
+    counter_path.write_text("{not-json", encoding="utf-8")
+
+    assert not dispatcher.gemini_daily_budget_available(path=counter_path, limit=3)
+    assert not dispatcher.reserve_gemini_daily_budget(path=counter_path, limit=3)
+
+
+def test_locked_budget_reservations_do_not_exceed_cap(tmp_path) -> None:
+    counter_path = tmp_path / "concurrent-counter.json"
+
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        reservations = list(
+            pool.map(
+                lambda _index: dispatcher.reserve_gemini_daily_budget(
+                    path=counter_path,
+                    limit=5,
+                ),
+                range(30),
+            )
+        )
+
+    assert reservations.count(True) == 5
+    payload = json.loads(counter_path.read_text(encoding="utf-8"))
+    assert payload["used"] == 0
+    assert payload["reserved"] == 5
+
+
+def test_stale_budget_reservation_expires_on_load(tmp_path) -> None:
+    counter_path = tmp_path / "stale-counter.json"
+    stale_lease = time.time() - dispatcher.GEMINI_RESERVATION_TTL_SECONDS - 1
+    counter_path.write_text(
+        json.dumps(
+            {
+                "date": datetime.now().date().isoformat(),
+                "used": 0,
+                "reserved": 1,
+                "reservation_leases": [stale_lease],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert dispatcher.gemini_daily_budget_available(path=counter_path, limit=1)
+    assert dispatcher.reserve_gemini_daily_budget(path=counter_path, limit=1)
+
+    payload = json.loads(counter_path.read_text(encoding="utf-8"))
+    assert payload["reserved"] == 1
+    assert len(payload["reservation_leases"]) == 1
+    assert payload["reservation_leases"][0] > stale_lease
+
+
+def test_invalid_budget_env_is_parsed_lazily(monkeypatch, tmp_path, caplog) -> None:
+    monkeypatch.setenv("RESEARCH_ENGINE_GEMINI_DAILY_BUDGET", "not-a-number")
+
+    assert dispatcher.gemini_daily_budget_available(path=tmp_path / "counter.json")
+    assert "using 300" in caplog.text
+
+
 def test_dispatch_scout_emits_agy_command(tmp_path) -> None:
     dispatcher._GEMINI_PRO_MODEL_ID_CACHE = None
     router = _RouterStub(str(tmp_path))
@@ -164,12 +344,15 @@ def test_dispatch_scout_emits_agy_command(tmp_path) -> None:
     assert spec is not None
     assert spec.provider == "agy_cli"
     assert spec.worker_model == WorkerModel.GEMINI_FLASH.value
-    assert spec.invocation_hint.startswith("agy-cli-1 --dangerously-skip-permissions --print ")
+    assert spec.model_id == "Gemini 3.7 Flash (Medium)"
+    assert spec.invocation_hint.startswith(
+        f"{dispatcher.AGY_CLI} --dangerously-skip-permissions -p "
+    )
     assert spec.brief_path in spec.invocation_hint
     assert spec.output_path in spec.invocation_hint
     assert "HOME=" not in spec.invocation_hint
-    assert "--model" not in spec.invocation_hint
-    assert '--print "$(cat ' in spec.invocation_hint
+    assert "--model 'Gemini 3.7 Flash (Medium)'" in spec.invocation_hint
+    assert '-p "$(cat ' in spec.invocation_hint
     assert "--yolo" not in spec.invocation_hint
     assert "--skip-trust" not in spec.invocation_hint
     assert "--dangerously-skip-permissions" in spec.invocation_hint
@@ -189,15 +372,36 @@ def test_social_lane_emits_gemini_invocation_hint() -> None:
 
     assert spec.worker_model == WorkerModel.GEMINI_FLASH.value
     assert spec.provider == "agy_cli"
-    assert spec.invocation_hint.startswith("agy-cli-1 --dangerously-skip-permissions --print ")
+    assert spec.model_id == "Gemini 3.7 Flash (Medium)"
+    assert spec.invocation_hint.startswith(
+        f"{dispatcher.AGY_CLI} --dangerously-skip-permissions -p "
+    )
     assert spec.brief_path in spec.invocation_hint
     assert spec.output_path in spec.invocation_hint
     assert "HOME=" not in spec.invocation_hint
-    assert "--model" not in spec.invocation_hint
-    assert '--print "$(cat ' in spec.invocation_hint
+    assert "--model 'Gemini 3.7 Flash (Medium)'" in spec.invocation_hint
+    assert '-p "$(cat ' in spec.invocation_hint
     assert "--yolo" not in spec.invocation_hint
     assert "--skip-trust" not in spec.invocation_hint
     assert "--dangerously-skip-permissions" in spec.invocation_hint
+
+
+def test_unattended_gemini_worker_routes_to_full_quota_model(monkeypatch) -> None:
+    monkeypatch.setenv("RESEARCH_ENGINE_UNATTENDED", "launchd")
+    territory = Territory(
+        territory_id="nightly",
+        description="Scheduled territory",
+        queries=["nightly research"],
+        assigned_agent_role=AgentRole.DOMAIN_SPECIALIST,
+        assigned_lanes=["reddit_rss"],
+        assigned_worker_model=WorkerModel.GEMINI_FLASH,
+    )
+
+    spec = dispatch(territory, router=None, topic_slug="nightly")
+
+    assert spec.provider == "agy_cli"
+    assert spec.model_id == "GPT-OSS 120B (Medium)"
+    assert "--model 'GPT-OSS 120B (Medium)'" in spec.invocation_hint
 
 
 def test_mistral_worker_emits_free_api_invocation_hint() -> None:
@@ -214,7 +418,7 @@ def test_mistral_worker_emits_free_api_invocation_hint() -> None:
 
     assert spec.worker_model == WorkerModel.MISTRAL.value
     assert spec.provider == "mistral_free_api"
-    assert "/Users/cleo/.secrets/mistral-free-keys.env" in spec.invocation_hint
+    assert paths.MISTRAL_KEYS_FILE_ENV in spec.invocation_hint
 
 
 def test_dispatch_honors_assigned_worker_even_with_exa_lane() -> None:
@@ -247,8 +451,9 @@ def test_dispatch_honors_explicit_grok_worker() -> None:
 
     assert spec.worker_model == WorkerModel.GROK.value
     assert spec.provider == "grok_cli"
-    assert spec.invocation_hint.startswith("hermes -m ")
-    assert f"-m {dispatcher.GROK_REASONING_MODEL}" in spec.invocation_hint
+    assert spec.invocation_hint.startswith(
+        (paths.executable(paths.GROK_BIN_ENV, "grok") or "grok") + " --single "
+    )
     assert spec.brief_path in spec.invocation_hint
     assert spec.output_path in spec.invocation_hint
 
@@ -267,8 +472,9 @@ def test_counter_evidence_role_is_standing_grok_lane() -> None:
 
     assert spec.worker_model == WorkerModel.GROK.value
     assert spec.provider == "grok_cli"
-    assert spec.invocation_hint.startswith("hermes -m ")
-    assert f"-m {dispatcher.GROK_RESEARCH_MODEL}" in spec.invocation_hint
+    assert spec.invocation_hint.startswith(
+        (paths.executable(paths.GROK_BIN_ENV, "grok") or "grok") + " --single "
+    )
 
 
 @pytest.mark.parametrize(
@@ -344,7 +550,6 @@ def test_grok_model_matrix_respects_protocol_and_role(
     assert spec.worker_model == WorkerModel.GROK.value
     assert spec.provider == "grok_cli"
     assert spec.model_id == expected_model
-    assert f"-m {expected_model}" in spec.invocation_hint
 
 
 def test_routing_table_marks_counter_evidence_as_grok_cli() -> None:
@@ -447,7 +652,7 @@ def test_build_api_lane_request_uses_reddit_rss_url_ua_and_format() -> None:
         "type": "api",
         "endpoint": "https://www.reddit.com/search.rss?q={query}&sort=relevance&limit=25",
         "headers": {
-            "User-Agent": "IanResearch/1.0 (123icpe@gmail.com)",
+            "User-Agent": "{RESEARCH_ENGINE_USER_AGENT}",
         },
         "response_format": "atom",
     }
@@ -459,7 +664,7 @@ def test_build_api_lane_request_uses_reddit_rss_url_ua_and_format() -> None:
     assert request.url == (
         "https://www.reddit.com/search.rss?q=local%20ai%20news&sort=relevance&limit=25"
     )
-    assert request.headers == {"User-Agent": "IanResearch/1.0 (123icpe@gmail.com)"}
+    assert request.headers == {"User-Agent": paths.user_agent()}
     assert request.response_format == "atom"
 
 

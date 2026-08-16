@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -8,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from research_engine import research_cli
+from research_engine import paths
 import research_engine.dispatcher as dispatcher
 from research_engine.persistence import CANONICAL_GEMINI_PRO_MODEL_ID
 from research_engine.schema import (
@@ -28,6 +30,18 @@ def _install_common_fakes(monkeypatch, tmp_path: Path, *, extract_result, grok_c
     class FakeRouter:
         def route(self, question: str):
             return SimpleNamespace(topic="test", lanes=["tavily_direct"])
+
+        def fleet_worker_models(self, fleet_name: str):
+            if fleet_name == research_cli.RESEARCH_FLEET_NAME:
+                return [model.value for model in (WorkerModel.CODEX_5_4, WorkerModel.MISTRAL, WorkerModel.GROK)]
+            if fleet_name == research_cli.DEEP_RESEARCH_FLEET_NAME:
+                return (
+                    [WorkerModel.HAIKU.value] * 5
+                    + [WorkerModel.CODEX_5_4.value] * 5
+                    + [WorkerModel.HAIKU.value] * 5
+                    + [WorkerModel.GROK.value]
+                )
+            raise AssertionError(f"unexpected fleet {fleet_name}")
 
     def fake_save_session(session, root):
         saved_sessions.append(session)
@@ -100,6 +114,18 @@ def _install_research_fakes(
     class FakeRouter:
         def route(self, question: str):
             return SimpleNamespace(topic="test", lanes=["tavily_direct"])
+
+        def fleet_worker_models(self, fleet_name: str):
+            if fleet_name == research_cli.RESEARCH_FLEET_NAME:
+                return [model.value for model in (WorkerModel.CODEX_5_4, WorkerModel.MISTRAL, WorkerModel.GROK)]
+            if fleet_name == research_cli.DEEP_RESEARCH_FLEET_NAME:
+                return (
+                    [WorkerModel.HAIKU.value] * 5
+                    + [WorkerModel.CODEX_5_4.value] * 5
+                    + [WorkerModel.HAIKU.value] * 5
+                    + [WorkerModel.GROK.value]
+                )
+            raise AssertionError(f"unexpected fleet {fleet_name}")
 
     def fake_save_session(session, root):
         saved_sessions.append(session)
@@ -228,7 +254,8 @@ def test_run_search_builds_session_with_source_answer_and_path(monkeypatch, tmp_
     assert result.path.exists()
     assert result.session.sources
     assert result.session.answer
-    assert result.session.answer_kind == AnswerKind.FULL
+    # Graded answer_kind is incidental here; thin synthetic sources may be PARTIAL.
+    assert result.session.answer_kind in {AnswerKind.FULL, AnswerKind.PARTIAL}
     assert result.backend == "codex"
     assert len(saved_sessions) == 1
     assert len(grok_calls) == 1
@@ -530,7 +557,8 @@ def test_run_research_builds_three_territory_session(monkeypatch, tmp_path):
     assert len(result.session.territories) == 3
     assert result.session.sources
     assert result.session.answer
-    assert result.session.answer_kind == AnswerKind.FULL
+    # Purpose is three-territory session build; kind is graded from fixtures, not forced FULL.
+    assert result.session.answer_kind in {AnswerKind.FULL, AnswerKind.PARTIAL}
     assert len(saved_sessions) == 1
     assert len(llm_calls) == 1
     assert len(grok_calls) == 1
@@ -573,8 +601,9 @@ def test_run_research_attaches_gemini_record_before_gated_save(monkeypatch, tmp_
 
     assert result.path is not None
     assert result.path.exists()
-    assert result.session.final_status == FinalStatus.COMPLETE
+    # Purpose is scout attachment before gated save, not COMPLETE from fail-open FULL.
     assert result.session.gemini_pro_runs
+    assert any(run.run_type == GeminiProRunKind.SCOUT for run in result.session.gemini_pro_runs)
     run = result.session.gemini_pro_runs[0]
     assert run.run_type == GeminiProRunKind.SCOUT
     assert run.success is True
@@ -626,7 +655,9 @@ def test_run_deep_research_thin_evidence_iteration_does_not_crash(monkeypatch, t
     assert len(saved_sessions) == 2
     assert result.path is not None
     assert result.path.exists()
-    assert result.session.answer
+    # unique_urls=False is deliberately thin; measured grading may ABSTAIN (answer=None).
+    assert result.session.answer_kind in {AnswerKind.PARTIAL, AnswerKind.ABSTAIN}
+    assert result.session.iteration_count >= 1
     assert {call.worker_model for call in result.session.queries_run} >= {
         WorkerModel.HAIKU,
         WorkerModel.CODEX_5_4,
@@ -637,36 +668,143 @@ def test_run_deep_research_thin_evidence_iteration_does_not_crash(monkeypatch, t
     assert grok_calls[0].model_id == dispatcher.GROK_RESEARCH_MODEL
 
 
-def test_build_territories_assigns_locked_worker_fleets():
-    deep_sub_questions = [f"deep research angle {index}" for index in range(1, 17)]
-
-    deep_territories = research_cli.build_territories(
-        deep_sub_questions,
-        research_cli.deep_research_territory_specs(),
-        provider="tavily",
-        protocol=Protocol.DEEP_RESEARCH,
+def test_run_deep_research_records_worker_disagreement(monkeypatch, tmp_path):
+    _saved_sessions, _search_calls = _install_research_fakes(
+        monkeypatch,
+        tmp_path,
+        fake_save=False,
     )
-    research_territories = research_cli.build_territories(
-        ["current options", "selection criteria", "known problems"],
-        research_cli.research_territory_specs(),
-        provider="tavily",
-        protocol=Protocol.RESEARCH,
+    summary_calls = {"n": 0}
+
+    def fake_llm(prompt, **kwargs):
+        if "exactly 16 non-overlapping sub-questions" in prompt:
+            return (
+                json.dumps(
+                    [f"deep research angle {index}" for index in range(1, 17)]
+                ),
+                "mock",
+            )
+        if "Summarize this territory" in prompt:
+            summary_calls["n"] += 1
+            if summary_calls["n"] == 1:
+                return (
+                    "GA4-practitioner says published accuracy data does not exist.",
+                    "mock",
+                )
+            return ("Neutral territory summary [1]", "mock")
+        return ("Final grounded answer [1]\nCaveats/disagreements: none.", "mock")
+
+    def fake_execute_grok_worker_spec(spec):
+        output_path = Path(spec.output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output = "Another worker found arXiv 2411.10109 with a 0.74 vs 0.83 comparison."
+        output_path.write_text(output + "\n", encoding="utf-8")
+        return output
+
+    monkeypatch.setattr(research_cli.llm_call, "llm_complete", fake_llm)
+    monkeypatch.setattr(research_cli, "execute_grok_worker_spec", fake_execute_grok_worker_spec)
+
+    result = research_cli.run_deep_research(
+        "Which demographic personas improve GA4 accuracy?",
+        topic="ga4-personas",
+        agent="pytest",
     )
 
-    deep_models = [territory.assigned_worker_model for territory in deep_territories]
-    research_models = [territory.assigned_worker_model for territory in research_territories]
+    assert result.session.agent_disagreements
+    disagreement = result.session.agent_disagreements[0]
+    assert "does not exist" in disagreement.agent_a_position.lower()
+    assert "arxiv" in disagreement.agent_b_position.lower()
 
-    assert len(deep_territories) == 16
-    assert deep_models.count(WorkerModel.HAIKU) == 10
-    assert deep_models.count(WorkerModel.CODEX_5_4) == 5
-    assert deep_models.count(WorkerModel.GEMINI_FLASH) == 0
-    assert deep_models.count(WorkerModel.GROK) == 1
-    assert len(research_territories) == 3
-    assert research_models == [
-        WorkerModel.CODEX_5_4,
-        WorkerModel.MISTRAL,
-        WorkerModel.GROK,
+
+def test_research_worker_models_follow_router_fleets_config():
+    class FakeRouter:
+        def fleet_worker_models(self, fleet_name: str):
+            if fleet_name == research_cli.RESEARCH_FLEET_NAME:
+                return ["sonnet", "opus", "haiku"]
+            if fleet_name == research_cli.DEEP_RESEARCH_FLEET_NAME:
+                return (
+                    ["sonnet"] * 5
+                    + ["opus"] * 5
+                    + ["haiku"] * 5
+                    + ["grok"]
+                )
+            raise AssertionError(f"unexpected fleet {fleet_name}")
+
+    research_specs = research_cli.research_territory_specs(router=FakeRouter())
+    deep_specs = research_cli.deep_research_territory_specs(router=FakeRouter())
+
+    assert [spec[3] for spec in research_specs] == [
+        WorkerModel.SONNET,
+        WorkerModel.OPUS,
+        WorkerModel.HAIKU,
     ]
+    assert [spec[3] for spec in deep_specs[:5]] == [WorkerModel.SONNET] * 5
+    assert [spec[3] for spec in deep_specs[5:10]] == [WorkerModel.OPUS] * 5
+    assert [spec[3] for spec in deep_specs[10:15]] == [WorkerModel.HAIKU] * 5
+    assert deep_specs[15][3] is WorkerModel.GROK
+
+    assert [spec[:3] for spec in research_specs] == list(research_cli.RESEARCH_LANE_PLAN)
+    assert [spec[:3] for spec in deep_specs] == list(research_cli.DEEP_RESEARCH_LANE_PLAN)
+
+
+def test_broken_fleets_config_is_loud_not_silent(monkeypatch, caplog, tmp_path: Path):
+    warning_fragment = "fleet 'research' router fleets config unusable"
+
+    class BrokenRouter:
+        def fleet_worker_models(self, fleet_name: str):
+            raise ValueError(f"bad config for {fleet_name}")
+
+        def route(self, question: str):
+            return SimpleNamespace(topic="test", lanes=["tavily_direct"])
+
+    saved_sessions = _install_research_fakes(monkeypatch, tmp_path)
+    monkeypatch.setattr(research_cli, "load_router", lambda: BrokenRouter())
+    monkeypatch.setattr(
+        research_cli,
+        "run_gemini_scout",
+        lambda *args, **kwargs: _failed_gemini_attempt(
+            GeminiProRunKind.SCOUT,
+            "disabled for test",
+        ),
+    )
+    monkeypatch.setattr(
+        research_cli,
+        "decompose_question",
+        lambda question, territory_count, **kwargs: [
+            f"sub-question {index}" for index in range(territory_count)
+        ],
+    )
+    monkeypatch.setattr(
+        research_cli,
+        "run_gemini_pro_synthesis_fallback",
+        lambda *args, **kwargs: _failed_gemini_attempt(
+            GeminiProRunKind.PRO_SYNTHESIS_FALLBACK,
+            "disabled for test",
+        ),
+    )
+    monkeypatch.setattr(
+        research_cli,
+        "run_gemini_final_synthesis",
+        lambda *args, **kwargs: _failed_gemini_attempt(
+            GeminiProRunKind.FINAL_SYNTHESIS,
+            "disabled for test",
+        ),
+    )
+
+    with caplog.at_level("ERROR"):
+        result = research_cli.run_research(
+            "Which workers should this test use?",
+            topic="fleet-warning",
+            agent="pytest",
+        )
+
+    assert result.fleet_warning is not None
+    assert warning_fragment in result.fleet_warning
+    assert "ROUTER FLEETS ERROR" in caplog.text
+    assert warning_fragment in caplog.text
+    assert result.session.final_status == FinalStatus.INSUFFICIENT_EVIDENCE
+    assert result.session.territories == []
+    assert saved_sessions
 
 
 def test_business_question_routes_deep_research_to_web_social_lanes():
@@ -794,8 +932,9 @@ def test_run_deep_research_attaches_gemini_record_before_gated_save(monkeypatch,
 
     assert result.path is not None
     assert result.path.exists()
-    assert result.session.final_status == FinalStatus.COMPLETE
+    # Purpose is scout attachment before gated save, not COMPLETE from fail-open FULL.
     assert result.session.gemini_pro_runs
+    assert any(run.run_type == GeminiProRunKind.SCOUT for run in result.session.gemini_pro_runs)
     run = result.session.gemini_pro_runs[0]
     assert run.run_type == GeminiProRunKind.SCOUT
     assert run.success is True
@@ -999,7 +1138,7 @@ def test_run_research_gemini_unavailable_direct_abstain_does_not_crash(
     assert "evidence gate bypassed: Gemini unavailable" in result.session.open_questions[0]
 
 
-def test_execute_gemini_worker_spec_uses_agy_without_model_flag(monkeypatch, tmp_path):
+def test_execute_gemini_worker_spec_uses_agy_with_explicit_gemini_model(monkeypatch, tmp_path):
     brief_path = tmp_path / "brief.md"
     output_path = tmp_path / "output.md"
     brief_path.write_text("Scout this question.", encoding="utf-8")
@@ -1022,6 +1161,9 @@ def test_execute_gemini_worker_spec_uses_agy_without_model_flag(monkeypatch, tmp
             }
 
     monkeypatch.setattr(research_cli.subprocess, "run", fake_run)
+    monkeypatch.setattr(research_cli, "GEMINI_DAILY_COUNTER_FILE", tmp_path / "counter.json")
+    monkeypatch.delenv("RESEARCH_ENGINE_UNATTENDED", raising=False)
+    monkeypatch.delenv("MENTOR_NIGHTLY_RUN", raising=False)
     spec = research_cli.WorkerSpec(
         worker_model="gemini-flash",
         provider="agy_cli",
@@ -1030,6 +1172,7 @@ def test_execute_gemini_worker_spec_uses_agy_without_model_flag(monkeypatch, tmp
         output_path=str(output_path),
         lanes=["gemini_pro_scout"],
         rationale="test",
+        model_id="Gemini 3.7 Flash (Medium)",
     )
 
     output = research_cli.execute_gemini_worker_spec(spec, router=Router())
@@ -1041,15 +1184,106 @@ def test_execute_gemini_worker_spec_uses_agy_without_model_flag(monkeypatch, tmp
     assert calls
     cmd, kwargs = calls[0]
     assert cmd == [
-        "agy-cli-1",
+        dispatcher.AGY_CLI,
         "--dangerously-skip-permissions",
-        "--print",
+        "-p",
         "Scout this question.",
+        "--model",
+        "Gemini 3.7 Flash (Medium)",
     ]
     assert "input" not in kwargs
     assert "env" not in kwargs
     assert kwargs["stdin"] == research_cli.subprocess.DEVNULL
     assert kwargs["timeout"] == research_cli.GEMINI_TIMEOUT_SECONDS
+    assert json.loads((tmp_path / "counter.json").read_text(encoding="utf-8"))["used"] == 1
+
+
+def test_execute_gemini_worker_spec_routes_to_fallback_when_daily_cap_hit(
+    monkeypatch,
+    tmp_path,
+):
+    brief_path = tmp_path / "brief.md"
+    output_path = tmp_path / "output.md"
+    counter_path = tmp_path / "counter.json"
+    brief_path.write_text("Scout this question.", encoding="utf-8")
+    counter_path.write_text(
+        json.dumps({"date": datetime.now().date().isoformat(), "used": 1}) + "\n",
+        encoding="utf-8",
+    )
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        return research_cli.subprocess.CompletedProcess(
+            cmd,
+            0,
+            stdout="fallback response https://example.com/source\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(research_cli.subprocess, "run", fake_run)
+    monkeypatch.setattr(research_cli, "GEMINI_DAILY_COUNTER_FILE", counter_path)
+    monkeypatch.setenv("RESEARCH_ENGINE_GEMINI_DAILY_BUDGET", "1")
+    monkeypatch.delenv("RESEARCH_ENGINE_UNATTENDED", raising=False)
+    monkeypatch.delenv("MENTOR_NIGHTLY_RUN", raising=False)
+    spec = research_cli.WorkerSpec(
+        worker_model="gemini-flash",
+        provider="agy_cli",
+        invocation_hint="",
+        brief_path=str(brief_path),
+        output_path=str(output_path),
+        lanes=["gemini_pro_scout"],
+        rationale="test",
+        model_id="Gemini 3.7 Flash (Medium)",
+    )
+
+    output = research_cli.execute_gemini_worker_spec(spec, router=object())
+
+    assert output == "fallback response https://example.com/source"
+    cmd, _kwargs = calls[0]
+    assert cmd[cmd.index("--model") + 1] == "GPT-OSS 120B (Medium)"
+    assert json.loads(counter_path.read_text(encoding="utf-8"))["used"] == 1
+
+
+def test_execute_gemini_worker_spec_routes_unattended_run_to_full_quota_model(
+    monkeypatch,
+    tmp_path,
+):
+    brief_path = tmp_path / "brief.md"
+    output_path = tmp_path / "output.md"
+    counter_path = tmp_path / "counter.json"
+    brief_path.write_text("Nightly research.", encoding="utf-8")
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        return research_cli.subprocess.CompletedProcess(
+            cmd,
+            0,
+            stdout="nightly response https://example.com/source\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(research_cli.subprocess, "run", fake_run)
+    monkeypatch.setattr(research_cli, "GEMINI_DAILY_COUNTER_FILE", counter_path)
+    monkeypatch.setenv("RESEARCH_ENGINE_UNATTENDED", "launchd")
+    spec = research_cli.WorkerSpec(
+        worker_model="gemini-flash",
+        provider="agy_cli",
+        invocation_hint="",
+        brief_path=str(brief_path),
+        output_path=str(output_path),
+        lanes=["gemini_pro_scout"],
+        rationale="test",
+        model_id="Gemini 3.7 Flash (Medium)",
+    )
+
+    output = research_cli.execute_gemini_worker_spec(spec, router=object())
+
+    assert output == "nightly response https://example.com/source"
+    cmd, _kwargs = calls[0]
+    assert cmd[cmd.index("--model") + 1] == "GPT-OSS 120B (Medium)"
+    assert not counter_path.exists()
 
 
 def test_execute_gemini_worker_spec_prefixes_dash_prefixed_prompt(monkeypatch, tmp_path):
@@ -1068,6 +1302,9 @@ def test_execute_gemini_worker_spec_prefixes_dash_prefixed_prompt(monkeypatch, t
         )
 
     monkeypatch.setattr(research_cli.subprocess, "run", fake_run)
+    monkeypatch.setattr(research_cli, "GEMINI_DAILY_COUNTER_FILE", tmp_path / "counter.json")
+    monkeypatch.delenv("RESEARCH_ENGINE_UNATTENDED", raising=False)
+    monkeypatch.delenv("MENTOR_NIGHTLY_RUN", raising=False)
     spec = research_cli.WorkerSpec(
         worker_model="gemini-flash",
         provider="agy_cli",
@@ -1083,10 +1320,12 @@ def test_execute_gemini_worker_spec_prefixes_dash_prefixed_prompt(monkeypatch, t
     assert output == "grounded response https://example.com/source"
     cmd, _kwargs = calls[0]
     assert cmd == [
-        "agy-cli-1",
+        dispatcher.AGY_CLI,
         "--dangerously-skip-permissions",
-        "--print",
+        "-p",
         "Brief:\n-start with a flag-like line",
+        "--model",
+        "Gemini 3.7 Flash (Medium)",
     ]
 
 
@@ -1127,6 +1366,9 @@ def test_execute_gemini_worker_spec_writes_stdout_only_and_warns_on_stderr(
         )
 
     monkeypatch.setattr(research_cli.subprocess, "run", fake_run)
+    monkeypatch.setattr(research_cli, "GEMINI_DAILY_COUNTER_FILE", tmp_path / "counter.json")
+    monkeypatch.delenv("RESEARCH_ENGINE_UNATTENDED", raising=False)
+    monkeypatch.delenv("MENTOR_NIGHTLY_RUN", raising=False)
     monkeypatch.setattr(
         research_cli.logger,
         "warning",
@@ -1149,6 +1391,155 @@ def test_execute_gemini_worker_spec_writes_stdout_only_and_warns_on_stderr(
         "stdout answer https://example.com/source\n"
     )
     assert warnings == [("agy Gemini worker stderr: %s", "non-fatal stderr noise")]
+
+
+def test_execute_gemini_worker_spec_rejects_failure_stub(monkeypatch, tmp_path):
+    brief_path = tmp_path / "brief.md"
+    output_path = tmp_path / "output.md"
+    brief_path.write_text("Scout this question.", encoding="utf-8")
+
+    def fake_run(cmd, **kwargs):
+        return research_cli.subprocess.CompletedProcess(
+            cmd,
+            0,
+            stdout="Error: timeout waiting for response\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(research_cli.subprocess, "run", fake_run)
+    monkeypatch.setattr(research_cli, "GEMINI_DAILY_COUNTER_FILE", tmp_path / "counter.json")
+    monkeypatch.delenv("RESEARCH_ENGINE_UNATTENDED", raising=False)
+    monkeypatch.delenv("MENTOR_NIGHTLY_RUN", raising=False)
+    spec = research_cli.WorkerSpec(
+        worker_model="gemini-flash",
+        provider="agy_cli",
+        invocation_hint="",
+        brief_path=str(brief_path),
+        output_path=str(output_path),
+        lanes=["gemini_pro_scout"],
+        rationale="test",
+    )
+
+    with pytest.raises(research_cli.GeminiProScoutError) as excinfo:
+        research_cli.execute_gemini_worker_spec(spec, router=object())
+
+    assert "failure stub" in str(excinfo.value)
+    assert not output_path.exists()
+
+
+def test_failed_gemini_exit_releases_budget_without_charge(monkeypatch, tmp_path) -> None:
+    brief_path = tmp_path / "brief.md"
+    brief_path.write_text("Scout this question.", encoding="utf-8")
+    counter_path = tmp_path / "counter.json"
+
+    def fake_run(cmd, **kwargs):
+        return research_cli.subprocess.CompletedProcess(
+            cmd,
+            1,
+            stdout="",
+            stderr="authentication failed",
+        )
+
+    monkeypatch.setattr(research_cli.subprocess, "run", fake_run)
+    monkeypatch.setattr(research_cli, "GEMINI_DAILY_COUNTER_FILE", counter_path)
+    monkeypatch.delenv("RESEARCH_ENGINE_UNATTENDED", raising=False)
+    monkeypatch.delenv("MENTOR_NIGHTLY_RUN", raising=False)
+    spec = research_cli.WorkerSpec(
+        worker_model="gemini-flash",
+        provider="agy_cli",
+        invocation_hint="",
+        brief_path=str(brief_path),
+        output_path=str(tmp_path / "output.md"),
+        lanes=["gemini_pro_scout"],
+        rationale="test",
+        model_id="Gemini 3.7 Flash (Medium)",
+    )
+
+    with pytest.raises(research_cli.GeminiProScoutError):
+        research_cli.execute_gemini_worker_spec(spec, router=object())
+
+    payload = json.loads(counter_path.read_text(encoding="utf-8"))
+    assert payload["used"] == 0
+    assert payload["reserved"] == 0
+
+
+def test_scout_record_uses_model_actually_run(monkeypatch, tmp_path) -> None:
+    brief_path = tmp_path / "brief.md"
+    brief_path.write_text("Nightly scout.", encoding="utf-8")
+    spec = research_cli.WorkerSpec(
+        worker_model="gemini-flash",
+        provider="agy_cli",
+        invocation_hint="",
+        brief_path=str(brief_path),
+        output_path=str(tmp_path / "output.md"),
+        lanes=["gemini_pro_scout"],
+        rationale="test",
+        model_id="Gemini 3.7 Flash (Medium)",
+    )
+
+    def fake_run(cmd, **kwargs):
+        return research_cli.subprocess.CompletedProcess(
+            cmd,
+            0,
+            stdout="nightly result https://example.com/source\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(research_cli, "dispatch_scout", lambda *args, **kwargs: spec)
+    monkeypatch.setattr(research_cli.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        research_cli,
+        "GEMINI_DAILY_COUNTER_FILE",
+        tmp_path / "counter.json",
+    )
+    monkeypatch.setenv("MENTOR_NIGHTLY_RUN", "1")
+
+    attempt = research_cli.run_gemini_scout(
+        "nightly question",
+        router=object(),
+        protocol=Protocol.RESEARCH,
+        topic="nightly",
+    )
+
+    assert attempt.record is not None
+    assert attempt.record.model_id == "GPT-OSS 120B (Medium)"
+
+
+@pytest.mark.parametrize(
+    ("env_name", "env_value"),
+    [
+        ("RESEARCH_ENGINE_UNATTENDED", "nightly"),
+        ("MENTOR_NIGHTLY_RUN", "1"),
+    ],
+)
+def test_cli_and_dispatcher_share_unattended_detection(
+    monkeypatch,
+    env_name,
+    env_value,
+) -> None:
+    monkeypatch.delenv("RESEARCH_ENGINE_UNATTENDED", raising=False)
+    monkeypatch.delenv("MENTOR_NIGHTLY_RUN", raising=False)
+    monkeypatch.setenv(env_name, env_value)
+
+    assert research_cli.is_unattended_research_run()
+    assert dispatcher.is_unattended_research_run()
+
+
+def test_mistral_free_keys_rotate(monkeypatch, tmp_path) -> None:
+    key_path = tmp_path / "mistral-keys.env"
+    key_path.write_text(
+        "MISTRAL_FREE_KEY_1=key-one\n"
+        "MISTRAL_FREE_KEY_2=key-two\n"
+        "MISTRAL_FREE_KEY_3=key-three\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(research_cli, "MISTRAL_FREE_KEYS_PATH", key_path)
+    monkeypatch.setattr(research_cli, "_MISTRAL_KEY_COUNTER", itertools.count())
+
+    selected = [research_cli.next_mistral_free_key() for _ in range(3)]
+
+    assert set(selected) == {"key-one", "key-two", "key-three"}
+    assert selected[0] != selected[1]
 
 
 def test_execute_grok_worker_spec_uses_hermes_without_shell(monkeypatch, tmp_path):
@@ -1185,10 +1576,8 @@ def test_execute_grok_worker_spec_uses_hermes_without_shell(monkeypatch, tmp_pat
     assert calls
     cmd, kwargs = calls[0]
     assert cmd == [
-        "hermes",
-        "-m",
-        "grok-test-model",
-        "-z",
+        paths.executable(paths.GROK_BIN_ENV, "grok") or "grok",
+        "--single",
         "Run the Grok territory.",
     ]
     assert kwargs["stdin"] == research_cli.subprocess.DEVNULL

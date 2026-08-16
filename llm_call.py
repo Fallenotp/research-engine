@@ -5,20 +5,17 @@ import signal
 import subprocess
 from pathlib import Path
 
+from . import paths
+
 
 CODEX_BIN = Path("/opt/homebrew/bin/codex")
-CLAUDE_BIN = Path("/Users/cleo/.local/bin/claude")
-CLAUDE_HOME = Path("/Users/cleo")
+CLAUDE_HOME = paths.optional_path(paths.CLAUDE_HOME_ENV) or Path.home()
 CODEX_DEFAULT_MODEL = "gpt-5.4-mini"
 SONNET_MODEL = "sonnet"
 OPUS_MODEL = "opus"
 AGY_CLI = "agy-cli-1"
 AGY_SKIP_PERMISSIONS_FLAG = "--dangerously-skip-permissions"
 GEMINI_TIMEOUT_SECONDS = 180
-AGY_FALLBACKS = (
-    Path("/Users/cleo/bin/agy-cli-2"),
-    Path("/Users/cleo/.local/bin/agy"),
-)
 BACKENDS = ("codex", "sonnet", "opus", "gemini")
 
 
@@ -113,14 +110,15 @@ def _run_codex(
 
 
 def _run_sonnet(prompt: str, *, timeout: int | float) -> str:
-    if not _is_executable(CLAUDE_BIN):
-        raise FileNotFoundError(str(CLAUDE_BIN))
+    claude_bin = Path(paths.require_executable(paths.CLAUDE_BIN_ENV, "claude"))
+    if not _is_executable(claude_bin):
+        raise FileNotFoundError(str(claude_bin))
     env = os.environ.copy()
     env.pop("ANTHROPIC_API_KEY", None)
     env["HOME"] = str(CLAUDE_HOME)
     completed = subprocess.run(
         [
-            str(CLAUDE_BIN),
+            str(claude_bin),
             "-p",
             prompt,
             "--model",
@@ -140,14 +138,15 @@ def _run_sonnet(prompt: str, *, timeout: int | float) -> str:
 
 
 def _run_opus(prompt: str, *, timeout: int | float) -> str:
-    if not _is_executable(CLAUDE_BIN):
-        raise FileNotFoundError(str(CLAUDE_BIN))
+    claude_bin = Path(paths.require_executable(paths.CLAUDE_BIN_ENV, "claude"))
+    if not _is_executable(claude_bin):
+        raise FileNotFoundError(str(claude_bin))
     env = os.environ.copy()
     env.pop("ANTHROPIC_API_KEY", None)
     env["HOME"] = str(CLAUDE_HOME)
     completed = subprocess.run(
         [
-            str(CLAUDE_BIN),
+            str(claude_bin),
             "-p",
             prompt,
             "--model",
@@ -184,10 +183,7 @@ def _run_gemini(prompt: str, *, timeout: int | float) -> str:
 
 
 def _agy_binary() -> str | None:
-    for candidate in (Path("/Users/cleo/bin") / AGY_CLI, *AGY_FALLBACKS):
-        if _is_executable(candidate):
-            return str(candidate)
-    return None
+    return paths.executable(paths.AGY_BIN_ENV, AGY_CLI, "agy-cli-2", "agy")
 
 
 def _agy_prompt_arg(prompt: str) -> str:

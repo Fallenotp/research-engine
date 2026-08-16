@@ -69,7 +69,7 @@ def test_run_gemini_backend_uses_agy_cli_not_retired_gemini(monkeypatch) -> None
             stderr="",
         )
 
-    monkeypatch.setattr(llm_call, "_agy_binary", lambda: "/Users/cleo/bin/agy-cli-1")
+    monkeypatch.setattr(llm_call, "_agy_binary", lambda: "agy-cli-1")
     monkeypatch.setattr(llm_call.subprocess, "run", fake_run)
 
     output = llm_call._run_gemini("hello", timeout=12)
@@ -78,7 +78,7 @@ def test_run_gemini_backend_uses_agy_cli_not_retired_gemini(monkeypatch) -> None
     assert calls
     cmd, kwargs = calls[0]
     assert cmd == [
-        "/Users/cleo/bin/agy-cli-1",
+        "agy-cli-1",
         "--dangerously-skip-permissions",
         "--print",
         "hello",

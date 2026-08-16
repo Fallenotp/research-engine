@@ -2,14 +2,14 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
+
+from . import paths
 
 
-TELEMETRY_PATH = Path(
-    os.environ.get("NO_BLUFF_TELEMETRY_PATH", "/Users/cleo/.claude/no-bluff-telemetry.jsonl")
+TELEMETRY_PATH = paths.optional_path(paths.NO_BLUFF_TELEMETRY_ENV) or paths.telemetry_path(
+    "no-bluff-telemetry.jsonl"
 )
 
 

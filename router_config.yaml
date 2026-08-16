@@ -24,7 +24,7 @@ rules:
   # --- Government / Legal / Regulatory ---
   - name: gov_tech_transfer
     patterns: [nasa software, patent license, spinoff, tech transfer, commercialize, dual-use technology, government technology, defense open source]
-    lanes: [nasa_techtransfer, github_code, searxng_general]
+    lanes: [nasa_techtransfer, github_code, searxng_general, exa_direct]
     worker_model: haiku
     topic: gov_tech
 
@@ -37,20 +37,20 @@ rules:
 
   - name: sec_filing
     patterns: [10-k, 10-q, 8-k, sec filing, edgar, form s-1, proxy statement]
-    lanes: [sec_edgar, sec_gov, searxng_general]
+    lanes: [sec_edgar, sec_gov, searxng_general, exa_direct]
     worker_model: haiku
     topic: finance_filings
     require_tier_1: true
 
   - name: campaign_finance
     patterns: [campaign finance, fec, super pac, independent expenditure]
-    lanes: [fec_gov, openstates, congress_gov, searxng_general]
+    lanes: [fec_gov, openstates, congress_gov, searxng_general, exa_direct]
     worker_model: haiku
     topic: politics
 
   - name: legislation
     patterns: [bill, congress, senate, house, statute, h.r., s.b., legislation]
-    lanes: [congress_gov, openstates, govinfo_gov, searxng_general]
+    lanes: [congress_gov, openstates, govinfo_gov, searxng_general, exa_direct]
     worker_model: haiku
     topic: politics
 
@@ -77,7 +77,7 @@ rules:
 
   - name: ml_sota
     patterns: [state of the art, sota, benchmark, leaderboard, ablation]
-    lanes: [papers_with_code, hn_algolia, github_code, gitlab_code, codeberg_code, hf_hub, semantic_scholar]
+    lanes: [papers_with_code, hn_algolia, github_code, gitlab_code, codeberg_code, hf_hub, semantic_scholar, exa_direct]
     worker_model: haiku
     topic: ml_ai
 
@@ -90,7 +90,7 @@ rules:
 
   - name: error_diagnosis
     patterns: [error, exception, traceback, bug, "doesn't work", segfault, panic]
-    lanes: [stack_exchange, github_code, gitlab_code, codeberg_code, sourcegraph, searxng_general]
+    lanes: [stack_exchange, github_code, gitlab_code, codeberg_code, sourcegraph, searxng_general, exa_direct]
     worker_model: codex_5_4
     topic: code
 
@@ -118,20 +118,20 @@ rules:
   # --- Datasets / AI artifacts ---
   - name: dataset_lookup
     patterns: [dataset, training data, csv, parquet, kaggle dataset]
-    lanes: [kaggle, hf_datasets, searxng_general]
+    lanes: [kaggle, hf_datasets, searxng_general, exa_direct]
     worker_model: haiku
     topic: datasets
 
   - name: model_lookup
     patterns: [model card, fine-tune, checkpoint, weights, gguf, mlx model]
-    lanes: [hf_hub, papers_with_code, github_code, gitlab_code, codeberg_code, searxng_general]
+    lanes: [hf_hub, papers_with_code, github_code, gitlab_code, codeberg_code, searxng_general, exa_direct]
     worker_model: haiku
     topic: ml_ai
 
   # --- Personal / Memory ---
   - name: memory_recall
     patterns: [check memory, did we discuss, what do i know about, have i seen]
-    lanes: [mentor_memory, claude_memory_files, obsidian]
+    lanes: [mentor_memory, claude_memory_files, obsidian, exa_direct]
     worker_model: haiku
     topic: personal
     skip_web: true
@@ -160,28 +160,35 @@ lanes:
 
   searxng_forums:
     type: api
-    endpoint: "http://localhost:8888/search?q={query}&format=json&engines=reddit,hackernews,lemmy,stackoverflow,discourse"
+    endpoint: "http://localhost:8888/search?q={query}&format=json&engines=hackernews,stackoverflow,lemmy+posts,askubuntu,mastodon+hashtags"
     auth: none
     cost_per_call_usd: 0.0
 
   gemini_pro_scout:
     type: cli
-    command: "agy-cli-1"
-    profile: "agy-cli-1"
-    fallback_command: "agy-cli-2"
+    command: "{RESEARCH_ENGINE_AGY_BIN}"
+    profile: "canonical-agy"
     model_candidates:
-      - "gemini-3-flash"
+      - "Gemini 3.7 Flash (Medium)"
     auth: oauth_subscription
     cost_per_call_usd: 0.0
-    notes: "Front scout lane for /research and /deep-research only. Locked scout = Gemini 3 Flash through agy-cli-1. Never call the retired gemini CLI. AGY RULE: pass the brief as the --print argument; never pass --model/-m; use agy-cli-1's configured default only. Ask Ian if the default fails."
+    notes: "Front scout lane for /research and /deep-research only. The canonical agy binary receives the exact friendly --model name. Skip Gemini probes when unattended or when the locked daily budget is exhausted."
 
   counter_evidence:
     type: cli
-    command: "hermes"
-    model: "grok-4.20-0309-reasoning"
+    command: "{RESEARCH_ENGINE_GROK_BIN}"
+    model: "grok-4.5"
     auth: oauth_subscription
     cost_per_call_usd: 0.0
-    notes: "Compatibility lane for the Grok-via-Hermes counter-evidence worker."
+    notes: "Native Grok CLI lane for the counter-evidence worker."
+
+  grok_x_search:
+    type: cli
+    command: "{RESEARCH_ENGINE_GROK_BIN}"
+    model: "grok-4.5"
+    auth: oauth_subscription
+    cost_per_call_usd: 0.0
+    notes: "X/Twitter search lane used by the business research sequence; defined in dispatcher.py."
 
   paid_proxy:
     type: api
@@ -190,7 +197,7 @@ lanes:
     body_template: '{"query":"{query}","numResults":10}'
     auth: none_local
     cost_per_call_usd: 0.005
-    notes: "Paid proxy fallback. Routes Linkup -> Tavily -> You.com -> paid Exa backup. Free-first search should exhaust local/free lanes before this."
+    notes: "Paid proxy fallback. Routes paid Linkup -> Tavily -> You.com, with free Exa (as of 2026-07-04) as backup. Free-first search should exhaust local/free lanes before this."
 
   linkup_direct:
     type: api
@@ -207,8 +214,8 @@ lanes:
     method: POST
     body_template: '{"query":"{query}","numResults":10,"provider":"exa"}'
     auth: none_local
-    cost_per_call_usd: 0.005
-    notes: "Paid Exa backup via proxy exa_* keys. Do not confuse this with the free keyless mcp.exa.ai endpoint used by buzz."
+    cost_per_call_usd: 0.0
+    notes: "Exa is FREE as of 2026-07-04 (Ian) via proxy exa_* keys and must NOT be reported as a paid burn. Do not confuse this with the free keyless mcp.exa.ai endpoint used by buzz."
 
   exa:
     type: api
@@ -216,8 +223,8 @@ lanes:
     method: POST
     body_template: '{"query":"{query}","numResults":10,"provider":"exa"}'
     auth: none_local
-    cost_per_call_usd: 0.005
-    notes: "Compatibility alias for paid exa_direct."
+    cost_per_call_usd: 0.0
+    notes: "Compatibility alias for exa_direct. Exa is now free."
 
   youcom_direct:
     type: api
@@ -249,7 +256,7 @@ lanes:
   # ------- Government / legal -------
   courtlistener:
     type: api
-    endpoint: "https://www.courtlistener.com/api/rest/v3/search/?q={query}"
+    endpoint: "https://www.courtlistener.com/api/rest/v4/search/?q={query}"
     auth: optional_token
     cost_per_call_usd: 0.0
     notes: "CT already has bridge/courtlistener_ingest.py — reuse."
@@ -303,7 +310,9 @@ lanes:
 
   govinfo_gov:
     type: api
-    endpoint: "https://api.govinfo.gov/search?api_key={DATA_GOV_API_KEY}&query={query}"
+    endpoint: "https://api.govinfo.gov/search?api_key={DATA_GOV_API_KEY}"
+    method: POST
+    body_template: '{"query":"{query}","pageSize":20,"offsetMark":"*"}'
     auth: env:DATA_GOV_API_KEY
     cost_per_call_usd: 0.0
 
@@ -424,7 +433,7 @@ lanes:
     endpoint: "https://www.reddit.com/search.rss?q={query}&sort=relevance&limit=25"
     auth: none
     headers:
-      User-Agent: "IanResearch/1.0 (123icpe@gmail.com)"
+      User-Agent: "{RESEARCH_ENGINE_USER_AGENT}"
     cost_per_call_usd: 0.0
     response_format: atom
 
@@ -434,7 +443,7 @@ lanes:
     endpoint: "https://www.reddit.com/search.json?q={query}&t=week"
     auth: none
     headers:
-      User-Agent: "IanResearch/1.0 (123icpe@gmail.com)"
+      User-Agent: "{RESEARCH_ENGINE_USER_AGENT}"
     cost_per_call_usd: 0.0
 
   reddit_failures:
@@ -442,7 +451,7 @@ lanes:
     endpoint: "https://www.reddit.com/search.json?q={query}+failed+OR+broken+OR+banned&sort=relevance&t=month"
     auth: none
     headers:
-      User-Agent: "IanResearch/1.0 (123icpe@gmail.com)"
+      User-Agent: "{RESEARCH_ENGINE_USER_AGENT}"
     cost_per_call_usd: 0.0
 
   x_pulse:
@@ -454,7 +463,7 @@ lanes:
 
   bluesky_jetstream:
     type: cli
-    command: "/Users/cleo/buzz/buzz.py"
+    command: "{RESEARCH_ENGINE_BUZZ_SCRIPT}"
     args: ["{query}", "--quick", "--emit=json", "--search=bluesky"]
     auth: none
     cost_per_call_usd: 0.0
@@ -469,16 +478,16 @@ lanes:
   # ------- Personal / memory -------
   mentor_memory:
     type: local
-    db_path: "/Users/cleo/lattice/data/agent_state/memory.db"
+    db_path: "{RESEARCH_ENGINE_MEMORY_DB}"
     notes: "MENTOR memory; never call retired Brain API at port 18790."
 
   claude_memory_files:
     type: local
-    glob: "/Users/cleo/.claude/projects/-Users-cleo/memory/*.md"
+    glob: "{RESEARCH_ENGINE_CLAUDE_MEMORY_GLOB}"
 
   obsidian:
     type: local
-    glob: "/Users/cleo/ObsidianVault/**/*.md"
+    glob: "{RESEARCH_ENGINE_OBSIDIAN_GLOB}"
 
 # ---------------------------------------------------------------------------
 # Topic authority weights — multiplied into reranker scores per topic.
@@ -579,31 +588,30 @@ failsafe:
   abstention_message: "Insufficient evidence — refine query or expand search."
 
 # ---------------------------------------------------------------------------
-# Gemini 3 Flash scout front stage.
+# Gemini 3.7 Flash scout front stage.
 # ---------------------------------------------------------------------------
 
 scout:
   lane: gemini_pro_scout
   worker_model: gemini-flash
   provider: agy_cli
-  cli_home: "agy-cli-1"
-  cli_profile: "agy-cli-1"
+  cli_home: "{RESEARCH_ENGINE_AGY_BIN}"
+  cli_profile: "canonical-agy"
   health_check_timeout_seconds: 60
-  fail_loud: true
+  fail_loud: false
   discord_alert_channel: alerts
   discord_alert_channel_id: "1495166380163596298"
-  # AGY RULE: model_candidates are used for health-check logging/cache only.
-  # agy-cli-1 is invoked WITHOUT --model/-m and relies on its configured
-  # default, locked as Gemini 3 Flash. Do not add --model back.
+  # The dispatcher passes the exact friendly model name via --model. It skips
+  # Gemini probes for unattended runs and when the locked daily cap is full.
   model_candidates:
-    - "gemini-3-flash"
+    - "Gemini 3.7 Flash (Medium)"
   fallback_flag: "--pro-synthesis-fallback"
 
 fleets:
   research:
     worker_count: 3
-    scout_model: gemini-3-flash
-    scout_home: "agy-cli-1"
+    scout_model: "Gemini 3.7 Flash (Medium)"
+    scout_home: "{RESEARCH_ENGINE_AGY_BIN}"
     workers:
       - count: 1
         model: codex-5.4
@@ -612,15 +620,15 @@ fleets:
         model: mistral
         command_model: mistral-small-latest
         provider: mistral_free_api
-        key_file: "/Users/cleo/.secrets/mistral-free-keys.env"
+        key_file: "{RESEARCH_ENGINE_MISTRAL_KEYS_FILE}"
       - count: 1
         model: grok
-        command_model: grok-4.20-0309-reasoning
-        provider: hermes
+        command_model: grok-4.5
+        provider: grok_cli
   deep_research:
     worker_count: 16
-    scout_model: gemini-3-flash
-    scout_home: "agy-cli-1"
+    scout_model: "Gemini 3.7 Flash (Medium)"
+    scout_home: "{RESEARCH_ENGINE_AGY_BIN}"
     workers:
       - count: 5
         model: haiku
@@ -631,8 +639,8 @@ fleets:
         model: haiku
       - count: 1
         model: grok
-        command_model: grok-4.20-0309-reasoning
-        provider: hermes
+        command_model: grok-4.5
+        provider: grok_cli
 
 # ---------------------------------------------------------------------------
 # Recursive planning tiers for /research and /deep-research.

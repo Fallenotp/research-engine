@@ -12,6 +12,8 @@ from uuid import UUID
 from pydantic import ValidationError
 
 from research_engine.evidence_gate import enforce_evidence_gate, write_evidence_gate_sidecar
+
+from . import paths
 from research_engine.schema import (
     EvidenceChunk,
     ExtractionMethod,
@@ -26,9 +28,12 @@ from research_engine.schema import (
 
 
 LOGGER = logging.getLogger(__name__)
-DEFAULT_ROOT = Path("/Users/cleo/.claude/research-sessions")
+DEFAULT_ROOT = paths.optional_path(paths.RESEARCH_SESSIONS_DIR_ENV) or paths.data_path(
+    "research-sessions"
+)
 INDEX_KEYS = {"session_id", "created_at", "protocol", "question", "final_status"}
-CANONICAL_GEMINI_PRO_MODEL_ID = "gemini-3-flash"
+CANONICAL_GEMINI_PRO_MODEL_ID = "Gemini 3.7 Flash (Medium)"
+_AGY_GEMINI_FLASH_MODEL_PREFIX = "Gemini 3.7 Flash"
 
 
 def save_session(
@@ -142,11 +147,12 @@ def enforce_gemini_pro_interlock(session: ResearchSession) -> ResearchSession:
     final_status = getattr(session.final_status, "value", str(session.final_status))
     detail = _describe_gemini_pro_runs(session)
     raise GeminiProScoutError(
-        "Gemini 3 Flash interlock failed closed: "
+        "Gemini 3.7 Flash interlock failed closed: "
         f"{protocol} session {session.session_id} with final_status={final_status!r} "
-        "cannot be saved without a successful Gemini 3 Flash scout record or a "
+        "cannot be saved without a successful Gemini 3.7 Flash scout record or a "
         "successful final-synthesis fallback record. "
-        f"Scout records must use model_id={CANONICAL_GEMINI_PRO_MODEL_ID!r}. "
+        "Scout records must use a live agy Gemini 3.7 Flash model id, such as "
+        f"{CANONICAL_GEMINI_PRO_MODEL_ID!r}. "
         f"Recorded runs: {detail}."
     )
 
@@ -212,10 +218,18 @@ def _has_successful_gemini_flash_scout(session: ResearchSession) -> bool:
         if (
             run.run_type == GeminiProRunKind.SCOUT
             and run.success
-            and run.model_id == CANONICAL_GEMINI_PRO_MODEL_ID
+            and _is_agy_gemini_flash_model(run.model_id)
         ):
             return True
     return False
+
+
+def _is_agy_gemini_flash_model(model_id: str | None) -> bool:
+    if not model_id:
+        return False
+    return model_id == _AGY_GEMINI_FLASH_MODEL_PREFIX or model_id.startswith(
+        f"{_AGY_GEMINI_FLASH_MODEL_PREFIX} ("
+    )
 
 
 def _has_successful_final_synthesis_run(session: ResearchSession) -> bool:

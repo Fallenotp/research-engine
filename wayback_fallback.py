@@ -9,8 +9,9 @@ from urllib.parse import quote
 import requests
 import trafilatura
 
+from . import paths
+
 logger = logging.getLogger("extractor")
-ENV_PATH = Path("/Users/cleo/.openclaw/.env")
 _WARNED_MISSING_KEYS = False
 
 
@@ -43,7 +44,9 @@ def _extractor_helpers():
 
 
 if not os.getenv("WAYBACK_ACCESS_KEY") or not os.getenv("WAYBACK_SECRET_KEY"):
-    _load_env_file(ENV_PATH)
+    configured_env = paths.env_file()
+    if configured_env is not None:
+        _load_env_file(configured_env)
 
 
 def try_wayback(source_url: str) -> dict[str, str | None] | None:
@@ -61,14 +64,14 @@ def try_wayback(source_url: str) -> dict[str, str | None] | None:
 
         headers = {
             "Authorization": f"LOW {access}:{secret}",
-            "User-Agent": "IanResearch/1.0 (twolittletrees@gmail.com)",
+            "User-Agent": paths.user_agent(),
         }
         cdx_url = (
             "https://web.archive.org/cdx/search/cdx"
             f"?url={quote(source_url, safe='')}"
-            "&limit=1&output=json&filter=statuscode:200&from=2020"
+            "&limit=1&output=json&filter=statuscode:200&from=2020&sort=reverse"
         )
-        cdx_response = requests.get(cdx_url, headers=headers, timeout=20)
+        cdx_response = requests.get(cdx_url, headers=headers, timeout=8)
         cdx_response.raise_for_status()
         rows = cdx_response.json()
         if not isinstance(rows, list) or len(rows) < 2:
