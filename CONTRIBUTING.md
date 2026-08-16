@@ -70,4 +70,5 @@ Security problems go through the Security tab instead. See [SECURITY.md](SECURIT
 
 ## Licence
 
-Contributions are accepted under the MIT licence, same as the rest of the repo.
+Contributions are accepted under the GNU AGPL-3.0-or-later, same as the rest of the repo. By
+opening a pull request you agree your work goes out under that licence.

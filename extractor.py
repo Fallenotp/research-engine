@@ -434,8 +434,8 @@ def _append_telemetry_row(row: dict) -> None:
                 handle.flush()
             finally:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("reader telemetry append failed: %s", exc)
 
 
 def _log(method: str, started_at: float, success: bool, char_count: int, error: str = "") -> None:
@@ -1140,9 +1140,9 @@ def _agent_browser(source_url: str) -> dict[str, str | None] | None:
         try:
             run_command("close", json_output=False)
         except FileNotFoundError:
-            pass
-        except Exception:
-            pass
+            logger.info("agent_browser close skipped for %s: command not found", source_url)
+        except Exception as exc:
+            logger.warning("agent_browser close failed for %s: %s", source_url, exc)
 
     body = str(text_data.get("text") or "").strip()
     if not body:

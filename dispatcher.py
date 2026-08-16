@@ -665,14 +665,6 @@ def _normalize_lanes(value: object) -> list[str]:
     return [str(item).strip() for item in value if str(item).strip()]
 
 
-def _match_lane_rule(lanes: list[str]) -> Optional[_LaneRule]:
-    lane_set = set(lanes)
-    for rule in _LANE_RULES:
-        if lane_set.intersection(rule.lanes):
-            return rule
-    return None
-
-
 def _warn_unknown_lanes(territory: Territory, router, assigned_lanes: list[str]) -> None:
     if router is None:
         return
@@ -806,20 +798,6 @@ def _config_flag(value: object) -> bool:
     if isinstance(value, (int, float)):
         return bool(value)
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _load_env_file(path: Path) -> None:
-    if not path.exists():
-        return
-    for raw_line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        key = key.strip()
-        value = value.strip().strip('"').strip("'")
-        if key and key not in os.environ:
-            os.environ[key] = value
 
 
 def _load_env_file_values(path: Path) -> dict[str, str]:

@@ -33,7 +33,6 @@ from research_engine.dispatcher import (
     AGY_INTERACTIVE_GEMINI_MODEL,
     GEMINI_CLI_HOME,
     GEMINI_DAILY_COUNTER_FILE,
-    GEMINI_SCOUT_CLI_HOME,
     GEMINI_TIMEOUT_SECONDS,
     GeminiProScoutError,
     GROK_TIMEOUT_SECONDS,
@@ -887,7 +886,11 @@ def run_multi_territory_research(
             route = router.route(question)
             authority_topic = route.topic
             require_tier_1 = bool(getattr(route, "require_tier_1", False))
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                "router route failed; disabling authority topic and Tier-1 enforcement: %s",
+                exc,
+            )
             authority_topic = None
             require_tier_1 = False
     scout_attempt = run_gemini_scout(
@@ -1056,14 +1059,19 @@ def provider_for_question(question: str) -> str:
     try:
         route = load_router().route(question)
         return choose_provider(getattr(route, "lanes", []))
-    except Exception:  # noqa: BLE001 - router failure degrades to default provider
+    except Exception as exc:  # noqa: BLE001 - router failure degrades to default provider
+        logger.warning(
+            "router provider selection failed; falling back to tavily: %s",
+            exc,
+        )
         return "tavily"
 
 
 def load_router_or_none():
     try:
         return load_router()
-    except Exception:
+    except Exception as exc:
+        logger.warning("router load failed; continuing without router: %s", exc)
         return None
 
 
@@ -1402,13 +1410,6 @@ def _execute_agy_worker_spec(spec: WorkerSpec, *, router) -> tuple[str, str]:
     return stdout_text, model_id
 
 
-def gemini_home_for_spec(spec: WorkerSpec, *, router) -> str:
-    if "gemini_pro_scout" in spec.lanes:
-        config = router_scout_config(router)
-        return str(config.get("cli_home") or GEMINI_SCOUT_CLI_HOME)
-    return GEMINI_CLI_HOME
-
-
 def gemini_timeout_for_spec(spec: WorkerSpec, *, router) -> int:
     if "gemini_pro_scout" in spec.lanes:
         config = router_scout_config(router)
@@ -1690,47 +1691,6 @@ def apply_anti_hallucination_gate(text: str, *, label: str) -> str:
     if validated.strip():
         return f"{validated.strip()}\n\n" + "\n".join(gate_lines)
     return "\n".join(gate_lines)
-
-
-def gemini_pro_synthesis_brief(
-    question: str,
-    *,
-    protocol: Protocol,
-    runs: list[TerritoryRun],
-) -> str:
-    source_pairs = source_pairs_from_runs(runs)
-    worker_paths = worker_output_paths_from_runs(runs)
-    sections = [
-        f"You are Gemini 3.7 Flash through agy doing final synthesis for {protocol.value}.",
-        "Use only the numbered sources below. If they do not directly answer "
-        "the question, abstain.",
-        "No-tool input contract: use the original question, territory summaries, "
-        "and worker output file paths below. Do not start fresh research.",
-        "End with one short line that begins: Caveats/disagreements:",
-        "",
-        f"Question: {question}",
-        "",
-        "Worker output file paths:",
-    ]
-    sections.extend(worker_paths or ["No worker output files were recorded."])
-    sections.extend([
-        "",
-        "Territory summaries:",
-    ])
-    summaries = [run.summary.strip() for run in runs if run.summary.strip()]
-    if summaries:
-        sections.extend(
-            f"{index}. {summary}"
-            for index, summary in enumerate(summaries, start=1)
-        )
-    else:
-        sections.append("No territory summaries were produced.")
-    sections.extend(["", "Numbered sources:"])
-    if source_pairs:
-        sections.extend(numbered_sources(source_pairs, max_chars=1500))
-    else:
-        sections.append("No usable sources were retrieved. Return insufficient evidence.")
-    return "\n".join(sections).strip()
 
 
 def run_logged_search(search_fn, question: str, *, errors: list[str], **kwargs) -> dict[str, Any]:
@@ -3320,7 +3280,8 @@ def write_session_directly(session: ResearchSession) -> Path | None:
             payload += "\n"
         path.write_text(payload, encoding="utf-8")
         return path
-    except Exception:
+    except Exception as exc:
+        logger.warning("direct session write failed: %s", exc)
         return None
 
 
@@ -3328,7 +3289,8 @@ def telemetry_safely() -> None:
     try:
         with contextlib.redirect_stdout(io.StringIO()):
             telemetry_observer.run()
-    except Exception:
+    except Exception as exc:
+        logger.warning("telemetry observer failed: %s", exc)
         return
 
 

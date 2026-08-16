@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import json
+import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
@@ -56,6 +57,7 @@ CALL_LOG_FIELDS = (
     "error",
     "agent",
 )
+logger = logging.getLogger(__name__)
 
 
 def _as_list(value: Any) -> list[Any]:
@@ -169,7 +171,7 @@ def session_to_row(session_dict: dict[str, Any], session_file: Path) -> dict[str
     return {field: row.get(field) for field in ROW_FIELDS}
 
 
-def _append_row(row: dict[str, Any]) -> None:
+def _append_row(row: dict[str, Any]) -> Exception | None:
     try:
         MASTER_LOG.parent.mkdir(parents=True, exist_ok=True)
         with MASTER_LOG.open("a", encoding="utf-8") as handle:
@@ -179,8 +181,10 @@ def _append_row(row: dict[str, Any]) -> None:
                 handle.flush()
             finally:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-    except Exception:
-        pass
+        return None
+    except Exception as exc:
+        logger.warning("telemetry append failed: %s", exc)
+        return exc
 
 
 def log_buzz(
@@ -218,9 +222,11 @@ def log_buzz(
             "session_id": None,
             "session_file": None,
         }
-        _append_row({field: row.get(field) for field in ROW_FIELDS})
-    except Exception:
-        pass
+        error = _append_row({field: row.get(field) for field in ROW_FIELDS})
+        if error is not None:
+            logger.warning("buzz telemetry append failed: %s", error)
+    except Exception as exc:
+        logger.warning("buzz telemetry append failed: %s", exc)
 
 
 def existing_session_ids() -> set[str]:

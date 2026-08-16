@@ -118,7 +118,8 @@ Deep-research deliberately mixes vendors — agreement across unrelated model fa
 ## Setup
 
 ### What it expects on the machine
-- Python 3.11+ with the scrape stack: `trafilatura`, `curl_cffi`, `crawl4ai`, `scrapling`
+- Python 3.10+ (the syntax floor; it is only actually run and tested on 3.11)
+- The scrape stack, installed via the optional extras below: `trafilatura`, `curl_cffi`, `crawl4ai`, `scrapling`
 - A local [SearXNG](https://github.com/searxng/searxng) instance on `localhost:8888`
 - The subscription LLM CLIs: `codex`, `claude`, and `agy` (Gemini — required for research/deep-research modes)
 - The `agent-browser` CLI, if you want the real-browser reading rung
@@ -218,4 +219,11 @@ editing paths in the source.
 
 ## Licence
 
-MIT. See [LICENSE](LICENSE).
+GNU AGPL-3.0-or-later. See [LICENSE](LICENSE).
+
+Use it, change it, run it, charge for it. The one condition: if you distribute it, or run a
+modified version as a network service other people can reach, you have to make your source
+available under the same licence. You cannot take this, close it, and ship it as a private
+product.
+
+If that does not suit your situation, ask.

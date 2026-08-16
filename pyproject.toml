@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "research-engine"
+version = "0.0.0"
+description = "Self-hosted web research pipeline: routes questions across search lanes, escalates through a reader ladder for pages that block scrapers, and answers only from source text it fetched."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "AGPL-3.0-or-later"
+dependencies = [
+    "beautifulsoup4",
+    "httpx",
+    "pydantic",
+    "PyYAML",
+    "requests",
+    "trafilatura",
+]
+
+[project.optional-dependencies]
+extractors = [
+    "crawlee",
+    "docling",
+    "gitingest",
+]
+markitdown = [
+    "markitdown",
+]
+pdf = [
+    "PyMuPDF",
+]
+scrapling = [
+    "scrapling",
+]
+proxy = [
+    "aiohttp",
+]
+
+[tool.setuptools]
+packages = ["research_engine"]
+
+[tool.setuptools.package-dir]
+research_engine = "."
+
+[tool.ruff]
+line-length = 88

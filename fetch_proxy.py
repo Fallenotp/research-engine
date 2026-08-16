@@ -57,8 +57,11 @@ class ProxyBackend:
 
 
 class NoProxyBackend(ProxyBackend):
+    def __init__(self, label: str = "no_proxy"):
+        self._label = label
+
     def acquire(self, *, domain: str, sticky: bool) -> ProxySession:
-        return ProxySession(proxy_url=None, label="no_proxy", sticky=sticky)
+        return ProxySession(proxy_url=None, label=self._label, sticky=sticky)
 
 
 @functools.lru_cache(maxsize=None)
@@ -332,5 +335,12 @@ def load_proxy_backend(config: dict) -> ProxyBackend:
             return NordVPNSocksBackend()
         except Exception as exc:
             logger.warning("nordvpn backend unavailable, trying scraperapi backend: %s", exc)
-        return _load_scraperapi_backend(fail_open=True)
+        try:
+            return ScraperAPIBackend()
+        except Exception as scraper_exc:
+            logger.warning(
+                "nordvpn backend unavailable, no proxy will be used after scraperapi fallback failed: %s",
+                scraper_exc,
+            )
+            return NoProxyBackend("no_proxy:nordvpn_and_scraperapi_unavailable")
     return NoProxyBackend()

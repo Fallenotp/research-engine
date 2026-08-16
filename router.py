@@ -124,14 +124,25 @@ def source_authority_score(domain: str, topic: str | None) -> float:
         _DEFAULT_ROUTER_LOAD_ATTEMPTED = True
         try:
             _DEFAULT_ROUTER = load_router()
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                "router load failed; using legacy authority score for topic %r: %s",
+                topic,
+                exc,
+            )
             _DEFAULT_ROUTER = None
 
     if _DEFAULT_ROUTER is None:
         return LEGACY_AUTHORITY_SCORE
     try:
         return _DEFAULT_ROUTER.authority_score(domain, topic)
-    except Exception:
+    except Exception as exc:
+        logger.warning(
+            "authority scoring failed for domain %r topic %r; using legacy score: %s",
+            domain,
+            topic,
+            exc,
+        )
         return LEGACY_AUTHORITY_SCORE
 
 

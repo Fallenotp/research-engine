@@ -14,7 +14,6 @@ from datetime import datetime, timezone
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Protocol
-from urllib.parse import urlparse
 
 from . import paths
 
@@ -517,82 +516,6 @@ def final_judge(result: dict[str, Any]) -> dict[str, Any]:
         if isinstance(judge, dict):
             return judge
     return {}
-
-
-def should_downgrade(result: dict[str, Any]) -> bool:
-    if result.get("low_confidence") is True:
-        return True
-    return str(result.get("terminal_state") or "").strip().lower() in {"partial", "exhausted"}
-
-
-def collect_items_by_source(items_by_source: dict[str, Sequence[object]]) -> list[SourceText]:
-    collected: list[SourceText] = []
-    seen_source_ids: set[str] = set()
-    remaining_chars = MAX_SOURCE_CHARS
-    for source, items in sorted(items_by_source.items()):
-        for index, item in enumerate(items, start=1):
-            source_id = f"{source}:{getattr(item, 'item_id', '') or index}"
-            if source_id in seen_source_ids:
-                continue
-            seen_source_ids.add(source_id)
-            text = source_item_text(item)
-            if not text:
-                continue
-            capped = text[: min(MAX_SOURCE_CHARS_PER_SOURCE, remaining_chars)]
-            if not capped:
-                break
-            collected.append(
-                SourceText(
-                    source_id=source_id,
-                    title=str(getattr(item, "title", "") or ""),
-                    domain=item_domain(item, str(source)),
-                    text=capped,
-                )
-            )
-            remaining_chars -= len(capped)
-            if remaining_chars <= 0:
-                return collected
-    return collected
-
-
-def source_item_text(item: object) -> str:
-    parts = [
-        str(getattr(item, "title", "") or ""),
-        str(getattr(item, "body", "") or ""),
-        str(getattr(item, "snippet", "") or ""),
-        str(getattr(item, "why_relevant", "") or ""),
-    ]
-    metadata = getattr(item, "metadata", {}) or {}
-    if not isinstance(metadata, dict):
-        metadata = {}
-
-    for key in ("transcript_snippet", "transcript"):
-        value = metadata.get(key)
-        if isinstance(value, str):
-            parts.append(value)
-
-    for key in ("transcript_highlights", "comment_insights"):
-        for value in metadata.get(key) or []:
-            if isinstance(value, str):
-                parts.append(value)
-
-    for comment in metadata.get("top_comments") or []:
-        if isinstance(comment, dict):
-            parts.append(str(comment.get("excerpt", "") or comment.get("text", "") or ""))
-        elif isinstance(comment, str):
-            parts.append(comment)
-
-    return " ".join(" ".join(part.split()) for part in parts if part).strip()
-
-
-def item_domain(item: object, fallback: str = "") -> str:
-    url = str(getattr(item, "url", "") or "")
-    if url:
-        parsed = urlparse(url)
-        if parsed.netloc:
-            return parsed.netloc
-    return fallback
-
 
 def cap_source_texts(source_texts: Sequence[SourceText]) -> list[SourceText]:
     capped: list[SourceText] = []

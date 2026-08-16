@@ -15,9 +15,10 @@ logger = logging.getLogger("extractor")
 _WARNED_MISSING_KEYS = False
 
 
-def _load_env_file(path: Path) -> None:
-    if not path.exists():
-        return
+def _load_env_file_values(path: Path | None) -> dict[str, str]:
+    if path is None or not path.exists():
+        return {}
+    values: dict[str, str] = {}
     for raw_line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
@@ -25,8 +26,9 @@ def _load_env_file(path: Path) -> None:
         key, _, value = line.partition("=")
         key = key.strip()
         value = value.strip().strip('"').strip("'")
-        if key and key not in os.environ:
-            os.environ[key] = value
+        if key and key not in values:
+            values[key] = value
+    return values
 
 
 def _extractor_helpers():
@@ -43,10 +45,7 @@ def _extractor_helpers():
     return extractor_module._html_meta, extractor_module._payload
 
 
-if not os.getenv("WAYBACK_ACCESS_KEY") or not os.getenv("WAYBACK_SECRET_KEY"):
-    configured_env = paths.env_file()
-    if configured_env is not None:
-        _load_env_file(configured_env)
+_ENV_FILE_VALUES = _load_env_file_values(paths.env_file())
 
 
 def try_wayback(source_url: str) -> dict[str, str | None] | None:
@@ -54,8 +53,8 @@ def try_wayback(source_url: str) -> dict[str, str | None] | None:
     global _WARNED_MISSING_KEYS
 
     try:
-        access = (os.getenv("WAYBACK_ACCESS_KEY") or "").strip()
-        secret = (os.getenv("WAYBACK_SECRET_KEY") or "").strip()
+        access = (os.getenv("WAYBACK_ACCESS_KEY") or _ENV_FILE_VALUES.get("WAYBACK_ACCESS_KEY") or "").strip()
+        secret = (os.getenv("WAYBACK_SECRET_KEY") or _ENV_FILE_VALUES.get("WAYBACK_SECRET_KEY") or "").strip()
         if not access or not secret:
             if not _WARNED_MISSING_KEYS:
                 logger.warning("Wayback fallback disabled: missing API keys")

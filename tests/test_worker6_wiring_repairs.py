@@ -6,7 +6,7 @@ from pathlib import Path
 
 import yaml
 
-from research_engine import sufficiency, telemetry_observer
+from research_engine import telemetry_observer
 from research_engine.router import DEFAULT_CONFIG_PATH, EXPECTED_SCHEMA_VERSION, load_router
 
 
@@ -127,9 +127,3 @@ def test_telemetry_observer_main_log_buzz_exposes_cli_hook(tmp_path, monkeypatch
     assert rows[0]["agent"] == "agent-a"
     assert rows[0]["source_domains"] == ["reddit", "x"]
     assert "Fine-tuning agents" in stdout
-
-
-def test_should_downgrade_marks_partial_or_low_confidence_results() -> None:
-    assert sufficiency.should_downgrade({"terminal_state": "partial"}) is True
-    assert sufficiency.should_downgrade({"low_confidence": True}) is True
-    assert sufficiency.should_downgrade({"terminal_state": "sufficient"}) is False
