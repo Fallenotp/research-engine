@@ -12,6 +12,7 @@ from research_engine import research_cli
 from research_engine import paths
 import research_engine.dispatcher as dispatcher
 from research_engine.persistence import CANONICAL_GEMINI_PRO_MODEL_ID
+from research_engine.schema import ResearchSession
 from research_engine.schema import (
     AnswerKind,
     FinalStatus,
@@ -228,6 +229,44 @@ def _install_research_fakes(
     )
     monkeypatch.setattr(research_cli.telemetry_observer, "run", lambda: {"added": 1})
     return saved_sessions, search_calls
+
+
+def test_save_session_with_fallback_preserves_original_session_on_save_failure(
+    monkeypatch, tmp_path
+) -> None:
+    source_text = "Grounded source text."
+    raw_text_path = tmp_path / "source.txt"
+    raw_text_path.write_text(source_text, encoding="utf-8")
+    session = ResearchSession(
+        protocol=Protocol.SEARCH,
+        question="What happened?",
+        triggered_by="pytest",
+        final_status=FinalStatus.COMPLETE,
+        answer="Real answer",
+        answer_kind=AnswerKind.FULL,
+        confidence=0.8,
+        answer_confidence=0.8,
+        sources=[],
+        evidence_chunks=[],
+        queries_run=[],
+        open_questions=[],
+    )
+
+    monkeypatch.setattr(research_cli.persistence, "DEFAULT_ROOT", tmp_path / "missing-root")
+    monkeypatch.setattr(
+        research_cli.persistence,
+        "save_session",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(FileNotFoundError("missing root")),
+    )
+
+    saved_session, path = research_cli.save_session_with_fallback(session)
+
+    assert saved_session is session
+    assert path is not None
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["answer"] == "Real answer"
+    assert payload["final_status"] == FinalStatus.COMPLETE.value
+    assert payload["answer_kind"] == AnswerKind.FULL.value
 
 
 def test_run_search_builds_session_with_source_answer_and_path(monkeypatch, tmp_path):
@@ -1153,6 +1192,9 @@ def test_run_research_gemini_unavailable_direct_abstain_does_not_crash(
 
 
 def test_execute_gemini_worker_spec_uses_agy_with_explicit_gemini_model(monkeypatch, tmp_path):
+    monkeypatch.setenv(paths.AGY_BIN_ENV, "/opt/research-engine-test/bin/agy")
+    monkeypatch.setattr(dispatcher, "AGY_CLI", "/opt/research-engine-test/bin/agy")
+    monkeypatch.setattr(research_cli, "GEMINI_CLI_HOME", "/opt/research-engine-test/bin/agy")
     brief_path = tmp_path / "brief.md"
     output_path = tmp_path / "output.md"
     brief_path.write_text("Scout this question.", encoding="utf-8")
@@ -1198,7 +1240,7 @@ def test_execute_gemini_worker_spec_uses_agy_with_explicit_gemini_model(monkeypa
     assert calls
     cmd, kwargs = calls[0]
     assert cmd == [
-        dispatcher.AGY_CLI,
+        "/opt/research-engine-test/bin/agy",
         "--dangerously-skip-permissions",
         "-p",
         "Scout this question.",
@@ -1301,6 +1343,9 @@ def test_execute_gemini_worker_spec_routes_unattended_run_to_full_quota_model(
 
 
 def test_execute_gemini_worker_spec_prefixes_dash_prefixed_prompt(monkeypatch, tmp_path):
+    monkeypatch.setenv(paths.AGY_BIN_ENV, "/opt/research-engine-test/bin/agy")
+    monkeypatch.setattr(dispatcher, "AGY_CLI", "/opt/research-engine-test/bin/agy")
+    monkeypatch.setattr(research_cli, "GEMINI_CLI_HOME", "/opt/research-engine-test/bin/agy")
     brief_path = tmp_path / "brief.md"
     output_path = tmp_path / "output.md"
     brief_path.write_text("-start with a flag-like line", encoding="utf-8")
@@ -1334,7 +1379,7 @@ def test_execute_gemini_worker_spec_prefixes_dash_prefixed_prompt(monkeypatch, t
     assert output == "grounded response https://example.com/source"
     cmd, _kwargs = calls[0]
     assert cmd == [
-        dispatcher.AGY_CLI,
+        "/opt/research-engine-test/bin/agy",
         "--dangerously-skip-permissions",
         "-p",
         "Brief:\n-start with a flag-like line",
@@ -1557,6 +1602,7 @@ def test_mistral_free_keys_rotate(monkeypatch, tmp_path) -> None:
 
 
 def test_execute_grok_worker_spec_uses_hermes_without_shell(monkeypatch, tmp_path):
+    monkeypatch.setenv(paths.GROK_BIN_ENV, "/opt/research-engine-test/bin/grok")
     brief_path = tmp_path / "brief.md"
     output_path = tmp_path / "output.md"
     brief_path.write_text("Run the Grok territory.", encoding="utf-8")
@@ -1590,7 +1636,7 @@ def test_execute_grok_worker_spec_uses_hermes_without_shell(monkeypatch, tmp_pat
     assert calls
     cmd, kwargs = calls[0]
     assert cmd == [
-        paths.executable(paths.GROK_BIN_ENV, "grok") or "grok",
+        "/opt/research-engine-test/bin/grok",
         "--single",
         "Run the Grok territory.",
     ]
@@ -1673,3 +1719,57 @@ def test_local_lane_payload_reports_missing_glob_root_as_not_configured(tmp_path
         ),
         "not_configured": True,
     }
+
+
+def test_run_local_search_lanes_surfaces_not_configured_error(tmp_path) -> None:
+    missing_db = tmp_path / "missing-memory.db"
+    expected_error = (
+        f"local lane not configured: missing {missing_db}; "
+        "set RESEARCH_ENGINE_MEMORY_DB"
+    )
+
+    class Router:
+        @staticmethod
+        def lane_endpoint(_lane: str) -> dict[str, str]:
+            return {
+                "type": "local",
+                "db_path": str(missing_db),
+                "env_var": "RESEARCH_ENGINE_MEMORY_DB",
+            }
+
+    errors: list[str] = []
+    payloads = research_cli.run_local_search_lanes(
+        ["mentor_memory"],
+        router=Router(),
+        question="where did we discuss this",
+        errors=errors,
+    )
+
+    assert payloads == [
+        (
+            "mentor_memory",
+            {"results": [], "error": expected_error, "not_configured": True},
+        )
+    ]
+    assert research_cli.first_error_or("no usable sources retrieved", errors) == expected_error
+
+
+def test_unset_buzz_script_surfaces_actionable_not_configured_error(monkeypatch) -> None:
+    monkeypatch.delenv(paths.BUZZ_SCRIPT_ENV, raising=False)
+    expected_error = "local lane not configured: set RESEARCH_ENGINE_BUZZ_SCRIPT"
+    errors: list[str] = []
+
+    payloads = research_cli.run_local_search_lanes(
+        ["bluesky_jetstream"],
+        router=research_cli.load_router(),
+        question="what is happening on bluesky",
+        errors=errors,
+    )
+
+    assert payloads == [
+        (
+            "bluesky_jetstream",
+            {"results": [], "error": expected_error, "not_configured": True},
+        )
+    ]
+    assert errors == [expected_error]

@@ -571,6 +571,23 @@ class SufficiencyTests(unittest.TestCase):
         self.assertEqual(none_result.confidence, 0.0)
         self.assertEqual(none_result.answer_confidence, 0.0)
 
+    def test_mark_partial_caps_high_measured_confidence_at_exactly_half(self) -> None:
+        session = _session(
+            "What changed in the policy?",
+            "The policy added an appeal window.",
+            ["The policy added an appeal window."],
+        )
+        session.confidence = 0.9
+        session.answer_confidence = 0.9
+
+        result = evidence_gate.mark_partial(
+            session,
+            {"terminal_state": "partial", "reason": "missing details"},
+        )
+
+        self.assertEqual(result.confidence, 0.5)
+        self.assertEqual(result.answer_confidence, 0.5)
+
     def test_save_session_abstains_exhausted_and_writes_sidecar(self) -> None:
         session = _session(
             "What does this prove?",

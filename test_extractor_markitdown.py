@@ -1,9 +1,9 @@
 import builtins
+import logging
 from pathlib import Path
 from unittest.mock import patch
 
 import fitz
-import pytest
 
 from research_engine import extractor
 from research_engine.schema import ExtractionMethod
@@ -79,7 +79,11 @@ def test_pdf_default_uses_pymupdf_before_docling(tmp_path) -> None:
     assert calls == ["pymupdf", "docling"]
 
 
-def test_pdf_without_pymupdf_extra_raises_actionable_error(tmp_path) -> None:
+def test_pdf_without_pymupdf_extra_returns_none_and_logs_actionable_error(
+    tmp_path,
+    caplog,
+) -> None:
+    caplog.set_level(logging.INFO, logger="extractor")
     pdf_path = tmp_path / "sample.pdf"
     _write_sample_pdf(pdf_path, "PyMuPDF missing PDF text")
     real_import = builtins.__import__
@@ -89,30 +93,51 @@ def test_pdf_without_pymupdf_extra_raises_actionable_error(tmp_path) -> None:
             raise ModuleNotFoundError("No module named 'fitz'")
         return real_import(name, globals, locals, fromlist, level)
 
-    with patch("builtins.__import__", side_effect=fake_import):
-        with pytest.raises(RuntimeError, match=r"pip install .*pdf"):
-            extractor.extract_clean_text(
-                str(pdf_path),
-                seen_urls_path=tmp_path / "seen.txt",
-            )
-
-
-def test_pdf_helper_none_does_not_fall_through_to_web_ladder(monkeypatch) -> None:
-    web_ladder_called = False
-
-    def fake_web_ladder(*args, **kwargs):
-        nonlocal web_ladder_called
-        web_ladder_called = True
-        return {"title": "wrong", "text": "wrong " * 100}
-
-    monkeypatch.setattr(extractor, "_extract_pdf_or_document", lambda *args, **kwargs: None)
-    monkeypatch.setattr(extractor, "_extract_github_repo", lambda *args, **kwargs: None)
-    monkeypatch.setattr(extractor, "_extract_web_ladder", fake_web_ladder)
-
-    result = extractor.extract_clean_text("https://example.com/paper.pdf")
+    with patch("builtins.__import__", side_effect=fake_import), patch.object(
+        extractor,
+        "_pdf_docling",
+        return_value={},
+    ), patch.object(
+        extractor,
+        "_markitdown_payload",
+        return_value={},
+    ):
+        result = extractor.extract_clean_text(
+            str(pdf_path),
+            seen_urls_path=tmp_path / "seen.txt",
+        )
 
     assert result is None
-    assert web_ladder_called is False
+    assert "pip install research-engine[pdf]" in caplog.text
+
+
+def test_pdf_fallback_respects_confirmed_vs_suffix_only_detection(monkeypatch) -> None:
+    def run_case(content_type: str):
+        web_ladder_called = False
+
+        def fake_web_ladder(*args, **kwargs):
+            nonlocal web_ladder_called
+            web_ladder_called = True
+            return {"title": "html viewer", "text": "html fallback text " * 40}
+
+        monkeypatch.setattr(
+            extractor, "_extract_pdf_or_document", lambda *args, **kwargs: None
+        )
+        monkeypatch.setattr(extractor, "_extract_github_repo", lambda *args, **kwargs: None)
+        monkeypatch.setattr(extractor, "_extract_web_ladder", fake_web_ladder)
+        monkeypatch.setattr(extractor, "_head_content_type", lambda *_args, **_kwargs: content_type)
+
+        result = extractor.extract_clean_text("https://example.com/paper.pdf")
+        return result, web_ladder_called
+
+    pdf_result, pdf_web_ladder_called = run_case("application/pdf")
+    html_result, html_web_ladder_called = run_case("text/html")
+
+    assert pdf_result is None
+    assert pdf_web_ladder_called is False
+    assert html_result is not None
+    assert html_result["title"] == "html viewer"
+    assert html_web_ladder_called is True
 
 
 def test_missing_pymupdf_falls_through_to_docling(tmp_path) -> None:

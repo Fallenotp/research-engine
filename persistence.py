@@ -28,9 +28,8 @@ from research_engine.schema import (
 
 
 LOGGER = logging.getLogger(__name__)
-DEFAULT_ROOT = paths.optional_path(paths.RESEARCH_SESSIONS_DIR_ENV) or paths.data_path(
-    "research-sessions"
-)
+_CLAUDE_RESEARCH_SESSIONS_ROOT = paths.home_path(".claude", "research-sessions")
+DEFAULT_ROOT = paths.optional_path(paths.RESEARCH_SESSIONS_DIR_ENV) or _CLAUDE_RESEARCH_SESSIONS_ROOT
 INDEX_KEYS = {"session_id", "created_at", "protocol", "question", "final_status"}
 CANONICAL_GEMINI_PRO_MODEL_ID = "Gemini 3.7 Flash (Medium)"
 _AGY_GEMINI_FLASH_MODEL_PREFIX = "Gemini 3.7 Flash"
@@ -42,14 +41,7 @@ def save_session(
 ) -> Path:
     """Persist session to root/YYYY-MM-DD/{session_id}.json."""
     root = root.expanduser().resolve()
-    if not root.exists():
-        raise FileNotFoundError(
-            paths.missing_config_message(
-                root,
-                paths.RESEARCH_SESSIONS_DIR_ENV,
-                label="Research sessions root",
-            )
-        )
+    root.mkdir(parents=True, exist_ok=True)
     session.updated_at = datetime.now(timezone.utc)
     session = enforce_evidence_gate(session)
     session = enforce_gemini_pro_interlock(session)

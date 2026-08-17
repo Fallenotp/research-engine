@@ -174,16 +174,13 @@ def test_search_session_still_saves_without_gemini_pro_record(tmp_path) -> None:
     assert path.exists()
 
 
-def test_save_session_rejects_missing_default_root(monkeypatch, tmp_path) -> None:
+def test_save_session_creates_missing_default_root(monkeypatch, tmp_path) -> None:
     session = _session(Protocol.SEARCH)
     missing_root = tmp_path / "missing-research-sessions"
     monkeypatch.setattr(persistence, "DEFAULT_ROOT", missing_root)
 
     with patch("research_engine.persistence.enforce_evidence_gate", side_effect=_identity):
-        with pytest.raises(FileNotFoundError) as excinfo:
-            save_session(session, root=persistence.DEFAULT_ROOT)
+        path = save_session(session, root=persistence.DEFAULT_ROOT)
 
-    assert str(excinfo.value) == (
-        "Research sessions root is not configured: missing "
-        f"{missing_root}. Set RESEARCH_ENGINE_RESEARCH_SESSIONS_DIR."
-    )
+    assert missing_root.exists()
+    assert path.exists()

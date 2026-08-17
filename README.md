@@ -113,8 +113,12 @@ first, each returning on its own, and only an ordinary web URL reaches the 7-run
 **Then the web ladder proper, 7 rungs:**
 
 `trafilatura` → `crawl4ai` → `Jina Reader` → `crawlee` → `scrapling` (stealth browser, brings in
-Camoufox) → `agent-browser` (a real browser session, on by default, not behind a toggle) →
-`firecrawl`.
+Camoufox) → `agent-browser` (a real browser session) → `firecrawl`.
+
+The `agent-browser` rung is gated twice, because a real browser is the one rung that can take a
+machine down. It runs only for a tier-3 request, and only after `l3_guard.preflight()` checks free
+RAM, swap pressure, the killswitch and the failure circuit-breaker. A blocked preflight is recorded
+and the rung returns nothing; it never falls back to launching the browser anyway.
 
 **Then, if nothing worked:** an open-access **publisher fallback** for paper-like URLs (Crossref and
 OpenAlex live here, not as search lanes), and finally the **Wayback Machine** for dead links.
@@ -253,8 +257,10 @@ python research_cli.py --mode research      "should we choose A or B"
 python research_cli.py --mode deep-research "everything known about X"
 ```
 
-Sessions are saved under `$RESEARCH_ENGINE_DATA_DIR/research-sessions/`, which defaults to
-`~/.research_engine/research-sessions/`. Override with `RESEARCH_ENGINE_RESEARCH_SESSIONS_DIR`.
+Sessions are saved to `~/.claude/research-sessions/YYYY-MM-DD/<session_id>.json`. Set
+`RESEARCH_ENGINE_RESEARCH_SESSIONS_DIR` to put them somewhere else. The directory is created on the
+first write, and a storage failure never rewrites the answer — the session is preserved and the
+failure is logged separately.
 
 Run the tests from the repo root, not from `tests/` — thirteen test modules live at the top level:
 

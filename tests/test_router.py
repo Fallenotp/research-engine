@@ -39,17 +39,17 @@ def test_router_loads_nasa_lane_and_data_gov_auth_config() -> None:
     assert "{FDA_API_KEY}" in fda["endpoint"]
 
 
-def test_scout_lane_routes_through_agy_cli_not_retired_gemini_cli() -> None:
+def test_scout_lane_routes_through_agy_cli_not_retired_gemini_cli(monkeypatch) -> None:
+    monkeypatch.setenv(paths.AGY_BIN_ENV, "/opt/research-engine-test/bin/agy")
     router = load_router()
 
     scout_lane = router.lane_endpoint("gemini_pro_scout")
     scout_config = router.scout_config()
 
-    assert scout_lane["command"] == (paths.executable(paths.AGY_BIN_ENV, "agy-cli-1", "agy-cli-2", "agy") or "agy")
-    assert scout_lane["command"].rsplit("/", 1)[-1] != "gemini"
+    assert scout_lane["command"] == "/opt/research-engine-test/bin/agy"
     assert scout_lane.get("home") is None
     assert scout_config["provider"] == "agy_cli"
-    assert scout_config["cli_home"] == scout_lane["command"]
+    assert scout_config["cli_home"] == "/opt/research-engine-test/bin/agy"
 
 
 def test_paid_lane_notes_mark_firecrawl_and_paid_proxy_as_paid_fallbacks() -> None:
@@ -67,16 +67,29 @@ def test_paid_lane_notes_mark_firecrawl_and_paid_proxy_as_paid_fallbacks() -> No
     assert "not a free lane" in firecrawl["notes"].lower()
 
 
-def test_bluesky_lane_uses_buzz_http_search_not_dead_jetstream() -> None:
+def test_bluesky_lane_uses_buzz_http_search_not_dead_jetstream(monkeypatch) -> None:
+    monkeypatch.setenv(
+        paths.BUZZ_SCRIPT_ENV,
+        "/opt/research-engine-test/bin/buzz",
+    )
     router = load_router()
 
     bluesky = router.lane_endpoint("bluesky_jetstream")
 
     assert bluesky["type"] == "cli"
-    assert bluesky["command"]
+    assert bluesky["command"] == "/opt/research-engine-test/bin/buzz"
     assert "--search=bluesky" in bluesky["args"]
     assert "jetstream" not in bluesky.get("endpoint", "").lower()
     assert "working http bluesky search" in bluesky["notes"].lower()
+
+
+def test_bluesky_lane_without_buzz_script_is_not_configured(monkeypatch) -> None:
+    monkeypatch.delenv(paths.BUZZ_SCRIPT_ENV, raising=False)
+
+    bluesky = load_router().lane_endpoint("bluesky_jetstream")
+
+    assert bluesky["type"] == "local"
+    assert bluesky["env_var"] == "RESEARCH_ENGINE_BUZZ_SCRIPT"
 
 
 def test_router_does_not_match_keywords_inside_larger_words() -> None:

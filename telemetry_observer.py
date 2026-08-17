@@ -17,8 +17,8 @@ except ModuleNotFoundError:  # pragma: no cover - direct script execution fallba
     from verbatim_check import check_verbatim
 
 
-SESSIONS_DIR = paths.optional_path(paths.RESEARCH_SESSIONS_DIR_ENV) or paths.data_path(
-    "research-sessions"
+SESSIONS_DIR = paths.optional_path(paths.RESEARCH_SESSIONS_DIR_ENV) or paths.home_path(
+    ".claude", "research-sessions"
 )
 MASTER_LOG = paths.telemetry_path("research-telemetry.jsonl")
 CALL_LOG = paths.telemetry_path("research-call-log.jsonl")

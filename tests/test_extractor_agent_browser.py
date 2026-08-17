@@ -61,12 +61,14 @@ def test_agent_browser_success_returns_payload() -> None:
             return _completed("")
         raise AssertionError(f"unexpected command: {args}")
 
-    with patch.object(extractor, "_get_politeness", return_value=politeness), patch.object(
+    with patch.object(extractor.l3_guard, "preflight", return_value=(True, None)), patch.object(
+        extractor.l3_guard, "record_success"
+    ) as record_success, patch.object(extractor, "_get_politeness", return_value=politeness), patch.object(
         extractor.subprocess,
         "run",
         side_effect=fake_run,
     ):
-        out = extractor._agent_browser("https://example.org")
+        out = extractor._agent_browser("https://example.org", tier=extractor.SourceTier.T3)
 
     assert out is not None
     assert out["title"] == "Exact Title"
@@ -78,6 +80,7 @@ def test_agent_browser_success_returns_payload() -> None:
         ("close",),
     ]
     politeness.wait.assert_called_once_with("example.org")
+    record_success.assert_called_once_with()
 
 
 @pytest.mark.parametrize("failing_command", [("open",), ("get", "text", "body")])
@@ -100,21 +103,26 @@ def test_agent_browser_always_closes_session_on_failure(failing_command) -> None
             return _completed(_envelope(data={"text": "Example body text"}))
         raise AssertionError(f"unexpected command: {args}")
 
-    with patch.object(extractor, "_get_politeness", return_value=politeness), patch.object(
+    with patch.object(extractor.l3_guard, "preflight", return_value=(True, None)), patch.object(
+        extractor.l3_guard, "record_failure"
+    ) as record_failure, patch.object(extractor, "_get_politeness", return_value=politeness), patch.object(
         extractor.subprocess,
         "run",
         side_effect=fake_run,
     ):
-        out = extractor._agent_browser("https://example.org")
+        out = extractor._agent_browser("https://example.org", tier=extractor.SourceTier.T3)
 
     assert out is None
     assert any(call[3] == "close" for call in calls)
+    record_failure.assert_called_once_with()
 
 
 def test_agent_browser_failure_envelope_returns_none() -> None:
     politeness = MagicMock()
 
-    with patch.object(extractor, "_get_politeness", return_value=politeness), patch.object(
+    with patch.object(extractor.l3_guard, "preflight", return_value=(True, None)), patch.object(
+        extractor.l3_guard, "record_failure"
+    ) as record_failure, patch.object(extractor, "_get_politeness", return_value=politeness), patch.object(
         extractor.subprocess,
         "run",
         side_effect=[
@@ -122,15 +130,18 @@ def test_agent_browser_failure_envelope_returns_none() -> None:
             _completed(""),
         ],
     ):
-        out = extractor._agent_browser("https://example.org")
+        out = extractor._agent_browser("https://example.org", tier=extractor.SourceTier.T3)
 
     assert out is None
+    record_failure.assert_called_once_with()
 
 
 def test_agent_browser_non_json_stdout_returns_none() -> None:
     politeness = MagicMock()
 
-    with patch.object(extractor, "_get_politeness", return_value=politeness), patch.object(
+    with patch.object(extractor.l3_guard, "preflight", return_value=(True, None)), patch.object(
+        extractor.l3_guard, "record_failure"
+    ) as record_failure, patch.object(extractor, "_get_politeness", return_value=politeness), patch.object(
         extractor.subprocess,
         "run",
         side_effect=[
@@ -138,15 +149,18 @@ def test_agent_browser_non_json_stdout_returns_none() -> None:
             _completed(""),
         ],
     ):
-        out = extractor._agent_browser("https://example.org")
+        out = extractor._agent_browser("https://example.org", tier=extractor.SourceTier.T3)
 
     assert out is None
+    record_failure.assert_called_once_with()
 
 
 def test_agent_browser_empty_text_returns_none() -> None:
     politeness = MagicMock()
 
-    with patch.object(extractor, "_get_politeness", return_value=politeness), patch.object(
+    with patch.object(extractor.l3_guard, "preflight", return_value=(True, None)), patch.object(
+        extractor.l3_guard, "record_failure"
+    ) as record_failure, patch.object(extractor, "_get_politeness", return_value=politeness), patch.object(
         extractor.subprocess,
         "run",
         side_effect=[
@@ -156,22 +170,26 @@ def test_agent_browser_empty_text_returns_none() -> None:
             _completed(""),
         ],
     ):
-        out = extractor._agent_browser("https://example.org")
+        out = extractor._agent_browser("https://example.org", tier=extractor.SourceTier.T3)
 
     assert out is None
+    record_failure.assert_called_once_with()
 
 
 def test_agent_browser_missing_binary_returns_none() -> None:
     politeness = MagicMock()
 
-    with patch.object(extractor, "_get_politeness", return_value=politeness), patch.object(
+    with patch.object(extractor.l3_guard, "preflight", return_value=(True, None)), patch.object(
+        extractor.l3_guard, "record_failure"
+    ) as record_failure, patch.object(extractor, "_get_politeness", return_value=politeness), patch.object(
         extractor.subprocess,
         "run",
         side_effect=FileNotFoundError(),
     ):
-        out = extractor._agent_browser("https://example.org")
+        out = extractor._agent_browser("https://example.org", tier=extractor.SourceTier.T3)
 
     assert out is None
+    record_failure.assert_called_once_with()
 
 
 def test_agent_browser_session_name_varies_by_url(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -193,13 +211,15 @@ def test_agent_browser_session_name_varies_by_url(monkeypatch: pytest.MonkeyPatc
             return _completed("")
         raise AssertionError(f"unexpected command: {args}")
 
-    with patch.object(extractor, "_get_politeness", return_value=politeness), patch.object(
+    with patch.object(extractor.l3_guard, "preflight", return_value=(True, None)), patch.object(
+        extractor.l3_guard, "record_success"
+    ), patch.object(extractor, "_get_politeness", return_value=politeness), patch.object(
         extractor.subprocess,
         "run",
         side_effect=fake_run,
     ):
-        first = extractor._agent_browser("https://example.org/one")
-        second = extractor._agent_browser("https://example.org/two")
+        first = extractor._agent_browser("https://example.org/one", tier=extractor.SourceTier.T3)
+        second = extractor._agent_browser("https://example.org/two", tier=extractor.SourceTier.T3)
 
     assert first is not None
     assert second is not None
@@ -212,11 +232,12 @@ def test_agent_browser_respects_robots_and_skips_fetch(monkeypatch: pytest.Monke
     politeness.allowed.return_value = False
     monkeypatch.setenv("RESEARCH_RESPECT_ROBOTS", "1")
 
-    with patch.object(extractor, "_get_politeness", return_value=politeness), patch.object(
-        extractor,
-        "note_block",
-    ) as note_block_mock, patch.object(extractor.subprocess, "run") as run_mock:
-        out = extractor._agent_browser("https://example.org")
+    with patch.object(extractor.l3_guard, "preflight", return_value=(True, None)), patch.object(
+        extractor, "_get_politeness", return_value=politeness
+    ), patch.object(extractor, "note_block") as note_block_mock, patch.object(
+        extractor.subprocess, "run"
+    ) as run_mock:
+        out = extractor._agent_browser("https://example.org", tier=extractor.SourceTier.T3)
 
     assert out is None
     run_mock.assert_not_called()
@@ -226,3 +247,32 @@ def test_agent_browser_respects_robots_and_skips_fetch(monkeypatch: pytest.Monke
         method="agent_browser",
         reason="robots_disallow",
     )
+
+
+def test_agent_browser_skips_when_tier_is_not_t3() -> None:
+    with patch.object(extractor.l3_guard, "preflight") as preflight_mock, patch.object(
+        extractor.subprocess, "run"
+    ) as run_mock:
+        out = extractor._agent_browser("https://example.org", tier=extractor.SourceTier.T2)
+
+    assert out is None
+    preflight_mock.assert_not_called()
+    run_mock.assert_not_called()
+
+
+def test_agent_browser_records_blocked_preflight_reason() -> None:
+    with patch.object(extractor.l3_guard, "preflight", return_value=(False, "L3_BLOCKED_LOW_RAM")), patch.object(
+        extractor.l3_guard, "record_failure"
+    ) as record_failure, patch.object(extractor.l3_guard, "log_attempt") as log_attempt, patch.object(
+        extractor.subprocess, "run"
+    ) as run_mock:
+        out = extractor._agent_browser("https://example.org", tier=extractor.SourceTier.T3)
+
+    assert out is None
+    record_failure.assert_called_once_with()
+    log_attempt.assert_called_once_with(
+        decision="blocked",
+        reason="L3_BLOCKED_LOW_RAM",
+        rung="agent_browser",
+    )
+    run_mock.assert_not_called()

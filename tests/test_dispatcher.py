@@ -63,7 +63,9 @@ class _RouterStub:
         return dict(self._config)
 
 
-def test_discover_gemini_pro_model_uses_canonical_flash_candidate(tmp_path) -> None:
+def test_discover_gemini_pro_model_uses_canonical_flash_candidate(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv(paths.AGY_BIN_ENV, "/opt/research-engine-test/bin/agy")
+    monkeypatch.setattr(dispatcher, "AGY_CLI", "/opt/research-engine-test/bin/agy")
     dispatcher._GEMINI_PRO_MODEL_ID_CACHE = None
 
     call_count = {"n": 0}
@@ -72,7 +74,7 @@ def test_discover_gemini_pro_model_uses_canonical_flash_candidate(tmp_path) -> N
         call_count["n"] += 1
         cmd = args[0]
         assert cmd == [
-            dispatcher.AGY_CLI,
+            "/opt/research-engine-test/bin/agy",
             "--dangerously-skip-permissions",
             "-p",
             "Reply with exactly OK.",
@@ -326,7 +328,9 @@ def test_invalid_budget_env_is_parsed_lazily(monkeypatch, tmp_path, caplog) -> N
     assert "using 300" in caplog.text
 
 
-def test_dispatch_scout_emits_agy_command(tmp_path) -> None:
+def test_dispatch_scout_emits_agy_command(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv(paths.AGY_BIN_ENV, "/opt/research-engine-test/bin/agy")
+    monkeypatch.setattr(dispatcher, "AGY_CLI", "/opt/research-engine-test/bin/agy")
     dispatcher._GEMINI_PRO_MODEL_ID_CACHE = None
     router = _RouterStub(str(tmp_path))
 
@@ -346,7 +350,7 @@ def test_dispatch_scout_emits_agy_command(tmp_path) -> None:
     assert spec.worker_model == WorkerModel.GEMINI_FLASH.value
     assert spec.model_id == "Gemini 3.7 Flash (Medium)"
     assert spec.invocation_hint.startswith(
-        f"{dispatcher.AGY_CLI} --dangerously-skip-permissions -p "
+        "/opt/research-engine-test/bin/agy --dangerously-skip-permissions -p "
     )
     assert spec.brief_path in spec.invocation_hint
     assert spec.output_path in spec.invocation_hint
@@ -358,7 +362,9 @@ def test_dispatch_scout_emits_agy_command(tmp_path) -> None:
     assert "--dangerously-skip-permissions" in spec.invocation_hint
 
 
-def test_social_lane_emits_gemini_invocation_hint() -> None:
+def test_social_lane_emits_gemini_invocation_hint(monkeypatch) -> None:
+    monkeypatch.setenv(paths.AGY_BIN_ENV, "/opt/research-engine-test/bin/agy")
+    monkeypatch.setattr(dispatcher, "AGY_CLI", "/opt/research-engine-test/bin/agy")
     territory = Territory(
         territory_id="social",
         description="Social and zeitgeist territory",
@@ -374,7 +380,7 @@ def test_social_lane_emits_gemini_invocation_hint() -> None:
     assert spec.provider == "agy_cli"
     assert spec.model_id == "Gemini 3.7 Flash (Medium)"
     assert spec.invocation_hint.startswith(
-        f"{dispatcher.AGY_CLI} --dangerously-skip-permissions -p "
+        "/opt/research-engine-test/bin/agy --dangerously-skip-permissions -p "
     )
     assert spec.brief_path in spec.invocation_hint
     assert spec.output_path in spec.invocation_hint
@@ -437,7 +443,8 @@ def test_dispatch_honors_assigned_worker_even_with_exa_lane() -> None:
     assert spec.provider == "codex_cli"
 
 
-def test_dispatch_honors_explicit_grok_worker() -> None:
+def test_dispatch_honors_explicit_grok_worker(monkeypatch) -> None:
+    monkeypatch.setenv(paths.GROK_BIN_ENV, "/opt/research-engine-test/bin/grok")
     territory = Territory(
         territory_id="grok-extra",
         description="Extra independent reasoning hand for broad web coverage",
@@ -452,13 +459,14 @@ def test_dispatch_honors_explicit_grok_worker() -> None:
     assert spec.worker_model == WorkerModel.GROK.value
     assert spec.provider == "grok_cli"
     assert spec.invocation_hint.startswith(
-        (paths.executable(paths.GROK_BIN_ENV, "grok") or "grok") + " --single "
+        "/opt/research-engine-test/bin/grok --single "
     )
     assert spec.brief_path in spec.invocation_hint
     assert spec.output_path in spec.invocation_hint
 
 
-def test_counter_evidence_role_is_standing_grok_lane() -> None:
+def test_counter_evidence_role_is_standing_grok_lane(monkeypatch) -> None:
+    monkeypatch.setenv(paths.GROK_BIN_ENV, "/opt/research-engine-test/bin/grok")
     territory = Territory(
         territory_id="counter",
         description="Counter-evidence and real-time objections",
@@ -473,7 +481,7 @@ def test_counter_evidence_role_is_standing_grok_lane() -> None:
     assert spec.worker_model == WorkerModel.GROK.value
     assert spec.provider == "grok_cli"
     assert spec.invocation_hint.startswith(
-        (paths.executable(paths.GROK_BIN_ENV, "grok") or "grok") + " --single "
+        "/opt/research-engine-test/bin/grok --single "
     )
 
 

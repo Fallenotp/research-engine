@@ -164,7 +164,7 @@ def test_provider_for_question_logs_when_router_route_fails(caplog, monkeypatch)
     assert "router provider selection failed; falling back to tavily: route unavailable" in caplog.text
 
 
-def test_source_authority_score_logs_legacy_fallback_when_router_load_fails(
+def test_source_authority_score_logs_default_fallback_when_router_load_fails(
     caplog, monkeypatch
 ) -> None:
     monkeypatch.setattr(router, "_DEFAULT_ROUTER_LOAD_ATTEMPTED", False)
@@ -178,11 +178,15 @@ def test_source_authority_score_logs_legacy_fallback_when_router_load_fails(
     with caplog.at_level(logging.WARNING, logger="research_engine.router"):
         score = router.source_authority_score("example.com", "legal")
 
-    assert score == router.LEGACY_AUTHORITY_SCORE
-    assert "router load failed; using legacy authority score for topic 'legal': bad router config" in caplog.text
+    assert score == router.DEFAULT_AUTHORITY_SCORE
+    assert "router load failed; using default authority score for topic 'legal': bad router config" in caplog.text
 
 
-def test_source_authority_score_logs_legacy_fallback_when_authority_call_fails(
+def test_source_authority_score_without_topic_uses_default_score() -> None:
+    assert router.source_authority_score("example.com", None) == router.DEFAULT_AUTHORITY_SCORE
+
+
+def test_source_authority_score_logs_default_fallback_when_authority_call_fails(
     caplog, monkeypatch
 ) -> None:
     monkeypatch.setattr(router, "_DEFAULT_ROUTER_LOAD_ATTEMPTED", True)
@@ -199,9 +203,9 @@ def test_source_authority_score_logs_legacy_fallback_when_authority_call_fails(
     with caplog.at_level(logging.WARNING, logger="research_engine.router"):
         score = router.source_authority_score("example.com", "legal")
 
-    assert score == router.LEGACY_AUTHORITY_SCORE
+    assert score == router.DEFAULT_AUTHORITY_SCORE
     assert (
-        "authority scoring failed for domain 'example.com' topic 'legal'; using legacy score: authority lookup failed"
+        "authority scoring failed for domain 'example.com' topic 'legal'; using default score: authority lookup failed"
         in caplog.text
     )
 

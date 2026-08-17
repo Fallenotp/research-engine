@@ -27,7 +27,7 @@ from research_engine.apify_accounts import (
     load_accounts_from_env,
 )
 
-from . import paths
+from . import l3_guard, paths
 from research_engine.schema import ExtractionMethod, SourceTier
 from research_engine.politeness import Politeness, respect_robots
 
@@ -544,12 +544,19 @@ def _apify_api_request(
 
 
 def _is_pdf(source_url: str, local_path: Path | None) -> bool:
+    return _pdf_detection(source_url, local_path)[0]
+
+
+def _pdf_detection(source_url: str, local_path: Path | None) -> tuple[bool, bool]:
     if local_path is not None:
-        return local_path.suffix.lower() == ".pdf"
+        is_pdf = local_path.suffix.lower() == ".pdf"
+        return is_pdf, is_pdf
     if urlparse(source_url).path.lower().endswith(".pdf"):
-        return True
+        content_type = _head_content_type(source_url)
+        return True, content_type == "application/pdf"
     content_type = _head_content_type(source_url)
-    return content_type == "application/pdf"
+    is_pdf = content_type == "application/pdf"
+    return is_pdf, is_pdf
 
 
 def _head_content_type(source_url: str) -> str | None:
@@ -579,6 +586,8 @@ def _is_markitdown_document(source_url: str, local_path: Path | None) -> bool:
         else Path(urlparse(source_url).path).suffix.lower()
     )
     if suffix in MARKITDOWN_SUFFIXES:
+        if suffix == ".pdf" and local_path is None:
+            return _head_content_type(source_url) == "application/pdf"
         return True
     if local_path is not None:
         return False
@@ -1123,7 +1132,19 @@ def _scrapling_stealth(
         return {}
 
 
-def _agent_browser(source_url: str) -> dict[str, str | None] | None:
+def _agent_browser(
+    source_url: str,
+    *,
+    tier: SourceTier | None = None,
+) -> dict[str, str | None] | None:
+    if tier != SourceTier.T3:
+        return None
+    allowed, reason = l3_guard.preflight()
+    if not allowed:
+        l3_guard.record_failure()
+        l3_guard.log_attempt(decision="blocked", reason=reason, rung="agent_browser")
+        return None
+
     politeness = _get_politeness()
     if respect_robots() and not politeness.allowed(source_url):
         logger.info("robots.txt disallows %s; skipping agent_browser", source_url)
@@ -1165,16 +1186,22 @@ def _agent_browser(source_url: str) -> dict[str, str | None] | None:
     try:
         open_data = read_envelope("open", source_url)
         if open_data is None:
+            l3_guard.record_failure()
             return None
         title_data = read_envelope("get", "title")
         if title_data is None:
+            l3_guard.record_failure()
             return None
         text_data = read_envelope("get", "text", "body")
         if text_data is None:
+            l3_guard.record_failure()
             return None
+        l3_guard.record_success()
     except FileNotFoundError:
+        l3_guard.record_failure()
         return None
     except Exception as exc:
+        l3_guard.record_failure()
         logger.info("agent_browser failed for %s: %s", source_url, exc)
         return None
     finally:
@@ -1187,6 +1214,7 @@ def _agent_browser(source_url: str) -> dict[str, str | None] | None:
 
     body = str(text_data.get("text") or "").strip()
     if not body:
+        l3_guard.record_failure()
         return None
 
     title = str(title_data.get("title") or open_data.get("title") or "").strip()
@@ -1371,7 +1399,8 @@ def _extract_pdf_or_document(
     min_chars: int,
     tier: SourceTier | None,
 ) -> dict | None:
-    if _is_pdf(source_url, local_path):
+    is_pdf, _ = _pdf_detection(source_url, local_path)
+    if is_pdf:
         missing_pdf_dependency: _MissingPdfDependencyError | None = None
         methods = [
             (ExtractionMethod.DOCLING.value, lambda: _pdf_docling(source_url, local_path)),
@@ -1395,7 +1424,7 @@ def _extract_pdf_or_document(
                 source_url, ExtractionMethod.MARKITDOWN.value, payload, tier=tier
             )
         if missing_pdf_dependency is not None:
-            raise RuntimeError(str(missing_pdf_dependency)) from missing_pdf_dependency
+            logger.info("PDF extraction dependency unavailable: %s", missing_pdf_dependency)
         return None
 
     if _is_markitdown_document(source_url, local_path):
@@ -1424,8 +1453,9 @@ def _extract_pdf_or_document(
 
 
 def _is_document_source(source_url: str, local_path: Path | None) -> bool:
+    _, pdf_confirmed = _pdf_detection(source_url, local_path)
     return (
-        _is_pdf(source_url, local_path)
+        pdf_confirmed
         or _is_markitdown_document(source_url, local_path)
         or (local_path is not None and local_path.suffix.lower() not in HTML_SUFFIXES)
     )
@@ -1477,7 +1507,6 @@ def _web_ladder_rungs(source_url: str):
         (ExtractionMethod.JINA.value, lambda: _jina(source_url), False),
         (ExtractionMethod.CRAWLEE.value, lambda: _crawlee_http(source_url), True),
         (ExtractionMethod.SCRAPLING.value, lambda: _scrapling_stealth(source_url), True),
-        (ExtractionMethod.AGENT_BROWSER.value, lambda: _agent_browser(source_url), False),
         (ExtractionMethod.FIRECRAWL.value, lambda: _firecrawl(source_url), False),
     ]
 
@@ -1494,6 +1523,19 @@ def _extract_web_ladder(
             continue
         extra = {"fetch_meta": payload["fetch_meta"]} if carries_fetch_meta and payload.get("fetch_meta") else None
         return _finalize_record(source_url, method, payload, tier=tier, extra=extra)
+    if tier == SourceTier.T3:
+        payload = _attempt(
+            ExtractionMethod.AGENT_BROWSER.value,
+            lambda: _agent_browser(source_url, tier=tier),
+            min_chars=min_chars,
+        )
+        if payload:
+            return _finalize_record(
+                source_url,
+                ExtractionMethod.AGENT_BROWSER.value,
+                payload,
+                tier=tier,
+            )
     return None
 
 

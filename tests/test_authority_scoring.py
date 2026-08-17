@@ -23,10 +23,10 @@ def extracted_source(tmp_path: Path) -> dict[str, object]:
 
 
 @pytest.mark.parametrize("builder", [_source_record_from_extract, source_record])
-def test_source_without_topic_keeps_flat_default(builder, extracted_source) -> None:
+def test_source_without_topic_uses_default_score(builder, extracted_source) -> None:
     record = builder(extracted_source, "verified source text", topic=None)
 
-    assert record.topic_authority_score == 0.6
+    assert record.topic_authority_score == 0.0
 
 
 @pytest.mark.parametrize("builder", [_source_record_from_extract, source_record])
@@ -53,7 +53,9 @@ def test_unknown_topic_uses_router_default_without_raising(builder, extracted_so
     assert record.topic_authority_score == 0.0
 
 
-def test_router_load_failure_falls_back_and_is_attempted_once(monkeypatch) -> None:
+def test_router_load_failure_falls_back_to_default_and_is_attempted_once(
+    monkeypatch, caplog
+) -> None:
     attempts = 0
 
     def fail_to_load():
@@ -65,9 +67,10 @@ def test_router_load_failure_falls_back_and_is_attempted_once(monkeypatch) -> No
     monkeypatch.setattr(router_module, "_DEFAULT_ROUTER_LOAD_ATTEMPTED", False)
     monkeypatch.setattr(router_module, "load_router", fail_to_load)
 
-    assert router_module.source_authority_score("example.com", "legal") == 0.6
-    assert router_module.source_authority_score("example.com", "legal") == 0.6
+    assert router_module.source_authority_score("example.com", "legal") == 0.0
+    assert router_module.source_authority_score("example.com", "legal") == 0.0
     assert attempts == 1
+    assert "router load failed" in caplog.text
 
 
 def test_real_secret_files_include_apify_key_aliases_and_skip_missing_file() -> None:

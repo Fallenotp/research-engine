@@ -1787,6 +1787,8 @@ def run_local_search_lanes(
         except Exception as exc:  # noqa: BLE001 - one lane should not abort search
             errors.append(f"{lane} local lane failed: {type(exc).__name__}: {exc}")
             payload = {"results": [], "error": str(exc)}
+        if payload.get("not_configured") and payload.get("error"):
+            errors.append(str(payload["error"]))
         payloads.append((lane, payload))
     return payloads
 
@@ -1815,6 +1817,9 @@ def local_lane_payload(lane_config: dict[str, Any], question: str) -> dict[str, 
             )
             return {"results": [], "error": error, "not_configured": True}
         return {"results": _local_file_results(glob_pattern, question)}
+    if env_var:
+        error = f"local lane not configured: set {env_var}"
+        return {"results": [], "error": error, "not_configured": True}
     return {"results": [], "error": "unsupported local lane config"}
 
 
@@ -3267,21 +3272,9 @@ def weakest_territory_run(runs: list[TerritoryRun]) -> TerritoryRun:
 def save_session_with_fallback(session: ResearchSession) -> tuple[ResearchSession, Path | None]:
     try:
         return session, persistence.save_session(session, root=persistence.DEFAULT_ROOT)
-    except Exception as exc:  # noqa: BLE001 - rebuild as abstain and retry
-        abstain = build_abstain_session(
-            session.question,
-            protocol=session.protocol,
-            agent=session.triggered_by,
-            queries_run=session.queries_run,
-            sources=session.sources,
-            territories=session.territories,
-            open_question=f"save_session failed: {type(exc).__name__}: {exc}",
-            gemini_pro_runs=session.gemini_pro_runs,
-        )
-        try:
-            return abstain, persistence.save_session(abstain, root=persistence.DEFAULT_ROOT)
-        except Exception:
-            return abstain, write_session_directly(abstain)
+    except Exception as exc:  # noqa: BLE001 - preserve the session; storage failure is not a false abstain
+        logger.warning("save_session failed, preserving original session: %s", exc)
+        return session, write_session_directly(session)
 
 
 def save_session_safely(session: ResearchSession) -> Path | None:

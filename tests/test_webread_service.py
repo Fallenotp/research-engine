@@ -481,6 +481,11 @@ def test_extract_returns_502_when_result_file_is_unreadable(monkeypatch, tmp_pat
 
     monkeypatch.setattr(webread_service, "extract_clean_text", _autospec_extract(fake_extract))
 
+    status_code, payload = webread_service._extract("https://example.com", 2, None)
+
+    assert status_code == 502
+    assert payload["receipt"]["error"] == "result file unreadable"
+
 def test_webread_service_real_extractor_signature_path_does_not_raise_typeerror(
     monkeypatch,
     tmp_path,
@@ -514,3 +519,65 @@ def test_webread_service_real_extractor_signature_path_does_not_raise_typeerror(
     assert status_code == 200
     assert payload["text"] == "real extractor path body text"
     assert payload["receipt"]["method"] == ExtractionMethod.CRAWL4AI.value
+
+
+def test_missing_pdf_extra_on_suffix_guess_returns_handled_response(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setenv("WEBREAD_CACHE_DIR", str(tmp_path / "cache-missing-pdf-extra"))
+    monkeypatch.setattr(extractor, "_pdf_detection", lambda *_args: (True, False))
+    monkeypatch.setattr(extractor, "_pdf_docling", lambda *_args: {})
+
+    def missing_pymupdf(*_args):
+        raise extractor._MissingPdfDependencyError("PyMuPDF is required; install the PDF extra")
+
+    monkeypatch.setattr(extractor, "_pdf_pymupdf", missing_pymupdf)
+    monkeypatch.setattr(extractor, "_markitdown_payload", lambda *_args: {})
+    monkeypatch.setattr(extractor, "_extract_web_ladder", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(extractor, "_extract_publisher_or_wayback", lambda *_args, **_kwargs: None)
+
+    status_code, payload = webread_service._extract(
+        "https://example.com/not-really-a-document.pdf",
+        2,
+        None,
+    )
+
+    assert status_code == 502
+    assert payload["receipt"]["error"] == "extract_clean_text returned no record"
+
+
+def test_suffix_only_pdf_guess_falls_through_to_web_ladder(monkeypatch) -> None:
+    expected = {"url": "https://example.com/page.pdf", "extraction_method": "crawl4ai"}
+    monkeypatch.setattr(extractor, "_pdf_detection", lambda *_args: (True, False))
+    monkeypatch.setattr(extractor, "_pdf_docling", lambda *_args: {})
+    monkeypatch.setattr(extractor, "_pdf_pymupdf", lambda *_args: {})
+    monkeypatch.setattr(extractor, "_markitdown_payload", lambda *_args: {})
+    monkeypatch.setattr(extractor, "_extract_apify_route", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        extractor,
+        "_extract_web_ladder",
+        lambda *_args, **_kwargs: expected,
+    )
+
+    result = extractor.extract_clean_text("https://example.com/page.pdf")
+
+    assert result == expected
+
+
+def test_confirmed_pdf_failure_does_not_fall_through_to_web_ladder(monkeypatch) -> None:
+    web_calls: list[str] = []
+    monkeypatch.setattr(extractor, "_pdf_detection", lambda *_args: (True, True))
+    monkeypatch.setattr(extractor, "_pdf_docling", lambda *_args: {})
+    monkeypatch.setattr(extractor, "_pdf_pymupdf", lambda *_args: {})
+    monkeypatch.setattr(extractor, "_markitdown_payload", lambda *_args: {})
+    monkeypatch.setattr(
+        extractor,
+        "_extract_web_ladder",
+        lambda source_url, **_kwargs: web_calls.append(source_url),
+    )
+
+    result = extractor.extract_clean_text("https://example.com/confirmed.pdf")
+
+    assert result is None
+    assert web_calls == []

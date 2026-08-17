@@ -4,12 +4,16 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import sys
 import ssl
 import subprocess
 import time
 import urllib.parse
 from pathlib import Path
 from typing import Any
+
+if __package__ in {None, ""}:  # pragma: no cover - exercised via direct script execution
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from research_engine import paths
 

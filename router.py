@@ -81,6 +81,16 @@ def load_router(config_path: str = DEFAULT_CONFIG_PATH) -> "Router":
 
 def _resolve_config_paths(value: Any) -> Any:
     if isinstance(value, dict):
+        if (
+            value.get("command") == "{RESEARCH_ENGINE_BUZZ_SCRIPT}"
+            and paths.optional_path(paths.BUZZ_SCRIPT_ENV) is None
+        ):
+            return {
+                "type": "local",
+                "env_var": paths.BUZZ_SCRIPT_ENV,
+                "cost_per_call_usd": value.get("cost_per_call_usd", 0.0),
+                "notes": value.get("notes", ""),
+            }
         return {key: _resolve_config_paths(item) for key, item in value.items()}
     if isinstance(value, list):
         return [_resolve_config_paths(item) for item in value]
@@ -117,9 +127,9 @@ def _resolve_config_paths(value: Any) -> Any:
 
 
 def source_authority_score(domain: str, topic: str | None) -> float:
-    """Return configured authority, preserving the legacy score without a topic."""
+    """Return configured authority, defaulting unknown or unavailable cases to zero."""
     if not topic:
-        return LEGACY_AUTHORITY_SCORE
+        return DEFAULT_AUTHORITY_SCORE
 
     global _DEFAULT_ROUTER, _DEFAULT_ROUTER_LOAD_ATTEMPTED
     if not _DEFAULT_ROUTER_LOAD_ATTEMPTED:
@@ -128,24 +138,24 @@ def source_authority_score(domain: str, topic: str | None) -> float:
             _DEFAULT_ROUTER = load_router()
         except Exception as exc:
             logger.warning(
-                "router load failed; using legacy authority score for topic %r: %s",
+                "router load failed; using default authority score for topic %r: %s",
                 topic,
                 exc,
             )
             _DEFAULT_ROUTER = None
 
     if _DEFAULT_ROUTER is None:
-        return LEGACY_AUTHORITY_SCORE
+        return DEFAULT_AUTHORITY_SCORE
     try:
         return _DEFAULT_ROUTER.authority_score(domain, topic)
     except Exception as exc:
         logger.warning(
-            "authority scoring failed for domain %r topic %r; using legacy score: %s",
+            "authority scoring failed for domain %r topic %r; using default score: %s",
             domain,
             topic,
             exc,
         )
-        return LEGACY_AUTHORITY_SCORE
+        return DEFAULT_AUTHORITY_SCORE
 
 
 class Router:
@@ -532,7 +542,7 @@ if __name__ == "__main__":
     assert decision.rule_name == "general_web"
 
     assert router.authority_score("nejm.org", "medicine") == 1.0
-    assert router.authority_score("unknown-site.xyz", "medicine") == 0.5
+    assert router.authority_score("unknown-site.xyz", "medicine") == 0.0
     assert router.lane_endpoint("courtlistener")["type"] == "api"
 
     print(
