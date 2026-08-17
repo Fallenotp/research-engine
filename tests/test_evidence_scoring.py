@@ -342,7 +342,7 @@ def test_authority_score_maps_to_real_source_tiers(builder, tmp_path: Path) -> N
     )
 
     assert authoritative.tier == SourceTier.T1
-    assert unknown.tier == SourceTier.T2
+    assert unknown.tier == SourceTier.T3
     assert no_topic.tier == SourceTier.T2
 
 

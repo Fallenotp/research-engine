@@ -86,3 +86,29 @@ def test_observer_and_csv_flow(tmp_path, monkeypatch) -> None:
 
     assert reader.fieldnames == list(telemetry_observer.ROW_FIELDS)
     assert len(csv_rows) == 2
+
+
+def test_run_reports_missing_sessions_root_as_not_configured(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    sessions_dir = tmp_path / "missing-research-sessions"
+    master_log = tmp_path / "agent_state" / "research-telemetry.jsonl"
+    master_log.parent.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(telemetry_observer, "SESSIONS_DIR", sessions_dir)
+    monkeypatch.setattr(telemetry_observer, "MASTER_LOG", master_log)
+
+    with caplog.at_level("WARNING", logger="research_engine.telemetry_observer"):
+        summary = telemetry_observer.run()
+
+    assert summary == {
+        "scanned": 0,
+        "added": 0,
+        "skipped": 0,
+        "errors": 1,
+        "master_log": str(master_log),
+        "error": (
+            "Research sessions root is not configured: missing "
+            f"{sessions_dir}. Set RESEARCH_ENGINE_RESEARCH_SESSIONS_DIR."
+        ),
+    }
+    assert summary["error"] in caplog.text

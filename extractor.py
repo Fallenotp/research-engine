@@ -471,7 +471,8 @@ def _attempt(method: str, fn, *, min_chars: int = 200) -> dict[str, str | None] 
     try:
         payload = fn()
     except _MissingPdfDependencyError:
-        raise
+        _log(method, started_at, False, 0, "MissingPdfDependencyError")
+        return None
     except Exception as exc:  # pragma: no cover - hard boundary for caller contract
         _log(method, started_at, False, 0, f"{type(exc).__name__}: {exc}")
         return None
@@ -479,6 +480,27 @@ def _attempt(method: str, fn, *, min_chars: int = 200) -> dict[str, str | None] 
     success = bool(payload) and _ok(payload, min_chars=min_chars)
     _log(method, started_at, success, char_count)
     return payload if success else None
+
+
+def _attempt_pdf_rung(
+    method: str,
+    fn,
+    *,
+    min_chars: int = 200,
+) -> tuple[dict[str, str | None] | None, _MissingPdfDependencyError | None]:
+    started_at = time.perf_counter()
+    try:
+        payload = fn()
+    except _MissingPdfDependencyError as exc:
+        _log(method, started_at, False, 0, "MissingPdfDependencyError")
+        return None, exc
+    except Exception as exc:  # pragma: no cover - hard boundary for caller contract
+        _log(method, started_at, False, 0, f"{type(exc).__name__}: {exc}")
+        return None, None
+    char_count = len((payload or {}).get("text") or "")
+    success = bool(payload) and _ok(payload, min_chars=min_chars)
+    _log(method, started_at, success, char_count)
+    return (payload if success else None), None
 
 
 def _get(
@@ -1035,6 +1057,8 @@ def _crawlee_http(
     except Exception as exc:
         logger.info("crawlee http failed for %s: %s", source_url, exc)
         if not released:
+            # Session release is best-effort on the error path; preserve the original fetch
+            # failure instead of surfacing a secondary backend cleanup problem here.
             backend.release(session, ok=False)
         return {}
 
@@ -1093,6 +1117,8 @@ def _scrapling_stealth(
     except Exception as exc:
         logger.info("scrapling stealth failed for %s: %s", source_url, exc)
         if not released:
+            # Proxy cleanup is deliberate best-effort after a failed scrape. Keep the caller's
+            # outcome tied to the scrape failure, not to whether release bookkeeping succeeds.
             backend.release(session, ok=False)
         return {}
 
@@ -1326,6 +1352,182 @@ def _local_text(local_path: Path) -> dict[str, str | None]:
     )
 
 
+def _finalize_record(
+    source_url: str,
+    method: str,
+    payload: dict[str, str | None],
+    *,
+    tier: SourceTier | None,
+    extra: dict[str, str] | None = None,
+) -> dict:
+    return _record(source_url, method, payload, tier=tier, extra=extra)
+
+
+def _extract_pdf_or_document(
+    source_url: str,
+    local_path: Path | None,
+    *,
+    prefer_pdf_engine: str,
+    min_chars: int,
+    tier: SourceTier | None,
+) -> dict | None:
+    if _is_pdf(source_url, local_path):
+        missing_pdf_dependency: _MissingPdfDependencyError | None = None
+        methods = [
+            (ExtractionMethod.DOCLING.value, lambda: _pdf_docling(source_url, local_path)),
+            (ExtractionMethod.PYMUPDF.value, lambda: _pdf_pymupdf(source_url, local_path)),
+        ]
+        if prefer_pdf_engine != ExtractionMethod.DOCLING.value:
+            methods.reverse()
+        for method, fn in methods:
+            payload, missing_exc = _attempt_pdf_rung(method, fn, min_chars=min_chars)
+            if missing_exc is not None:
+                missing_pdf_dependency = missing_exc
+            if payload:
+                return _finalize_record(source_url, method, payload, tier=tier)
+        payload = _attempt(
+            ExtractionMethod.MARKITDOWN.value,
+            lambda: _markitdown_payload(source_url, local_path),
+            min_chars=min_chars,
+        )
+        if payload:
+            return _finalize_record(
+                source_url, ExtractionMethod.MARKITDOWN.value, payload, tier=tier
+            )
+        if missing_pdf_dependency is not None:
+            raise RuntimeError(str(missing_pdf_dependency)) from missing_pdf_dependency
+        return None
+
+    if _is_markitdown_document(source_url, local_path):
+        payload = _attempt(
+            ExtractionMethod.MARKITDOWN.value,
+            lambda: _markitdown_payload(source_url, local_path),
+            min_chars=min_chars,
+        )
+        if payload:
+            return _finalize_record(
+                source_url, ExtractionMethod.MARKITDOWN.value, payload, tier=tier
+            )
+        return None
+
+    if local_path is not None and local_path.suffix.lower() not in HTML_SUFFIXES:
+        payload = _attempt(
+            ExtractionMethod.UNSTRUCTURED.value,
+            lambda: _local_text(local_path),
+            min_chars=min_chars,
+        )
+        if payload:
+            return _finalize_record(
+                source_url, ExtractionMethod.UNSTRUCTURED.value, payload, tier=tier
+            )
+    return None
+
+
+def _is_document_source(source_url: str, local_path: Path | None) -> bool:
+    return (
+        _is_pdf(source_url, local_path)
+        or _is_markitdown_document(source_url, local_path)
+        or (local_path is not None and local_path.suffix.lower() not in HTML_SUFFIXES)
+    )
+
+
+def _extract_github_repo(
+    source_url: str,
+    *,
+    min_chars: int,
+    tier: SourceTier | None,
+) -> dict | None:
+    if not (_is_web_url(source_url) and _is_github_repo_url(source_url)):
+        return None
+    github_parts = _github_repo_parts(source_url)
+    branch = github_parts[2] if github_parts else None
+    payload = _attempt(
+        ExtractionMethod.GITINGEST.value,
+        lambda: _gitingest(source_url, branch),
+        min_chars=min_chars,
+    )
+    if not payload:
+        return None
+    return _finalize_record(source_url, ExtractionMethod.GITINGEST.value, payload, tier=tier)
+
+
+def _extract_apify_route(
+    source_url: str,
+    *,
+    min_chars: int,
+    tier: SourceTier | None,
+) -> dict | None:
+    if not actor_route_for_url(source_url):
+        return None
+    payload = _attempt(
+        ExtractionMethod.APIFY.value,
+        lambda: _apify_actor_fetch(source_url),
+        min_chars=min_chars,
+    )
+    if not payload:
+        return None
+    extra = {"fetch_meta": payload["fetch_meta"]} if payload.get("fetch_meta") else None
+    return _finalize_record(source_url, ExtractionMethod.APIFY.value, payload, tier=tier, extra=extra)
+
+
+def _web_ladder_rungs(source_url: str):
+    return [
+        (ExtractionMethod.TRAFILATURA.value, lambda: _trafilatura(source_url, None), False),
+        (ExtractionMethod.CRAWL4AI.value, lambda: _crawl4ai(source_url), False),
+        (ExtractionMethod.JINA.value, lambda: _jina(source_url), False),
+        (ExtractionMethod.CRAWLEE.value, lambda: _crawlee_http(source_url), True),
+        (ExtractionMethod.SCRAPLING.value, lambda: _scrapling_stealth(source_url), True),
+        (ExtractionMethod.AGENT_BROWSER.value, lambda: _agent_browser(source_url), False),
+        (ExtractionMethod.FIRECRAWL.value, lambda: _firecrawl(source_url), False),
+    ]
+
+
+def _extract_web_ladder(
+    source_url: str,
+    *,
+    min_chars: int,
+    tier: SourceTier | None,
+) -> dict | None:
+    for method, fn, carries_fetch_meta in _web_ladder_rungs(source_url):
+        payload = _attempt(method, fn, min_chars=min_chars)
+        if not payload:
+            continue
+        extra = {"fetch_meta": payload["fetch_meta"]} if carries_fetch_meta and payload.get("fetch_meta") else None
+        return _finalize_record(source_url, method, payload, tier=tier, extra=extra)
+    return None
+
+
+def _extract_publisher_or_wayback(
+    source_url: str,
+    *,
+    min_chars: int,
+    tier: SourceTier | None,
+) -> dict | None:
+    if _plausibly_paper_url(source_url):
+        from research_engine.publisher_fallback import try_publisher_fallback
+
+        payload = _attempt(
+            ExtractionMethod.PUBLISHER_OA.value,
+            lambda: try_publisher_fallback(source_url),
+            min_chars=min_chars,
+        )
+        if payload:
+            return _finalize_record(
+                source_url, ExtractionMethod.PUBLISHER_OA.value, payload, tier=tier
+            )
+
+    from research_engine.wayback_fallback import try_wayback
+
+    payload = _attempt(
+        ExtractionMethod.WAYBACK.value,
+        lambda: try_wayback(source_url),
+        min_chars=min_chars,
+    )
+    if payload:
+        return _finalize_record(source_url, ExtractionMethod.WAYBACK.value, payload, tier=tier)
+    return None
+
+
 def _github_repo_parts(url: str) -> tuple[str, str, str | None] | None:
     """Return (owner, repo, branch) when *url* targets a GitHub repo root."""
     parsed = urlparse(url)
@@ -1438,143 +1640,34 @@ def extract_clean_text(
             "extraction_method": "skipped_duplicate",
         }
 
-    def finalize(
-        method: str,
-        payload: dict[str, str | None],
-        *,
-        extra: dict[str, str] | None = None,
-    ) -> dict:
-        return _record(source_url, method, payload, tier=tier, extra=extra)
+    handled_as_document = _is_document_source(source_url, local_path)
+    extracted = _extract_pdf_or_document(
+        source_url,
+        local_path,
+        prefer_pdf_engine=prefer_pdf_engine,
+        min_chars=min_chars,
+        tier=tier,
+    )
+    if extracted or handled_as_document:
+        return extracted
 
-    if _is_pdf(source_url, local_path):
-        methods = [
-            (ExtractionMethod.DOCLING.value, lambda: _pdf_docling(source_url, local_path)),
-            (ExtractionMethod.PYMUPDF.value, lambda: _pdf_pymupdf(source_url, local_path)),
-        ]
-        if prefer_pdf_engine != ExtractionMethod.DOCLING.value:
-            methods.reverse()
-        for method, fn in methods:
-            payload = _attempt(method, fn, min_chars=min_chars)
-            if payload:
-                return finalize(method, payload)
-        payload = _attempt(
-            ExtractionMethod.MARKITDOWN.value,
-            lambda: _markitdown_payload(source_url, local_path),
-            min_chars=min_chars,
-        )
-        return finalize(ExtractionMethod.MARKITDOWN.value, payload) if payload else None
-    if _is_markitdown_document(source_url, local_path):
-        payload = _attempt(
-            ExtractionMethod.MARKITDOWN.value,
-            lambda: _markitdown_payload(source_url, local_path),
-            min_chars=min_chars,
-        )
-        return finalize(ExtractionMethod.MARKITDOWN.value, payload) if payload else None
-    if local_path is not None and local_path.suffix.lower() not in HTML_SUFFIXES:
-        payload = _attempt(
-            ExtractionMethod.UNSTRUCTURED.value,
-            lambda: _local_text(local_path),
-            min_chars=min_chars,
-        )
-        return finalize(ExtractionMethod.UNSTRUCTURED.value, payload) if payload else None
-    if _is_web_url(source_url) and _is_github_repo_url(source_url):
-        github_parts = _github_repo_parts(source_url)
-        branch = github_parts[2] if github_parts else None
-        payload = _attempt(
-            ExtractionMethod.GITINGEST.value,
-            lambda: _gitingest(source_url, branch),
-            min_chars=min_chars,
-        )
-        if payload:
-            return finalize(ExtractionMethod.GITINGEST.value, payload)
+    extracted = _extract_github_repo(source_url, min_chars=min_chars, tier=tier)
+    if extracted:
+        return extracted
+
     if _is_web_url(source_url):
+        extracted = _extract_apify_route(source_url, min_chars=min_chars, tier=tier)
         if actor_route_for_url(source_url):
-            payload = _attempt(
-                ExtractionMethod.APIFY.value,
-                lambda: _apify_actor_fetch(source_url),
-                min_chars=min_chars,
-            )
-            if payload:
-                extra = None
-                if payload.get("fetch_meta"):
-                    extra = {"fetch_meta": payload["fetch_meta"]}
-                return finalize(ExtractionMethod.APIFY.value, payload, extra=extra)
-            return None
+            return extracted
+        if extracted:
+            return extracted
 
-        payload = _attempt(
-            ExtractionMethod.TRAFILATURA.value,
-            lambda: _trafilatura(source_url, None),
-            min_chars=min_chars,
-        )
-        if payload:
-            return finalize(ExtractionMethod.TRAFILATURA.value, payload)
-        payload = _attempt(
-            ExtractionMethod.CRAWL4AI.value,
-            lambda: _crawl4ai(source_url),
-            min_chars=min_chars,
-        )
-        if payload:
-            return finalize(ExtractionMethod.CRAWL4AI.value, payload)
-        payload = _attempt(
-            ExtractionMethod.JINA.value,
-            lambda: _jina(source_url),
-            min_chars=min_chars,
-        )
-        if payload:
-            return finalize(ExtractionMethod.JINA.value, payload)
-        payload = _attempt(
-            ExtractionMethod.CRAWLEE.value,
-            lambda: _crawlee_http(source_url),
-            min_chars=min_chars,
-        )
-        if payload:
-            extra = None
-            if payload.get("fetch_meta"):
-                extra = {"fetch_meta": payload["fetch_meta"]}
-            return finalize(ExtractionMethod.CRAWLEE.value, payload, extra=extra)
-        payload = _attempt(
-            ExtractionMethod.SCRAPLING.value,
-            lambda: _scrapling_stealth(source_url),
-            min_chars=min_chars,
-        )
-        if payload:
-            extra = None
-            if payload.get("fetch_meta"):
-                extra = {"fetch_meta": payload["fetch_meta"]}
-            return finalize(ExtractionMethod.SCRAPLING.value, payload, extra=extra)
-        payload = _attempt(
-            ExtractionMethod.AGENT_BROWSER.value,
-            lambda: _agent_browser(source_url),
-            min_chars=min_chars,
-        )
-        if payload:
-            return finalize(ExtractionMethod.AGENT_BROWSER.value, payload)
-        payload = _attempt(
-            ExtractionMethod.FIRECRAWL.value,
-            lambda: _firecrawl(source_url),
-            min_chars=min_chars,
-        )
-        if payload:
-            return finalize(ExtractionMethod.FIRECRAWL.value, payload)
-        if _plausibly_paper_url(source_url):
-            from research_engine.publisher_fallback import try_publisher_fallback
-
-            payload = _attempt(
-                ExtractionMethod.PUBLISHER_OA.value,
-                lambda: try_publisher_fallback(source_url),
-                min_chars=min_chars,
-            )
-            if payload:
-                return finalize(ExtractionMethod.PUBLISHER_OA.value, payload)
-        from research_engine.wayback_fallback import try_wayback
-
-        payload = _attempt(
-            ExtractionMethod.WAYBACK.value,
-            lambda: try_wayback(source_url),
-            min_chars=min_chars,
-        )
-        if payload:
-            return finalize(ExtractionMethod.WAYBACK.value, payload)
+        extracted = _extract_web_ladder(source_url, min_chars=min_chars, tier=tier)
+        if extracted:
+            return extracted
+        extracted = _extract_publisher_or_wayback(source_url, min_chars=min_chars, tier=tier)
+        if extracted:
+            return extracted
         note_block(source_url, method="ladder", reason="all_rungs_failed")
         return None
 
@@ -1584,7 +1677,9 @@ def extract_clean_text(
         min_chars=min_chars,
     )
     if payload:
-        return finalize(ExtractionMethod.TRAFILATURA.value, payload)
+        return _finalize_record(
+            source_url, ExtractionMethod.TRAFILATURA.value, payload, tier=tier
+        )
     return None
 
 

@@ -95,3 +95,45 @@ def test_pdf_without_pymupdf_extra_raises_actionable_error(tmp_path) -> None:
                 str(pdf_path),
                 seen_urls_path=tmp_path / "seen.txt",
             )
+
+
+def test_pdf_helper_none_does_not_fall_through_to_web_ladder(monkeypatch) -> None:
+    web_ladder_called = False
+
+    def fake_web_ladder(*args, **kwargs):
+        nonlocal web_ladder_called
+        web_ladder_called = True
+        return {"title": "wrong", "text": "wrong " * 100}
+
+    monkeypatch.setattr(extractor, "_extract_pdf_or_document", lambda *args, **kwargs: None)
+    monkeypatch.setattr(extractor, "_extract_github_repo", lambda *args, **kwargs: None)
+    monkeypatch.setattr(extractor, "_extract_web_ladder", fake_web_ladder)
+
+    result = extractor.extract_clean_text("https://example.com/paper.pdf")
+
+    assert result is None
+    assert web_ladder_called is False
+
+
+def test_missing_pymupdf_falls_through_to_docling(tmp_path) -> None:
+    pdf_path = tmp_path / "sample.pdf"
+    _write_sample_pdf(pdf_path, "PyMuPDF missing PDF text")
+    real_import = builtins.__import__
+
+    def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "fitz":
+            raise ModuleNotFoundError("No module named 'fitz'")
+        return real_import(name, globals, locals, fromlist, level)
+
+    with patch("builtins.__import__", side_effect=fake_import), patch.object(
+        extractor,
+        "_pdf_docling",
+        return_value={"title": "Docling", "text": "docling fallback text " * 20},
+    ):
+        out = extractor.extract_clean_text(
+            str(pdf_path),
+            seen_urls_path=tmp_path / "seen.txt",
+        )
+
+    assert out is not None
+    assert out["extraction_method"] == ExtractionMethod.DOCLING.value

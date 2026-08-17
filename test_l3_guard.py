@@ -304,7 +304,7 @@ def test_log_attempt_writes_parseable_json_lines(monkeypatch, tmp_path) -> None:
         url="https://x",
         decision="blocked",
         reason="L3_BLOCKED_LOW_RAM",
-        rung="steel_stagehand",
+        rung="agent_browser",
         free_mb=123.0,
         elapsed_ms=5,
     )
@@ -319,7 +319,7 @@ def test_log_attempt_writes_parseable_json_lines(monkeypatch, tmp_path) -> None:
     assert payload["url"] == "https://x"
     assert payload["decision"] == "blocked"
     assert payload["reason"] == "L3_BLOCKED_LOW_RAM"
-    assert payload["rung"] == "steel_stagehand"
+    assert payload["rung"] == "agent_browser"
     assert payload["free_mb"] == 123.0
     assert payload["elapsed_ms"] == 5
 
@@ -327,7 +327,7 @@ def test_log_attempt_writes_parseable_json_lines(monkeypatch, tmp_path) -> None:
         url="https://x",
         decision="blocked",
         reason="L3_BLOCKED_LOW_RAM",
-        rung="steel_stagehand",
+        rung="agent_browser",
         free_mb=123.0,
         elapsed_ms=5,
     )

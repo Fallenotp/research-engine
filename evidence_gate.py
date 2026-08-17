@@ -120,8 +120,13 @@ def mark_partial(session: ResearchSession, decision: dict[str, Any]) -> Research
     session.evidence_gate_decision = decision
     session.final_status = FinalStatus.WEAK_SOURCES
     session.answer_kind = AnswerKind.PARTIAL
-    session.confidence = min(float(session.confidence or 0.5), 0.5)
-    session.answer_confidence = min(float(session.answer_confidence or session.confidence or 0.5), 0.5)
+    measured_confidence = session.confidence
+    session.confidence = 0.0 if measured_confidence is None else min(float(measured_confidence), 0.5)
+    measured_answer_confidence = session.answer_confidence
+    if measured_answer_confidence is None:
+        session.answer_confidence = session.confidence
+    else:
+        session.answer_confidence = min(float(measured_answer_confidence), 0.5)
     _append_open_question(session, sufficiency.low_confidence_reason_for_result(decision))
     _prune_invalid_chunk_references(session)
     return session

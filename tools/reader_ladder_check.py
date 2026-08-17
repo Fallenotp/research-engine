@@ -125,14 +125,10 @@ def _helper_name(node: ast.AST) -> str | None:
 def derive_reader_rungs(source_text: str) -> list[RungSpec]:
     """Read extract_clean_text() from source instead of carrying a stale ladder list."""
     module = ast.parse(source_text)
-    function = next(
-        (
-            node
-            for node in module.body
-            if isinstance(node, ast.FunctionDef) and node.name == "extract_clean_text"
-        ),
-        None,
-    )
+    functions = {
+        node.name: node for node in module.body if isinstance(node, ast.FunctionDef)
+    }
+    function = functions.get("extract_clean_text")
     if function is None:
         raise ValueError("extract_clean_text not found")
 
@@ -140,6 +136,8 @@ def derive_reader_rungs(source_text: str) -> list[RungSpec]:
 
     def guard_text(node: ast.AST) -> str:
         return ast.get_source_segment(source_text, node) or ast.unparse(node)
+
+    visited_functions: set[str] = set()
 
     def add_attempt(call: ast.Call, guards: tuple[str, ...]) -> None:
         if not isinstance(call.func, ast.Name) or call.func.id != "_attempt":
@@ -158,6 +156,13 @@ def derive_reader_rungs(source_text: str) -> list[RungSpec]:
                 )
             )
 
+    def walk_helper(name: str, guards: tuple[str, ...]) -> None:
+        helper_function = functions.get(name)
+        if helper_function is None or name in visited_functions:
+            return
+        visited_functions.add(name)
+        walk(helper_function.body, guards)
+
     def walk(statements: list[ast.stmt], guards: tuple[str, ...] = ()) -> None:
         for statement in statements:
             if isinstance(statement, ast.If):
@@ -166,6 +171,10 @@ def derive_reader_rungs(source_text: str) -> list[RungSpec]:
                 walk(statement.orelse, guards)
                 continue
             if isinstance(statement, ast.For):
+                if isinstance(statement.iter, ast.Call):
+                    helper_name = _helper_name(statement.iter.func)
+                    if helper_name:
+                        walk_helper(helper_name, guards)
                 walk(statement.body, guards)
                 walk(statement.orelse, guards)
                 continue
@@ -188,9 +197,40 @@ def derive_reader_rungs(source_text: str) -> list[RungSpec]:
                                 guards=guards,
                             )
                         )
+            if (
+                isinstance(statement, ast.Return)
+                and isinstance(statement.value, ast.List)
+            ):
+                for entry in statement.value.elts:
+                    if not isinstance(entry, ast.Tuple) or len(entry.elts) < 2:
+                        continue
+                    method = _method_name(entry.elts[0])
+                    helper = _helper_name(entry.elts[1])
+                    if method and helper:
+                        rungs.append(
+                            RungSpec(
+                                method=method,
+                                helper=helper,
+                                line=entry.lineno,
+                                guards=guards,
+                            )
+                        )
             value = getattr(statement, "value", None)
             if isinstance(value, ast.Call):
                 add_attempt(value, guards)
+                helper_name = _helper_name(value.func)
+                if helper_name:
+                    walk_helper(helper_name, guards)
+                continue
+            if isinstance(statement, ast.Assign) and isinstance(statement.value, ast.Call):
+                helper_name = _helper_name(statement.value.func)
+                if helper_name:
+                    walk_helper(helper_name, guards)
+                continue
+            if isinstance(statement, ast.Return) and isinstance(statement.value, ast.Call):
+                helper_name = _helper_name(statement.value.func)
+                if helper_name:
+                    walk_helper(helper_name, guards)
 
     walk(function.body)
     return sorted(rungs, key=lambda rung: (rung.line, rung.method, rung.helper))

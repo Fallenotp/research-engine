@@ -259,7 +259,7 @@ def test_synthesize_falls_back_to_heuristic_when_llm_unavailable(monkeypatch) ->
             tier=grounding.SourceTier.T2,
             raw_text_path="/tmp/paris.txt",
         ),
-        record=SimpleNamespace(topic_authority_score=0.5),
+        record=SimpleNamespace(topic_authority_score=0.0),
         full_text="Paris is the capital of France.",
         snippet_hint="",
     )
@@ -272,9 +272,9 @@ def test_synthesize_falls_back_to_heuristic_when_llm_unavailable(monkeypatch) ->
     )
 
     assert result == (
-        "partial",
-        "Paris is the capital of France.",
-        pytest.approx(0.43333333333333335),
+        "not_found",
+        "",
+        0.0,
     )
 
 

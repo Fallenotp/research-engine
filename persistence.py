@@ -42,6 +42,14 @@ def save_session(
 ) -> Path:
     """Persist session to root/YYYY-MM-DD/{session_id}.json."""
     root = root.expanduser().resolve()
+    if not root.exists():
+        raise FileNotFoundError(
+            paths.missing_config_message(
+                root,
+                paths.RESEARCH_SESSIONS_DIR_ENV,
+                label="Research sessions root",
+            )
+        )
     session.updated_at = datetime.now(timezone.utc)
     session = enforce_evidence_gate(session)
     session = enforce_gemini_pro_interlock(session)

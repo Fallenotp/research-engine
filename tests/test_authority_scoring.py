@@ -42,7 +42,7 @@ def test_unknown_domain_ranks_below_old_flat_default(builder, extracted_source) 
 
     record = builder(extracted_source, "verified source text", topic="legal")
 
-    assert record.topic_authority_score == 0.5
+    assert record.topic_authority_score == 0.0
     assert record.topic_authority_score < 0.6
 
 
@@ -50,7 +50,7 @@ def test_unknown_domain_ranks_below_old_flat_default(builder, extracted_source) 
 def test_unknown_topic_uses_router_default_without_raising(builder, extracted_source) -> None:
     record = builder(extracted_source, "verified source text", topic="gov_tech")
 
-    assert record.topic_authority_score == 0.5
+    assert record.topic_authority_score == 0.0
 
 
 def test_router_load_failure_falls_back_and_is_attempted_once(monkeypatch) -> None:

@@ -479,15 +479,18 @@ lanes:
   mentor_memory:
     type: local
     db_path: "{RESEARCH_ENGINE_MEMORY_DB}"
+    env_var: "RESEARCH_ENGINE_MEMORY_DB"
     notes: "MENTOR memory; never call retired Brain API at port 18790."
 
   claude_memory_files:
     type: local
     glob: "{RESEARCH_ENGINE_CLAUDE_MEMORY_GLOB}"
+    env_var: "RESEARCH_ENGINE_CLAUDE_MEMORY_GLOB"
 
   obsidian:
     type: local
     glob: "{RESEARCH_ENGINE_OBSIDIAN_GLOB}"
+    env_var: "RESEARCH_ENGINE_OBSIDIAN_GLOB"
 
 # ---------------------------------------------------------------------------
 # Topic authority weights — multiplied into reranker scores per topic.

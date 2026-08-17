@@ -17,6 +17,7 @@ if __package__ in {None, ""}:
 from research_engine import l3_guard
 from research_engine.extractor import extract_clean_text
 from research_engine.schema import ExtractionMethod
+from research_engine.schema import SourceTier
 
 CACHE_TTL_SECONDS = 6 * 60 * 60
 CACHE_MAX_ENTRIES = 500
@@ -137,10 +138,13 @@ def _extract(url: str, max_layer: int, ask: str | None) -> tuple[int, dict]:
             )
             return 200, {"text": str(cached.get("text") or ""), "receipt": receipt}
 
-    allow_l3 = max_layer >= 3
-    
+    l3_requested = max_layer >= 3
+    requested_tier = (
+        SourceTier.T3 if max_layer >= 3 else SourceTier.T2 if max_layer == 2 else SourceTier.T1
+    )
+
     def run_extract() -> dict | None:
-        record = extract_clean_text(url, instruction=ask, allow_l3=allow_l3)
+        record = extract_clean_text(url, instruction=ask, tier=requested_tier)
         if not ask and (
             record is None
             or str(record.get("extraction_method") or "") == ExtractionMethod.FIRECRAWL.value
@@ -150,7 +154,7 @@ def _extract(url: str, max_layer: int, ask: str | None) -> tuple[int, dict]:
             retry_record = extract_clean_text(
                 url,
                 instruction="return the readable page text",
-                allow_l3=allow_l3,
+                tier=requested_tier,
             )
             if retry_record is not None and (
                 record is None
@@ -160,7 +164,7 @@ def _extract(url: str, max_layer: int, ask: str | None) -> tuple[int, dict]:
                 record = retry_record
         return record
 
-    if allow_l3:
+    if l3_requested:
         acquired = _extract_lock.acquire(timeout=LOCK_WAIT_S)
         if not acquired:
             elapsed_ms = int((time.perf_counter() - started_at) * 1000)

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 from research_engine import llm_call
@@ -86,3 +88,78 @@ def test_run_gemini_backend_uses_agy_cli_not_retired_gemini(monkeypatch) -> None
     assert "input" not in kwargs
     assert "env" not in kwargs
     assert kwargs["stdin"] == llm_call.subprocess.DEVNULL
+
+
+def test_llm_complete_logs_backend_failures_and_raises_with_details(
+    monkeypatch,
+    caplog,
+) -> None:
+    def fake_run_backend(
+        prompt: str,
+        *,
+        backend: str,
+        timeout: int | float,
+        model: str | None = None,
+    ) -> str:
+        raise RuntimeError(f"{backend} failed")
+
+    monkeypatch.setattr(llm_call, "_run_backend", fake_run_backend)
+    caplog.set_level(logging.WARNING, logger=llm_call.__name__)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        llm_call.llm_complete("Reply with READY.")
+
+    assert "codex: RuntimeError: codex failed" in str(excinfo.value)
+    assert "sonnet: RuntimeError: sonnet failed" in str(excinfo.value)
+    assert "llm backend failed: codex: RuntimeError: codex failed" in caplog.text
+    assert "llm backend failed: sonnet: RuntimeError: sonnet failed" in caplog.text
+
+
+def test_run_codex_missing_binary_names_env_var(monkeypatch) -> None:
+    monkeypatch.setattr(llm_call.paths, "require_executable", lambda *args: (_ for _ in ()).throw(
+        FileNotFoundError(f"Set {llm_call.paths.CODEX_BIN_ENV}")
+    ))
+
+    with pytest.raises(FileNotFoundError) as excinfo:
+        llm_call._run_codex("hello", timeout=12)
+
+    assert str(excinfo.value) == f"Set {llm_call.paths.CODEX_BIN_ENV}"
+
+
+def test_run_sonnet_missing_binary_names_env_var(monkeypatch) -> None:
+    monkeypatch.setattr(llm_call.paths, "require_executable", lambda *args: (_ for _ in ()).throw(
+        FileNotFoundError(f"Set {llm_call.paths.CLAUDE_BIN_ENV}")
+    ))
+
+    with pytest.raises(FileNotFoundError) as excinfo:
+        llm_call._run_sonnet("hello", timeout=12)
+
+    assert str(excinfo.value) == f"Set {llm_call.paths.CLAUDE_BIN_ENV}"
+
+
+def test_run_gemini_missing_binary_names_env_var(monkeypatch) -> None:
+    monkeypatch.setattr(llm_call.paths, "require_executable", lambda *args: (_ for _ in ()).throw(
+        FileNotFoundError(f"Set {llm_call.paths.AGY_BIN_ENV}")
+    ))
+
+    with pytest.raises(FileNotFoundError) as excinfo:
+        llm_call._run_gemini("hello", timeout=12)
+
+    assert str(excinfo.value) == f"Set {llm_call.paths.AGY_BIN_ENV}"
+
+
+def test_agy_binary_uses_existing_env_var_and_fallback_names(monkeypatch) -> None:
+    captured = {}
+
+    def fake_require_executable(env_var: str, *names: str) -> str:
+        captured["env_var"] = env_var
+        captured["names"] = names
+        return "/tmp/agy"
+
+    monkeypatch.setattr(llm_call.paths, "require_executable", fake_require_executable)
+
+    assert llm_call._agy_binary() == "/tmp/agy"
+    assert captured == {
+        "env_var": llm_call.paths.AGY_BIN_ENV,
+        "names": ("agy-cli-1", "agy-cli-2", "agy"),
+    }

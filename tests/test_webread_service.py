@@ -481,7 +481,6 @@ def test_extract_returns_502_when_result_file_is_unreadable(monkeypatch, tmp_pat
 
     monkeypatch.setattr(webread_service, "extract_clean_text", _autospec_extract(fake_extract))
 
-
 def test_webread_service_real_extractor_signature_path_does_not_raise_typeerror(
     monkeypatch,
     tmp_path,

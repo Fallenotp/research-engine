@@ -538,6 +538,39 @@ class SufficiencyTests(unittest.TestCase):
         self.assertTrue(result.open_questions)
         self.assertEqual(result.evidence_gate_decision["terminal_state"], "partial")
 
+    def test_mark_partial_preserves_measured_zero_and_none_confidence(self) -> None:
+        zero_session = _session(
+            "What changed in the policy?",
+            "The policy added an appeal window.",
+            ["The policy added an appeal window."],
+        )
+        zero_session.confidence = 0.0
+        zero_session.answer_confidence = 0.0
+
+        zero_result = evidence_gate.mark_partial(
+            zero_session,
+            {"terminal_state": "partial", "reason": "missing details"},
+        )
+
+        self.assertEqual(zero_result.confidence, 0.0)
+        self.assertEqual(zero_result.answer_confidence, 0.0)
+
+        none_session = _session(
+            "What changed in the policy?",
+            "The policy added an appeal window.",
+            ["The policy added an appeal window."],
+        )
+        none_session.confidence = None
+        none_session.answer_confidence = None
+
+        none_result = evidence_gate.mark_partial(
+            none_session,
+            {"terminal_state": "partial", "reason": "missing details"},
+        )
+
+        self.assertEqual(none_result.confidence, 0.0)
+        self.assertEqual(none_result.answer_confidence, 0.0)
+
     def test_save_session_abstains_exhausted_and_writes_sidecar(self) -> None:
         session = _session(
             "What does this prove?",

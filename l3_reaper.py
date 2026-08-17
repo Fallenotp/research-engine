@@ -110,7 +110,7 @@ def reap(now: float | None = None) -> bool:
     if last_reap is not None and last_request is not None and last_request <= last_reap:
         return False
 
-    # Keep the webread-steel container warm; only tear down the sidecar and local model.
+    # Reap only the idle L3 helpers: stop the stagehand sidecar and terminate the local MLX model.
     _run_stop_command("WEBREAD_SIDECAR_STOP_CMD", "pkill -f webread-stagehand-sidecar")
     _stop_model_processes()
     _write_last_reap()

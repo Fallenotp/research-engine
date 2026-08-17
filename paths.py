@@ -116,3 +116,17 @@ def telemetry_path(name: str) -> Path:
 
 def home_path(*parts: str) -> Path:
     return Path.home().joinpath(*parts)
+
+
+def glob_root(pattern: str) -> Path:
+    path = Path(pattern).expanduser()
+    parts: list[str] = []
+    for part in path.parts:
+        if any(marker in part for marker in ("*", "?", "[")):
+            break
+        parts.append(part)
+    return Path(*parts)
+
+
+def missing_config_message(path: Path, env_var: str, *, label: str) -> str:
+    return f"{label} is not configured: missing {path}. Set {env_var}."

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import logging
 import os
 import signal
 import subprocess
 from pathlib import Path
 
-from . import paths
-CLAUDE_HOME = paths.optional_path(paths.CLAUDE_HOME_ENV) or Path.home()
+from research_engine import paths
+
 CODEX_DEFAULT_MODEL = "gpt-5.4-mini"
 SONNET_MODEL = "sonnet"
 OPUS_MODEL = "opus"
@@ -14,6 +15,7 @@ AGY_CLI = "agy-cli-1"
 AGY_SKIP_PERMISSIONS_FLAG = "--dangerously-skip-permissions"
 GEMINI_TIMEOUT_SECONDS = 180
 BACKENDS = ("codex", "sonnet", "opus", "gemini")
+logger = logging.getLogger(__name__)
 
 
 def llm_complete_with_backend(
@@ -34,14 +36,19 @@ def llm_complete(
     timeout: int | float = 120,
     prefer: str | None = None,
 ) -> tuple[str, str]:
+    failures: list[str] = []
     for backend in _backend_order(prefer):
         try:
             text = _run_backend(prompt, backend=backend, timeout=timeout)
-        except Exception:  # noqa: BLE001 - backend fallback boundary
+        except Exception as exc:  # noqa: BLE001 - backend fallback boundary
+            failure = f"{backend}: {type(exc).__name__}: {exc}"
+            logger.warning("llm backend failed: %s", failure)
+            failures.append(failure)
             continue
         if text:
             return text, backend
-    raise RuntimeError("no llm backend")
+    detail = "; ".join(failures) if failures else "no backends attempted"
+    raise RuntimeError(f"no llm backend; failures: {detail}")
 
 
 def _backend_order(prefer: str | None) -> list[str]:
@@ -76,12 +83,10 @@ def _run_codex(
     timeout: int | float,
     model: str = CODEX_DEFAULT_MODEL,
 ) -> str:
-    codex_bin = Path(paths.require_executable(paths.CODEX_BIN_ENV, "codex"))
-    if not _is_executable(codex_bin):
-        raise FileNotFoundError(str(codex_bin))
+    codex_bin = paths.require_executable(paths.CODEX_BIN_ENV, "codex")
     proc = subprocess.Popen(
         [
-            str(codex_bin),
+            codex_bin,
             "exec",
             "--skip-git-repo-check",
             "-s",
@@ -108,15 +113,13 @@ def _run_codex(
 
 
 def _run_sonnet(prompt: str, *, timeout: int | float) -> str:
-    claude_bin = Path(paths.require_executable(paths.CLAUDE_BIN_ENV, "claude"))
-    if not _is_executable(claude_bin):
-        raise FileNotFoundError(str(claude_bin))
+    claude_bin = paths.require_executable(paths.CLAUDE_BIN_ENV, "claude")
     env = os.environ.copy()
     env.pop("ANTHROPIC_API_KEY", None)
-    env["HOME"] = str(CLAUDE_HOME)
+    env["HOME"] = str(paths.optional_path(paths.CLAUDE_HOME_ENV) or Path.home())
     completed = subprocess.run(
         [
-            str(claude_bin),
+            claude_bin,
             "-p",
             prompt,
             "--model",
@@ -136,15 +139,13 @@ def _run_sonnet(prompt: str, *, timeout: int | float) -> str:
 
 
 def _run_opus(prompt: str, *, timeout: int | float) -> str:
-    claude_bin = Path(paths.require_executable(paths.CLAUDE_BIN_ENV, "claude"))
-    if not _is_executable(claude_bin):
-        raise FileNotFoundError(str(claude_bin))
+    claude_bin = paths.require_executable(paths.CLAUDE_BIN_ENV, "claude")
     env = os.environ.copy()
     env.pop("ANTHROPIC_API_KEY", None)
-    env["HOME"] = str(CLAUDE_HOME)
+    env["HOME"] = str(paths.optional_path(paths.CLAUDE_HOME_ENV) or Path.home())
     completed = subprocess.run(
         [
-            str(claude_bin),
+            claude_bin,
             "-p",
             prompt,
             "--model",
@@ -165,8 +166,6 @@ def _run_opus(prompt: str, *, timeout: int | float) -> str:
 
 def _run_gemini(prompt: str, *, timeout: int | float) -> str:
     agy = _agy_binary()
-    if agy is None:
-        raise FileNotFoundError(AGY_CLI)
     completed = subprocess.run(
         [agy, AGY_SKIP_PERMISSIONS_FLAG, "--print", _agy_prompt_arg(prompt)],
         capture_output=True,
@@ -180,8 +179,8 @@ def _run_gemini(prompt: str, *, timeout: int | float) -> str:
     return (completed.stdout or "").strip()
 
 
-def _agy_binary() -> str | None:
-    return paths.executable(paths.AGY_BIN_ENV, AGY_CLI, "agy-cli-2", "agy")
+def _agy_binary() -> str:
+    return paths.require_executable(paths.AGY_BIN_ENV, AGY_CLI, "agy-cli-2", "agy")
 
 
 def _agy_prompt_arg(prompt: str) -> str:

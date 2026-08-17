@@ -60,6 +60,22 @@ CALL_LOG_FIELDS = (
 logger = logging.getLogger(__name__)
 
 
+def _telemetry_parent_is_configured() -> bool:
+    if MASTER_LOG.parent.exists():
+        return True
+    if os.environ.get(paths.DATA_DIR_ENV, "").strip() or MASTER_LOG.parent != paths.data_dir():
+        MASTER_LOG.parent.mkdir(parents=True, exist_ok=True)
+        return True
+    logger.warning(
+        paths.missing_config_message(
+            MASTER_LOG.parent,
+            paths.DATA_DIR_ENV,
+            label="Telemetry root",
+        )
+    )
+    return False
+
+
 def _as_list(value: Any) -> list[Any]:
     return value if isinstance(value, list) else []
 
@@ -173,7 +189,14 @@ def session_to_row(session_dict: dict[str, Any], session_file: Path) -> dict[str
 
 def _append_row(row: dict[str, Any]) -> Exception | None:
     try:
-        MASTER_LOG.parent.mkdir(parents=True, exist_ok=True)
+        if not _telemetry_parent_is_configured():
+            return FileNotFoundError(
+                paths.missing_config_message(
+                    MASTER_LOG.parent,
+                    paths.DATA_DIR_ENV,
+                    label="Telemetry root",
+                )
+            )
         with MASTER_LOG.open("a", encoding="utf-8") as handle:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
             try:
@@ -330,7 +353,35 @@ def format_call_summary(summary: dict[str, dict[str, float | int]]) -> str:
 
 
 def run() -> dict[str, Any]:
-    MASTER_LOG.parent.mkdir(parents=True, exist_ok=True)
+    if not SESSIONS_DIR.exists():
+        message = paths.missing_config_message(
+            SESSIONS_DIR,
+            paths.RESEARCH_SESSIONS_DIR_ENV,
+            label="Research sessions root",
+        )
+        logger.warning(message)
+        return {
+            "scanned": 0,
+            "added": 0,
+            "skipped": 0,
+            "errors": 1,
+            "master_log": str(MASTER_LOG),
+            "error": message,
+        }
+    if not _telemetry_parent_is_configured():
+        message = paths.missing_config_message(
+            MASTER_LOG.parent,
+            paths.DATA_DIR_ENV,
+            label="Telemetry root",
+        )
+        return {
+            "scanned": 0,
+            "added": 0,
+            "skipped": 0,
+            "errors": 1,
+            "master_log": str(MASTER_LOG),
+            "error": message,
+        }
     seen = existing_session_ids()
     scanned = 0
     added = 0

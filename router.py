@@ -17,7 +17,7 @@ from research_engine.schema import WorkerModel
 DEFAULT_CONFIG_PATH = str(paths.package_path("router_config.yaml"))
 EXPECTED_SCHEMA_VERSION = "1.0.0"
 ALWAYS_MATCH_PATTERN = ".*"
-DEFAULT_AUTHORITY_SCORE = 0.5
+DEFAULT_AUTHORITY_SCORE = 0.0
 LEGACY_AUTHORITY_SCORE = 0.6
 _REQUIRED_RULE_FIELDS = ("name", "patterns", "lanes", "worker_model", "topic")
 _HOW_TO_PREFIXES = ("how do i ", "how can i ", "how should i ")
@@ -93,7 +93,8 @@ def _resolve_config_paths(value: Any) -> Any:
         or "agy",
         "{RESEARCH_ENGINE_GROK_BIN}": paths.executable(paths.GROK_BIN_ENV, "grok") or "grok",
         "{RESEARCH_ENGINE_BUZZ_SCRIPT}": str(
-            paths.optional_path(paths.BUZZ_SCRIPT_ENV) or paths.package_path("tools", "buzz-disabled")
+            paths.optional_path(paths.BUZZ_SCRIPT_ENV)
+            or paths.package_path("tools", "buzz-disabled")
         ),
         "{RESEARCH_ENGINE_MEMORY_DB}": str(paths.data_path("memory.db")),
         "{RESEARCH_ENGINE_CLAUDE_MEMORY_GLOB}": os.environ.get(
@@ -105,7 +106,8 @@ def _resolve_config_paths(value: Any) -> Any:
             str(paths.data_path("obsidian", "**", "*.md")),
         ),
         "{RESEARCH_ENGINE_MISTRAL_KEYS_FILE}": str(
-            paths.optional_path(paths.MISTRAL_KEYS_FILE_ENV) or paths.data_path("missing-mistral-free-keys.env")
+            paths.optional_path(paths.MISTRAL_KEYS_FILE_ENV)
+            or paths.data_path("missing-mistral-free-keys.env")
         ),
         "{RESEARCH_ENGINE_USER_AGENT}": paths.user_agent(),
     }

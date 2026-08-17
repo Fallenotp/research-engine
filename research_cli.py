@@ -1792,11 +1792,28 @@ def run_local_search_lanes(
 
 
 def local_lane_payload(lane_config: dict[str, Any], question: str) -> dict[str, Any]:
+    env_var = str(lane_config.get("env_var") or "").strip()
     db_path = str(lane_config.get("db_path") or "").strip()
     if db_path:
-        return {"results": _local_db_results(Path(db_path), question)}
+        db_file = Path(db_path).expanduser()
+        if not db_file.is_file():
+            error = (
+                f"local lane not configured: missing {db_file}; set {env_var}"
+                if env_var
+                else f"local lane not configured: missing {db_file}"
+            )
+            return {"results": [], "error": error, "not_configured": True}
+        return {"results": _local_db_results(db_file, question)}
     glob_pattern = str(lane_config.get("glob") or "").strip()
     if glob_pattern:
+        root = paths.glob_root(glob_pattern)
+        if not root.exists():
+            error = (
+                f"local lane not configured: missing {root}; set {env_var}"
+                if env_var
+                else f"local lane not configured: missing {root}"
+            )
+            return {"results": [], "error": error, "not_configured": True}
         return {"results": _local_file_results(glob_pattern, question)}
     return {"results": [], "error": "unsupported local lane config"}
 

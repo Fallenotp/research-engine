@@ -43,6 +43,13 @@ def _install_common_fakes(monkeypatch, tmp_path: Path, *, extract_result, grok_c
                 )
             raise AssertionError(f"unexpected fleet {fleet_name}")
 
+        def graduated_answer_config(self) -> dict[str, float]:
+            return {
+                "full_confidence_min": 0.2,
+                "partial_confidence_min": 0.1,
+                "abstain_confidence_below": 0.05,
+            }
+
     def fake_save_session(session, root):
         saved_sessions.append(session)
         path = Path(root) / session.created_at.strftime("%Y-%m-%d") / f"{session.session_id}.json"
@@ -126,6 +133,13 @@ def _install_research_fakes(
                     + [WorkerModel.GROK.value]
                 )
             raise AssertionError(f"unexpected fleet {fleet_name}")
+
+        def graduated_answer_config(self) -> dict[str, float]:
+            return {
+                "full_confidence_min": 0.2,
+                "partial_confidence_min": 0.1,
+                "abstain_confidence_below": 0.05,
+            }
 
     def fake_save_session(session, root):
         saved_sessions.append(session)
@@ -1615,3 +1629,47 @@ def test_research_and_deep_research_abstain_without_sources(monkeypatch, tmp_pat
         assert not result.session.sources
         assert result.session.open_questions
         assert saved_sessions
+
+
+def test_local_lane_payload_reports_missing_db_as_not_configured(tmp_path) -> None:
+    missing_db = tmp_path / "missing-memory.db"
+
+    payload = research_cli.local_lane_payload(
+        {
+            "type": "local",
+            "db_path": str(missing_db),
+            "env_var": "RESEARCH_ENGINE_MEMORY_DB",
+        },
+        "where did we discuss this",
+    )
+
+    assert payload == {
+        "results": [],
+        "error": (
+            f"local lane not configured: missing {missing_db}; "
+            "set RESEARCH_ENGINE_MEMORY_DB"
+        ),
+        "not_configured": True,
+    }
+
+
+def test_local_lane_payload_reports_missing_glob_root_as_not_configured(tmp_path) -> None:
+    missing_root = tmp_path / "missing-vault"
+
+    payload = research_cli.local_lane_payload(
+        {
+            "type": "local",
+            "glob": str(missing_root / "**" / "*.md"),
+            "env_var": "RESEARCH_ENGINE_OBSIDIAN_GLOB",
+        },
+        "where is the note",
+    )
+
+    assert payload == {
+        "results": [],
+        "error": (
+            f"local lane not configured: missing {missing_root}; "
+            "set RESEARCH_ENGINE_OBSIDIAN_GLOB"
+        ),
+        "not_configured": True,
+    }
