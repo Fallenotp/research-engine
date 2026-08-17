@@ -1424,9 +1424,10 @@ def execute_codex_worker_spec(spec: WorkerSpec) -> str:
     prompt = Path(spec.brief_path).read_text(encoding="utf-8")
     output_path = Path(spec.output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    codex_bin = paths.require_executable(paths.CODEX_BIN_ENV, "codex")
     completed = subprocess.run(
         [
-            "/opt/homebrew/bin/codex",
+            codex_bin,
             "exec",
             "--skip-git-repo-check",
             "-s",

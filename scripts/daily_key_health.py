@@ -1,4 +1,4 @@
-#!/opt/homebrew/bin/python3.11
+#!/usr/bin/env python3.11
 from __future__ import annotations
 
 import http.client

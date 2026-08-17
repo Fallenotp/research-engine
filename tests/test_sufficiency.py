@@ -159,10 +159,11 @@ class SufficiencyTests(unittest.TestCase):
         self.assertNotIn("OPENCLAW_RULES", env)
 
     def test_ollama_cli_client_runs_with_local_model(self) -> None:
+        executable = "/tmp/test-bin/ollama"
         client = sufficiency.CLIJsonClient(
             provider_label="ollama-fallback",
             model_id="qwen3.5:9b",
-            executable="/opt/homebrew/bin/ollama",
+            executable=executable,
             timeout_seconds=5,
         )
         completed = subprocess.CompletedProcess(
@@ -177,7 +178,7 @@ class SufficiencyTests(unittest.TestCase):
 
         command = run_mock.call_args.args[0]
         kwargs = run_mock.call_args.kwargs
-        self.assertEqual(command, ["/opt/homebrew/bin/ollama", "run", "qwen3.5:9b"])
+        self.assertEqual(command, [executable, "run", "qwen3.5:9b"])
         self.assertEqual(set(kwargs["env"]), {"HOME", "LANG", "LC_ALL", "PATH", "TMPDIR"})
         self.assertEqual(kwargs["env"]["HOME"], str(Path.home()))
 
@@ -190,7 +191,7 @@ class SufficiencyTests(unittest.TestCase):
             with patch.object(
                 sufficiency,
                 "_resolve_ollama_runtime",
-                return_value=("/opt/homebrew/bin/ollama", "qwen3.5:9b"),
+                return_value=("/tmp/test-bin/ollama", "qwen3.5:9b"),
             ):
                 primary, fallback = sufficiency.get_sufficiency_clients()
 

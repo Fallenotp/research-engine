@@ -189,7 +189,6 @@ class CLIJsonClient:
             executable_dir,
             str(Path.home() / ".bun" / "bin"),
             str(Path.home() / ".local" / "bin"),
-            "/opt/homebrew/bin",
             "/usr/bin",
             "/bin",
             "/usr/sbin",
@@ -996,9 +995,9 @@ def _agy_prompt_arg(prompt: str) -> str:
 def _resolve_ollama_runtime() -> tuple[str, str] | None:
     executable = _first_executable(
         (
+            paths.executable(paths.OLLAMA_BIN_ENV, "ollama") or "",
             SUFFICIENCY_OLLAMA_BIN,
             shutil.which("ollama") or "",
-            str(Path("/opt/homebrew/bin/ollama")),
         )
     )
     if not executable:

@@ -6,9 +6,6 @@ import subprocess
 from pathlib import Path
 
 from . import paths
-
-
-CODEX_BIN = Path("/opt/homebrew/bin/codex")
 CLAUDE_HOME = paths.optional_path(paths.CLAUDE_HOME_ENV) or Path.home()
 CODEX_DEFAULT_MODEL = "gpt-5.4-mini"
 SONNET_MODEL = "sonnet"
@@ -79,11 +76,12 @@ def _run_codex(
     timeout: int | float,
     model: str = CODEX_DEFAULT_MODEL,
 ) -> str:
-    if not _is_executable(CODEX_BIN):
-        raise FileNotFoundError(str(CODEX_BIN))
+    codex_bin = Path(paths.require_executable(paths.CODEX_BIN_ENV, "codex"))
+    if not _is_executable(codex_bin):
+        raise FileNotFoundError(str(codex_bin))
     proc = subprocess.Popen(
         [
-            str(CODEX_BIN),
+            str(codex_bin),
             "exec",
             "--skip-git-repo-check",
             "-s",

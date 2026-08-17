@@ -134,7 +134,6 @@ async function pageFunction(context) {
 """.strip()
 FIRECRAWL_SCRAPE_URL = "https://api.firecrawl.dev/v2/scrape"
 FIRECRAWL_ADVANCE_STATUSES = {401, 403, 429}
-AGENT_BROWSER_BIN = "/opt/homebrew/bin/agent-browser"
 _PROXY_BACKEND = None
 _POLITENESS = None
 _APIFY_ACCOUNT_POOL = None
@@ -1107,12 +1106,16 @@ def _agent_browser(source_url: str) -> dict[str, str | None] | None:
 
     politeness.wait(_domain(source_url))
     timeout = int(os.environ.get("WEBREAD_L3_TIMEOUT_S", "120"))
+    agent_browser_bin = paths.require_executable(
+        paths.AGENT_BROWSER_BIN_ENV,
+        "agent-browser",
+    )
     session_seed = f"{source_url}:{os.getpid()}:{time.time_ns()}"
     session_hash = hashlib.sha256(session_seed.encode("utf-8")).hexdigest()[:16]
     session_name = f"reader-{os.getpid()}-{session_hash}"
 
     def run_command(*args: str, json_output: bool = True) -> subprocess.CompletedProcess[str]:
-        command = [AGENT_BROWSER_BIN, "--session", session_name, *args]
+        command = [agent_browser_bin, "--session", session_name, *args]
         if json_output:
             command.append("--json")
         return subprocess.run(
@@ -1424,7 +1427,6 @@ def extract_clean_text(
     seen_urls_path: Path | None = None,
     tier: SourceTier | None = None,
     instruction: str | None = None,
-    allow_l3: bool | None = None,
 ) -> dict | None:
     source_url, local_path = _source_ref(url_or_path)
     min_chars = 1 if instruction else 200

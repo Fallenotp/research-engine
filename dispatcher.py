@@ -59,9 +59,12 @@ Provider = Literal[
     "opus_subagent",
 ]
 
-_BRIEF_DIR_TEMPLATE = "/tmp/deep-research-briefs-{topic_slug}"
+_TMP_DIR = Path(tempfile.gettempdir())
+_BRIEF_DIR_TEMPLATE = str(_TMP_DIR / "deep-research-briefs-{topic_slug}")
 _BRIEF_PATH_TEMPLATE = _BRIEF_DIR_TEMPLATE + "/brief-{role}-{territory_id}.md"
-_OUTPUT_PATH_TEMPLATE = "/tmp/deep-research-{topic_slug}-agent-{role}-{territory_id}.md"
+_OUTPUT_PATH_TEMPLATE = str(
+    _TMP_DIR / "deep-research-{topic_slug}-agent-{role}-{territory_id}.md"
+)
 # Gemini is reachable fleet-wide only through agy. Scheduled workers pin a
 # full-quota agy model so the configured Gemini lane remains for daytime use.
 AGY_PROVIDER = "agy_cli"
@@ -478,10 +481,10 @@ def dispatch_scout(
         return None
 
     safe_topic_slug = _slugify(topic_slug)
-    brief_path = (
-        f"/tmp/deep-research-briefs-{safe_topic_slug}/brief-scout-gemini-flash.md"
+    brief_path = str(
+        _TMP_DIR / f"deep-research-briefs-{safe_topic_slug}" / "brief-scout-gemini-flash.md"
     )
-    output_path = f"/tmp/deep-research-{safe_topic_slug}-agent-scout-gemini-flash.md"
+    output_path = str(_TMP_DIR / f"deep-research-{safe_topic_slug}-agent-scout-gemini-flash.md")
     _ensure_parent_dir(brief_path)
     _ensure_parent_dir(output_path)
     Path(brief_path).write_text(
@@ -530,8 +533,10 @@ def dispatch_pro_synthesis_fallback(
         return None
 
     safe_topic_slug = _slugify(topic_slug)
-    brief_path = f"/tmp/deep-research-briefs-{safe_topic_slug}/brief-final-synthesis-pro.md"
-    output_path = f"/tmp/deep-research-{safe_topic_slug}-final-synthesis-pro.md"
+    brief_path = str(
+        _TMP_DIR / f"deep-research-briefs-{safe_topic_slug}" / "brief-final-synthesis-pro.md"
+    )
+    output_path = str(_TMP_DIR / f"deep-research-{safe_topic_slug}-final-synthesis-pro.md")
     _ensure_parent_dir(brief_path)
     _ensure_parent_dir(output_path)
     Path(brief_path).write_text(

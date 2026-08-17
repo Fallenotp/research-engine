@@ -320,7 +320,9 @@ def classify_rung(
     elif helper == "_scrapling_stealth":
         status, detail = import_status("scrapling.fetchers")
     elif helper == "_agent_browser":
-        status, detail = command_status(extractor.AGENT_BROWSER_BIN)
+        status, detail = command_status(
+            paths.executable(paths.AGENT_BROWSER_BIN_ENV, "agent-browser") or "agent-browser"
+        )
     elif helper == "_firecrawl":
         status, detail = firecrawl_status(env_map, router_config)
     elif helper == "try_publisher_fallback":
