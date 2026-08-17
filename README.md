@@ -6,9 +6,7 @@ and returns a cited answer — or says the evidence is too thin and abstains.
 
 > **Read this first.** This is a working personal system, published because it may be useful, not a
 > product. It runs daily on one machine. Running it elsewhere means standing up several local services
-> and supplying your own API keys. Machine-specific paths are all environment variables, so nothing
-> needs editing in the source, but plenty still needs configuring. Known gaps are listed at the bottom
-> rather than hidden.
+> and supplying your own API keys. Known gaps are listed at the bottom rather than hidden.
 
 ## Contents
 
@@ -28,7 +26,9 @@ and returns a cited answer — or says the evidence is too thin and abstains.
 1. The **router** (`router.py` + `router_config.yaml`) reads the question and scores 18 rules to pick
    which of the 46 search lanes to run. Multiple rules can match; it picks a primary and merges the
    rest, capped at 10 lanes.
-2. Chosen lanes run. Free lanes first.
+2. Chosen lanes run. **In `search` mode**, free lanes run first and the paid proxy fires only if the
+   free ones come back thin. In `research` and `deep-research` the workers always hit SearXNG and the
+   paid proxy — lane names there shape the worker's brief rather than selecting the APIs that run.
 3. Each promising URL goes through the **reader ladder** (`extractor.py`), which escalates one rung at
    a time until something returns usable text.
 4. **Grounding** (`grounding.py`) matches claims against the fetched text and scores confidence from
@@ -42,13 +42,14 @@ The CLI takes `--mode search|research|deep-research`. Default is `search`. There
 | | `search` | `research` | `deep-research` |
 |---|---|---|---|
 | What it is | A fast fact lookup | A decision-grade answer | An exhaustive sweep |
-| Worker LLMs | **None** | 3 | 16 territories |
+| Worker fleet | **none** | 3 workers | 16 territories |
+| Still uses LLMs? | Yes — see below | Yes | Yes |
 | Extra rounds | None | None | One follow-up if gaps remain |
-| Cost ceiling | Free-first | $0.50 | $1.50 |
 | Use it for | "What is X's current pricing?" | "Should we pick A or B?" | An irreversible decision, or new territory |
 
-**`search`** runs no worker LLMs at all. It queries SearXNG first, adds free API lanes only if fewer
-than 5 results come back, and reaches for the paid proxy last. Cheapest by a wide margin.
+**`search`** runs no worker *fleet*, but it is not LLM-free: every web search fires one Grok CLI
+X-search pass, and the final answer is synthesised by an LLM (Codex, falling back to Sonnet). It is
+much the cheapest mode, not a zero-cost one.
 
 **`research`** adds an optional Gemini Flash scout and a fixed fleet of 3 workers: one Codex
 (`gpt-5.4-mini`), one Mistral (`mistral-small-latest`), one Grok (`grok-4.5`). **The Mistral worker is
@@ -58,15 +59,19 @@ runs on 2 live workers.
 **`deep-research`** plans 16 territories across a larger fleet and runs one focused follow-up pass if
 the session still has gaps.
 
+`router_config.yaml` carries `budget_ceiling_usd` values of 0.50 and 1.50 for these modes. **They are
+not enforced.** The only code that reads them lives in `iteration_controller.py`, which the CLI does
+not call. Treat them as intent, not a spend limit.
+
 ## Search lanes
 
 46 lanes are defined in `router_config.yaml`. Which ones fire depends on the question.
 
-**Free, no key needed:** SearXNG (general web, your own instance), `reddit_rss`, `reddit_failures`,
-`hackernews`, `arxiv`, `crossref`, `openalex`, `wikipedia`, `grok_x_search` (X/Twitter via the Grok
-CLI), and others.
+**Free, no key needed:** SearXNG (general web, your own instance), `hn_algolia`, `reddit_rss`,
+`arxiv`, `pubmed`, `semantic_scholar`, `core`, `papers_with_code`, `sec_edgar`, `courtlistener`,
+`sourcegraph`, `codeberg_code`, `grok_x_search` (X/Twitter via the Grok CLI), and others.
 
-**Free but keyed — inert until you supply the key:**
+**Free but keyed — that lane fails with a `requires env var` error until you supply the key:**
 
 | Lane | Needs |
 |---|---|
@@ -78,64 +83,74 @@ CLI), and others.
 | `fda_gov` | `FDA_API_KEY` |
 | `kaggle` | `~/.kaggle/kaggle.json` |
 
-**Paid / proxied:** `paid_proxy`, `linkup_direct`, `tavily_direct`, `youcom_direct`,
-`firecrawl_direct`, `exa_direct`. These route through a semantic-search proxy on `localhost:18791`
-that is not part of this repo.
+**Proxied** through a semantic-search proxy on `localhost:18791` that is not part of this repo:
+`paid_proxy`, `linkup_direct`, `tavily_direct`, `youcom_direct`, `firecrawl_direct` (paid), and
+`exa_direct` (proxied but **free** — cost 0.0 in the config).
 
-**Not callable from the CLI:** `hf_hub` and `hf_datasets` are declared as MCP lanes, and the
-dispatcher ignores the `mcp_server` field, so they never run. `reddit_json` is marked deprecated in
-the config (its endpoint returns 403); `reddit_rss` replaces it. `x_pulse` expects an
-`x-pulse-research` script that is not in this repo.
+**Local lanes** search your own files and are off unless you point their variable at real data. If the
+path does not exist the lane reports `not configured: missing <path>. Set <ENV_VAR>.` rather than
+returning an empty result set that reads like "nothing found".
+
+**Cannot run at all:** `hf_hub` and `hf_datasets` are declared as MCP lanes and the dispatcher ignores
+the `mcp_server` field. `x_pulse` and `bluesky_jetstream` are `type: cli` lanes whose `command` field
+the dispatcher also ignores. `reddit_json` is marked deprecated (its endpoint returns 403); note that
+`reddit_failures` still calls that same dead endpoint.
 
 ## The reader ladder
 
-`extract_clean_text()` in `extractor.py`. For a normal web URL it tries these in order, stopping at
-the first rung that returns usable text:
+`extract_clean_text()` in `extractor.py`. It is not one linear ladder — three branches are tried
+first, each returning on its own, and only an ordinary web URL reaches the 7-rung ladder.
 
-1. **gitingest** — GitHub repo URLs only (not GitLab) get packed into one text file
-2. **Apify actors** — only for routed platforms (X, Instagram and similar), via an account pool
-3. **trafilatura** — plain HTTP article extraction. The workhorse; most pages stop here
-4. **Crawl4AI** — JavaScript pages in local Chromium. ⚠️ Shells out to a helper script that is **not
-   in this repo** — see [Known gaps](#known-gaps)
-5. **Jina Reader** — hosted text extraction
-6. **Crawlee** — a second crawler engine
-7. **Scrapling** — stealth browser for bot walls (Cloudflare, Turnstile); brings in Camoufox
-8. **agent-browser** — a real browser session. Runs by default, not behind a toggle
-9. **Firecrawl** — API-based scraping, the last web rung
-10. **Publisher fallback** — open-access publisher lookup, for paper-like URLs only
-11. **Wayback Machine** — for dead links
+**Branches, in order:**
 
-Other content routes:
+1. **Documents, PDFs and local files** — PDFs try PyMuPDF (default), then Docling, then MarkItDown.
+   Word, PowerPoint, Excel, images and audio go through MarkItDown. `file://` and plain local paths
+   work. A failed document extraction stops here; it does not fall through to the web.
+2. **gitingest** — **GitHub** repo URLs only (not GitLab) get packed into one text file.
+3. **Apify actors** — **Instagram and TikTok only**. For those hosts it is exclusive: if Apify fails,
+   extraction ends rather than continuing down the ladder.
 
-- **Local files and `file://` links** work, not just web URLs
-- **Documents and media** — Word, PowerPoint, Excel, PDF, images and audio go through MarkItDown;
-  PDFs can also use PyMuPDF or Docling
-- **Blocked IPs** — `fetch_proxy.py` can retry through a rotating VPN proxy. If both the VPN and its
-  backup fail it browses unproxied and labels the result `no_proxy:...` rather than implying a proxy
-  was in use
+**Then the web ladder proper, 7 rungs:**
+
+`trafilatura` → `crawl4ai` → `Jina Reader` → `crawlee` → `scrapling` (stealth browser, brings in
+Camoufox) → `agent-browser` (a real browser session, on by default, not behind a toggle) →
+`firecrawl`.
+
+**Then, if nothing worked:** an open-access **publisher fallback** for paper-like URLs (Crossref and
+OpenAlex live here, not as search lanes), and finally the **Wayback Machine** for dead links.
+
+⚠️ The **crawl4ai** rung shells out to a helper script that is **not shipped in this repo**. Set
+`RESEARCH_ENGINE_CRAWL4AI_SCRIPT` or that rung returns nothing.
+
+**Blocked IPs** — `fetch_proxy.py` can retry through a rotating VPN proxy. If both the VPN and its
+backup fail it browses unproxied and labels the result `no_proxy:...` rather than implying a proxy was
+in use.
 
 Every rung attempt is logged by `extractor.py` to `research-reader-telemetry.jsonl` in your data
 directory. `telemetry_observer.py` is a separate tool that post-processes saved sessions.
 
 ## The LLMs it uses
 
-Everything runs through CLIs you are already signed into. No API keys are read for the LLMs
-themselves.
+Codex, Claude, Grok and `agy` run as CLIs you are already signed into. The one exception is Mistral,
+which is an HTTP API and needs a key file.
 
 | Role | What actually runs |
 |---|---|
-| Final synthesis | Opus → Codex `gpt-5.5` → Sonnet, tried in that order |
-| Scout (research, deep-research) | Gemini 3.7 Flash via `agy`. **Optional** — if it fails the run continues without it |
+| Final synthesis (`research`, `deep-research`) | Opus → Codex `gpt-5.5` → Sonnet, in that order |
+| Final synthesis (`search`) | Codex → Sonnet |
+| Scout (`research`, `deep-research`) | Gemini 3.7 Flash via `agy`. **Optional** — if it fails the run continues without it |
 | Worker: Codex | `gpt-5.4-mini` (territories are labelled `codex-5.4`) |
-| Worker: Grok | `grok-4.5` via the Grok CLI (`grok --single`). Fallback is `cursor-agent --model cursor-grok-4.5-high`. **Not** Hermes — its xAI auth is dead |
-| Worker: Mistral | `mistral-small-latest` over HTTP. Needs a key file |
+| Worker: Grok | The Grok CLI, invoked as `grok --single`. **Not** Hermes — its xAI auth is dead |
+| Worker: Mistral | `mistral-small-latest` over HTTPS with a Bearer key. Needs a key file |
 
-Three things worth knowing:
+Four things worth knowing:
 
 - **Gemini Pro is never used.** The scout is explicitly restricted to Flash.
 - **Territories labelled `haiku` do not run Haiku.** `llm_call.py` supports exactly four backends —
   codex, sonnet, opus, gemini. A `haiku` territory falls through to a generic summariser that uses
   Codex or Sonnet. The label is a leftover.
+- **There is no automatic fallback if the Grok CLI fails.** That worker's pass is recorded as an
+  error. (A `cursor-agent` fallback is mentioned in a source comment but no code path invokes it.)
 - There is a **Gemini daily budget of 300 calls** (`RESEARCH_ENGINE_GEMINI_DAILY_BUDGET`). Past it, or
   when `RESEARCH_ENGINE_UNATTENDED` is set, Gemini calls are swapped to `GPT-OSS 120B (Medium)`.
 
@@ -146,13 +161,17 @@ scores that were constants typed into the source — a content-farm blog scored 
 manufacturer.
 
 - **Confidence is measured, not asserted.** Source authority and count feed a weighted score, mapped
-  through thresholds in `router_config.yaml`.
-- **Failures fail down, not up.** If the confidence config cannot be read, the run abstains and logs
-  why. It does not fall back to a confident-looking default.
+  through thresholds in `router_config.yaml`. If that config cannot be read, the engine uses documented
+  fail-closed defaults (0.70 / 0.35) and still grades from the measured score, rather than inventing a
+  confident result without measuring.
+- **A measured zero stays zero.** The weak-sources gate caps confidence at 0.5; it does not raise an
+  unmeasured or zero score up to it.
+- **Grounding abstains** when its thresholds cannot be loaded, and logs why.
 - **Evidence scoring is containment, not Jaccard**, calibrated on real claim and paragraph pairs.
 - **Counter-evidence lane.** One Grok worker is pointed at a mutated query specifically to find
   reasons the obvious answer is wrong.
-- **Cite or admit.** A fetched, cited source, or an honest "insufficient evidence".
+- **Missing data announces itself.** A local lane whose source is absent says "not configured" instead
+  of returning zero results.
 
 ## Install
 
@@ -170,16 +189,17 @@ Python 3.10 or newer. It is only actually run and tested on 3.11.
 | Thing | Needed for | Where |
 |---|---|---|
 | SearXNG on `localhost:8888` | All modes. The primary search lane | https://github.com/searxng/searxng |
-| `agy` (Gemini CLI wrapper) | The optional scout | Local wrapper; must be on `PATH` |
-| `grok` CLI | The Grok worker and `grok_x_search` | https://grok.com |
+| `grok` CLI | The Grok worker and `grok_x_search` — used in every mode | https://grok.com |
 | `codex` CLI | Default LLM backend | OpenAI Codex CLI |
 | `claude` CLI | Sonnet and Opus backends | Anthropic Claude CLI |
-| Semantic proxy on `localhost:18791` | Paid search lanes only | Not in this repo |
+| `agy` (Gemini CLI wrapper) | The optional scout | Local wrapper; must be on `PATH` |
+| Semantic proxy on `localhost:18791` | Proxied search lanes only | Not in this repo |
 
 ### Reader tools
 
 Every one of these has a live call site in `extractor.py`. Install only what you need — a missing tool
-skips its rung rather than failing the run.
+fails its own rung and the ladder continues. (PDFs are the exception: PyMuPDF, Docling and MarkItDown
+are tried in turn, and only if all three are unavailable does the PDF path raise.)
 
 | Tool | Install | Source |
 |---|---|---|
@@ -200,9 +220,8 @@ skips its rung rather than failing the run.
 
 ## Configuration
 
-Nothing is hardcoded to one machine. Paths and binaries resolve through `paths.py`, which reads
-environment variables and falls back to sensible defaults. Copy `.env.example`, fill in what you need,
-and point `RESEARCH_ENGINE_ENV_FILE` at it — or export the variables directly.
+Copy `.env.example`, fill in what you need, and point `RESEARCH_ENGINE_ENV_FILE` at it — or export the
+variables directly.
 
 The ones most people set:
 
@@ -215,11 +234,16 @@ The ones most people set:
 | `RESEARCH_ENGINE_CRAWL4AI_SCRIPT` | *(unset)* | Path to your Crawl4AI helper — that rung is dead without it |
 | `RESEARCH_ENGINE_GEMINI_DAILY_BUDGET` | `300` | Gemini calls per day before swapping to GPT-OSS |
 
-Binaries are found with `shutil.which()` first, so if the CLIs are on your `PATH` you need not set
-anything. When a required binary is genuinely missing, the error names the exact variable to set.
+**Precedence:** if a `RESEARCH_ENGINE_*_BIN` variable is set it wins. Only when it is unset does the
+code fall back to `shutil.which()` on your `PATH`. So if the CLIs are on your `PATH` you need not set
+anything, and when a required binary is genuinely missing the error names the exact variable to set.
 
-Integrations with the author's other tools (Obsidian, a local buzz script, a semantic-search proxy)
-are **off unless you set their variable**. See `.env.example` for the full list.
+Local-file lanes (Obsidian, a Claude memory glob) and integrations with the author's other tools are
+**off unless you set their variable**. See `.env.example` for the full list.
+
+⚠️ A few lane integrations in `router_config.yaml` still assume fixed home-directory locations —
+`~/.kaggle/kaggle.json` for `kaggle` and `~/bin/x-pulse-research` for `x_pulse`. Those are not
+env-var driven.
 
 ## Usage
 
@@ -232,7 +256,7 @@ python research_cli.py --mode deep-research "everything known about X"
 Sessions are saved under `$RESEARCH_ENGINE_DATA_DIR/research-sessions/`, which defaults to
 `~/.research_engine/research-sessions/`. Override with `RESEARCH_ENGINE_RESEARCH_SESSIONS_DIR`.
 
-Run the tests from the repo root, not from `tests/` — twelve test files live at the top level:
+Run the tests from the repo root, not from `tests/` — thirteen test modules live at the top level:
 
 ```bash
 pytest . -q
@@ -241,9 +265,9 @@ ruff check .
 
 ## Design principles
 
-- **Cheapest that works.** In `search` mode free lanes run first and paid search fires only when free
-  results are thin. This applies to `search` only; `research` and `deep-research` use the paid proxy
-  as part of their normal flow.
+- **Cheapest that works** — in `search` mode. Free lanes run first and paid search fires only when
+  free results are thin. `research` and `deep-research` use the paid proxy as part of their normal
+  flow, so this is a `search`-mode property, not a global one.
 - **Cite or admit.** A cited source or an honest abstention, never a confident guess.
 - **Disagreement is data.** A counter-evidence worker hunts for reasons the obvious answer is wrong.
 - **Stop at the first good rung.** No fetching a page five ways when the first way worked.
@@ -255,13 +279,16 @@ Stated plainly rather than discovered later.
 - **Crawl4AI needs a helper script that is not in this repo.** Set `RESEARCH_ENGINE_CRAWL4AI_SCRIPT`
   to your own, or that rung returns nothing.
 - **Some lanes cannot run at all.** `hf_hub` and `hf_datasets` are MCP lanes the dispatcher ignores;
-  `x_pulse` needs an external script that is not included; `reddit_json` is deprecated upstream.
+  `x_pulse` and `bluesky_jetstream` are CLI lanes whose command field is also ignored; `reddit_json`
+  is deprecated upstream and `reddit_failures` still uses that same dead endpoint.
+- **The `budget_ceiling_usd` values are not enforced.** Nothing in the CLI reads them.
 - **`haiku` worker labels are cosmetic** — those territories execute on Codex or Sonnet.
 - **The Mistral worker is inert** until you supply a key file, so `research` mode runs 2 of 3 workers
   out of the box.
-- **No console entry point.** `research_cli.py` has a `main()`, but the module imports heavy optional
-  extractors at load time, so a `research-engine` command would break on a minimal install.
-- **The full read stack is heavy.** The core install is light; the extras pull in browsers.
+- **No console entry point.** `pyproject.toml` declares no `[project.scripts]`. The package itself
+  imports fine on a minimal install; this is a packaging gap, not an import problem.
+- **Apify is exclusive for Instagram and TikTok.** If it fails on those hosts, extraction stops rather
+  than falling back to the generic ladder.
 - Several MEDIUM and LOW findings from an internal code audit remain open — long functions, duplicate
   helpers, style. None affect correctness.
 
