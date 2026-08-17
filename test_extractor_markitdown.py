@@ -1,7 +1,9 @@
+import builtins
 from pathlib import Path
 from unittest.mock import patch
 
 import fitz
+import pytest
 
 from research_engine import extractor
 from research_engine.schema import ExtractionMethod
@@ -75,3 +77,21 @@ def test_pdf_default_uses_pymupdf_before_docling(tmp_path) -> None:
     assert out is not None
     assert out["extraction_method"] == ExtractionMethod.DOCLING.value
     assert calls == ["pymupdf", "docling"]
+
+
+def test_pdf_without_pymupdf_extra_raises_actionable_error(tmp_path) -> None:
+    pdf_path = tmp_path / "sample.pdf"
+    _write_sample_pdf(pdf_path, "PyMuPDF missing PDF text")
+    real_import = builtins.__import__
+
+    def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "fitz":
+            raise ModuleNotFoundError("No module named 'fitz'")
+        return real_import(name, globals, locals, fromlist, level)
+
+    with patch("builtins.__import__", side_effect=fake_import):
+        with pytest.raises(RuntimeError, match=r"pip install .*pdf"):
+            extractor.extract_clean_text(
+                str(pdf_path),
+                seen_urls_path=tmp_path / "seen.txt",
+            )

@@ -15,7 +15,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import parse_qsl, unquote, urlencode, urlparse, urlunparse
 
-import fitz
 import requests
 import trafilatura
 from bs4 import BeautifulSoup
@@ -171,6 +170,10 @@ PUBLISHER_HOSTS = (
 PAPER_DOI_RE = re.compile(r"10\.\d{4,9}/[^\s\"'<>&]+", re.IGNORECASE)
 PAPER_PII_RE = re.compile(r"S\d{15,17}", re.IGNORECASE)
 __all__ = ["compact_search_results", "extract_clean_text"]
+
+
+class _MissingPdfDependencyError(RuntimeError):
+    pass
 
 
 def _is_web_url(value: str) -> bool:
@@ -468,6 +471,8 @@ def _attempt(method: str, fn, *, min_chars: int = 200) -> dict[str, str | None] 
     started_at = time.perf_counter()
     try:
         payload = fn()
+    except _MissingPdfDependencyError:
+        raise
     except Exception as exc:  # pragma: no cover - hard boundary for caller contract
         _log(method, started_at, False, 0, f"{type(exc).__name__}: {exc}")
         return None
@@ -707,6 +712,13 @@ def _pdf_docling(source_url: str, local_path: Path | None) -> dict[str, str | No
 
 
 def _pdf_pymupdf(source_url: str, local_path: Path | None) -> dict[str, str | None]:
+    try:
+        import fitz
+    except Exception as exc:  # pragma: no cover - optional dependency
+        raise _MissingPdfDependencyError(
+            "PyMuPDF is required for PDF extraction. Install it with "
+            "`pip install research-engine[pdf]`."
+        ) from exc
     if local_path is not None:
         doc = fitz.open(local_path)
     else:
