@@ -17,6 +17,7 @@ from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
 import research_engine.evidence_gate as evidence_gate
+from research_engine.dispatcher import trim_output
 from research_engine.router import DEFAULT_CONFIG_PATH, Router, RoutingDecision, load_router
 from research_engine.schema import (
     FinalStatus,
@@ -445,7 +446,7 @@ def _single_source_claim_gaps(session: ResearchSession) -> list[Gap]:
         claims.setdefault(chunk.supports_claim, set()).add(chunk.source_id)
     return [
         Gap(
-            gap_topic=f"single-source claim about {_trim(claim)}",
+            gap_topic=f"single-source claim about {trim_output(claim, limit=80)}",
             severity=GapSeverity.HIGH,
             detection_reason="single-source claim",
             recommended_lane="paid_proxy",
@@ -498,7 +499,7 @@ def _stale_data_gaps(
         if published is not None and published < cutoff:
             gaps.append(
                 Gap(
-                    gap_topic=f"stale source {source.domain}: {_trim(source.title)}",
+                    gap_topic=f"stale source {source.domain}: {trim_output(source.title, limit=80)}",
                     severity=GapSeverity.MEDIUM,
                     detection_reason="stale data",
                     recommended_lane="x_pulse",
@@ -513,7 +514,7 @@ def _subtopic_gaps(session: ResearchSession) -> list[Gap]:
         return []
     return [
         Gap(
-            gap_topic=f"sub-topic missed: {_trim(question)}",
+            gap_topic=f"sub-topic missed: {trim_output(question, limit=80)}",
             severity=GapSeverity.LOW,
             detection_reason="sub-topic missed",
             recommended_lane="searxng_general",
@@ -692,13 +693,6 @@ def _parse_published_date(value: str | None) -> datetime | None:
             continue
     LOGGER.warning("Could not parse published_date=%r", value)
     return None
-
-
-def _trim(text: str, limit: int = 80) -> str:
-    compact = " ".join(text.split())
-    if len(compact) <= limit:
-        return compact
-    return f"{compact[: limit - 3].rstrip()}..."
 
 
 if __name__ == "__main__":

@@ -130,6 +130,7 @@ def audit_answer(session_dict: dict[str, Any]) -> dict[str, Any]:
             ],
         }
     except Exception as exc:
+        paths.safe_log(logger, logging.WARNING, "Verbatim audit failed: %s", exc)
         return {"flagged": False, "claims": [], "audit_error": str(exc)}
 
 
@@ -206,7 +207,7 @@ def _append_row(row: dict[str, Any]) -> Exception | None:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         return None
     except Exception as exc:
-        logger.warning("telemetry append failed: %s", exc)
+        paths.safe_log(logger, logging.WARNING, "telemetry append failed: %s", exc)
         return exc
 
 
@@ -247,9 +248,19 @@ def log_buzz(
         }
         error = _append_row({field: row.get(field) for field in ROW_FIELDS})
         if error is not None:
-            logger.warning("buzz telemetry append failed: %s", error)
+            paths.safe_log(
+                logger,
+                logging.WARNING,
+                "buzz telemetry append failed: %s",
+                error,
+            )
     except Exception as exc:
-        logger.warning("buzz telemetry append failed: %s", exc)
+        paths.safe_log(
+            logger,
+            logging.WARNING,
+            "buzz telemetry append failed: %s",
+            exc,
+        )
 
 
 def existing_session_ids() -> set[str]:
@@ -263,12 +274,21 @@ def existing_session_ids() -> set[str]:
                 try:
                     record = json.loads(line)
                 except json.JSONDecodeError:
+                    paths.safe_log(
+                        logger, logging.DEBUG, "Malformed line in MASTER_LOG was skipped"
+                    )
                     continue
                 if isinstance(record, dict):
                     session_id = record.get("session_id")
                     if session_id:
                         seen.add(str(session_id))
-    except Exception:
+    except Exception as exc:
+        paths.safe_log(
+            logger,
+            logging.WARNING,
+            "MASTER_LOG read failed; returning an empty seen-session set because it could not be read, not because nothing was seen: %s",
+            exc,
+        )
         return set()
     return seen
 
@@ -284,10 +304,23 @@ def _read_jsonl_dict_rows(path: Path) -> list[dict[str, Any]]:
                 try:
                     row = json.loads(line)
                 except json.JSONDecodeError:
+                    paths.safe_log(
+                        logger,
+                        logging.DEBUG,
+                        "Malformed line in %s was skipped",
+                        path.name,
+                    )
                     continue
                 if isinstance(row, dict):
                     rows.append(row)
-    except Exception:
+    except Exception as exc:
+        paths.safe_log(
+            logger,
+            logging.WARNING,
+            "JSONL read failed for %s; returning zero rows because it is unreadable, not empty: %s",
+            path.name,
+            exc,
+        )
         return []
     return rows
 
@@ -307,6 +340,12 @@ def summarize_calls(
             try:
                 duration_value = float(duration_ms or 0)
             except (TypeError, ValueError):
+                paths.safe_log(
+                    logger,
+                    logging.DEBUG,
+                    "Non-numeric duration_ms %r was coerced to 0.0",
+                    duration_ms,
+                )
                 duration_value = 0.0
             bucket = buckets.setdefault(
                 lane,
@@ -330,7 +369,13 @@ def summarize_calls(
                 "avg_ms": (total_ms / calls) if calls else 0.0,
             }
         return summary
-    except Exception:
+    except Exception as exc:
+        paths.safe_log(
+            logger,
+            logging.WARNING,
+            "Call summary could not be built; returning an empty summary: %s",
+            exc,
+        )
         return {}
 
 
@@ -411,7 +456,13 @@ def run() -> dict[str, Any]:
             _append_row(session_to_row(session_dict, session_file))
             seen.add(session_id_str)
             added += 1
-        except Exception:
+        except Exception as exc:
+            paths.safe_log(
+                logger,
+                logging.WARNING,
+                "Session telemetry row failed: %s",
+                exc,
+            )
             errors += 1
         scanned += 1
 

@@ -416,7 +416,7 @@ def discover_gemini_pro_model(
         )
         if exc is not None:
             failures.append(
-                f"{model_id}: {type(exc).__name__}: {_trim_output(str(exc))} "
+                f"{model_id}: {type(exc).__name__}: {trim_output(str(exc))} "
                 f"after {attempts_used} attempt(s)"
             )
             continue
@@ -431,7 +431,7 @@ def discover_gemini_pro_model(
             break
         failures.append(
             f"{model_id}: exit={completed.returncode} after {attempts_used} attempt(s); "
-            f"output={_trim_output(combined_output)}"
+            f"output={trim_output(combined_output)}"
         )
 
     reason = "; ".join(failures) or "no Gemini 3.7 Flash model candidates were checked"
@@ -1252,7 +1252,7 @@ def resolve_agy_model(
 _is_unattended_run = is_unattended_research_run
 
 
-def _trim_output(text: str, limit: int = 240) -> str:
+def trim_output(text: str, limit: int = 240) -> str:
     compact = " ".join(text.split())
     if len(compact) <= limit:
         return compact
@@ -1315,7 +1315,7 @@ def _run_agy_gemini_with_backoff(
                     model_id,
                     attempt_number,
                     total_attempts,
-                    _trim_output(exc_text),
+                    trim_output(exc_text),
                 )
                 sleeper(backoff_seconds[attempt_number - 1])
                 continue
@@ -1334,7 +1334,7 @@ def _run_agy_gemini_with_backoff(
                 model_id,
                 attempt_number,
                 total_attempts,
-                _trim_output(combined_output),
+                trim_output(combined_output),
             )
             sleeper(backoff_seconds[attempt_number - 1])
             continue

@@ -24,6 +24,7 @@ from research_engine.research_cli import (
     TIER_1_AUTHORITY_MIN,
     clamp_unit_interval,
     graduated_answer_thresholds,
+    slugify_question,
 )
 from research_engine.router import source_authority_score
 from research_engine.router import load_router
@@ -147,7 +148,7 @@ def ground(query: str, *, topic_slug: str | None = None) -> GroundResult:
             backends_used=["searxng"],
         )
 
-    topic = topic_slug or _slugify_query(cleaned_query)
+    topic = topic_slug or slugify_question(cleaned_query, fallback="grounding")
     backends_used = ["searxng"]
     search_payload = logged_search.searxng(
         _search_query(cleaned_query),
@@ -227,11 +228,6 @@ def ground(query: str, *, topic_slug: str | None = None) -> GroundResult:
         sources=public_sources,
         backends_used=backends_used,
     )
-
-
-def _slugify_query(query: str) -> str:
-    slug = re.sub(r"[^a-z0-9]+", "-", query.lower()).strip("-")
-    return slug[:80].strip("-") or "grounding"
 
 
 def _payload_results(payload: dict | None) -> list[dict]:
@@ -345,7 +341,13 @@ def _run_backend_lookup(backend: str, query: str) -> BackendLookupResult:
         else:
             return BackendLookupResult(answer="", urls=[])
     except Exception:
-        logger.exception("Grounding backend lookup failed for backend=%s", backend)
+        paths.safe_log(
+            logger,
+            logging.ERROR,
+            "Grounding backend lookup failed for backend=%s",
+            backend,
+            exc_info=True,
+        )
         return BackendLookupResult(answer="", urls=[])
 
     answer, urls = _parse_backend_output(output)
@@ -516,6 +518,12 @@ def _source_record_from_extract(
     try:
         method = ExtractionMethod(method_value)
     except ValueError:
+        paths.safe_log(
+            logger,
+            logging.WARNING,
+            "Unrecognised extraction_method %r; labelling record CURL instead",
+            method_value,
+        )
         method = ExtractionMethod.CURL
     url = str(extracted.get("url") or "")
     domain = str(extracted.get("domain") or urlparse(url).netloc or "unknown")
@@ -605,8 +613,11 @@ def _grounding_status_from_confidence(confidence: float) -> GroundStatus:
     try:
         thresholds = graduated_answer_thresholds(load_router())
     except Exception:
-        logger.exception(
-            "Grounding could not load router thresholds; failing down to not_found"
+        paths.safe_log(
+            logger,
+            logging.ERROR,
+            "Grounding could not load router thresholds; failing down to not_found",
+            exc_info=True,
         )
         return "not_found"
     if thresholds is None:
@@ -628,7 +639,12 @@ def _llm_synthesis(
     try:
         from research_engine import llm_call
     except Exception:
-        logger.exception("Grounding LLM synthesis unavailable because llm_call import failed")
+        paths.safe_log(
+            logger,
+            logging.ERROR,
+            "Grounding LLM synthesis unavailable because llm_call import failed",
+            exc_info=True,
+        )
         return None
 
     source_blocks = []
@@ -657,6 +673,9 @@ def _llm_synthesis(
     try:
         raw, backend = llm_call.llm_complete(prompt, timeout=LOOKUP_TIMEOUT_SECONDS)
     except Exception as exc:
+        paths.safe_log(
+            logger, logging.WARNING, "Grounding LLM synthesis failed: %s", exc
+        )
         _append_telemetry("grounding_synth", "error", prompt, str(exc))
         return None
     _append_telemetry("grounding_synth", backend, prompt, raw)
@@ -688,7 +707,13 @@ def _append_telemetry(
         with TELEMETRY_PATH.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, sort_keys=True) + "\n")
     except Exception:
-        logger.exception("Grounding telemetry append failed for kind=%s", kind)
+        paths.safe_log(
+            logger,
+            logging.ERROR,
+            "Grounding telemetry append failed for kind=%s",
+            kind,
+            exc_info=True,
+        )
         return
 
 
@@ -717,12 +742,24 @@ def _parse_llm_json(raw: str) -> tuple[GroundStatus, str, float] | None:
         try:
             payload = json.loads(candidate)
         except json.JSONDecodeError:
+            paths.safe_log(
+                logger,
+                logging.DEBUG,
+                "Candidate JSON block failed to parse; trying the next candidate",
+            )
             continue
         status = payload.get("status")
         answer = " ".join(str(payload.get("answer") or "").split()).strip()
         try:
             confidence = float(payload.get("confidence", 0.0))
         except (TypeError, ValueError):
+            invalid_confidence = str(payload.get("confidence"))[:120]
+            paths.safe_log(
+                logger,
+                logging.WARNING,
+                "Model confidence %r was not measured as a numeric value; flooring to 0.0",
+                invalid_confidence,
+            )
             confidence = 0.0
         if status not in {"grounded", "partial", "not_found"}:
             continue

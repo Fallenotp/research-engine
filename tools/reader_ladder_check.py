@@ -7,8 +7,6 @@ import argparse
 import ast
 import importlib
 import json
-import os
-import re
 import shutil
 import socket
 from collections import Counter
@@ -24,6 +22,7 @@ from research_engine import extractor
 from research_engine import paths
 from research_engine.fetch_proxy import FIRECRAWL_ENV_VARS
 from research_engine.schema import ExtractionMethod
+from research_engine.tools.lane_health_check import load_env_map, parse_env_file as parse_env_file
 
 
 ROOT = paths.PROJECT_DIR
@@ -48,42 +47,6 @@ class RungSpec:
     helper: str
     line: int
     guards: tuple[str, ...]
-
-
-def parse_env_file(path: Path) -> dict[str, str]:
-    """Read dotenv-style assignments without mutating os.environ."""
-    values: dict[str, str] = {}
-    if not path.is_file():
-        return values
-
-    with path.open(encoding="utf-8") as handle:
-        for raw_line in handle:
-            line = raw_line.strip()
-            if not line or line.startswith("#"):
-                continue
-            if line.startswith("export "):
-                line = line[7:].lstrip()
-            if "=" not in line:
-                continue
-            name, value = line.split("=", 1)
-            name = name.strip()
-            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
-                continue
-            value = value.strip()
-            if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-                value = value[1:-1]
-            values.setdefault(name, value)
-    return values
-
-
-def load_env_map() -> dict[str, str]:
-    """Load first-file-wins dotenv values, then overlay the live environment."""
-    values: dict[str, str] = {}
-    for path in ENV_PATHS:
-        for name, value in parse_env_file(path).items():
-            values.setdefault(name, value)
-    values.update(os.environ)
-    return values
 
 
 def extractor_source_text(path: Path = EXTRACTOR_PATH) -> str:

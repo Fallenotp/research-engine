@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import logging
 import os
 import sys
 import threading
@@ -14,10 +15,12 @@ from urllib.parse import parse_qs, urlparse
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from research_engine import l3_guard
+from research_engine import l3_guard, paths
 from research_engine.extractor import extract_clean_text
 from research_engine.schema import ExtractionMethod
 from research_engine.schema import SourceTier
+
+logger = logging.getLogger(__name__)
 
 CACHE_TTL_SECONDS = 6 * 60 * 60
 CACHE_MAX_ENTRIES = 500
@@ -119,8 +122,13 @@ def _extract(url: str, max_layer: int, ask: str | None) -> tuple[int, dict]:
     started_at = time.perf_counter()
     try:
         _touch_last_request()
-    except Exception:
-        pass
+    except Exception as exc:
+        paths.safe_log(
+            logger,
+            logging.WARNING,
+            "last-request timestamp could not be touched; extraction continues: %s",
+            exc,
+        )
     cold_start = _next_cold_start()
     if not ask:
         cached = _read_cache(url)
@@ -186,15 +194,27 @@ def _extract(url: str, max_layer: int, ask: str | None) -> tuple[int, dict]:
             try:
                 _L3_LOCK.parent.mkdir(parents=True, exist_ok=True)
                 _L3_LOCK.write_text(str(time.time()), encoding="utf-8")
-            except Exception:
-                pass
+            except Exception as exc:
+                paths.safe_log(
+                    logger,
+                    logging.WARNING,
+                    "L3 cross-process lock file could not be written; "
+                    "in-process lock remains held: %s",
+                    exc,
+                )
             record = run_extract()
         finally:
             try:
                 _L3_LOCK.unlink(missing_ok=True)
-            except Exception:
-                pass
-            _extract_lock.release()
+            except Exception as exc:
+                paths.safe_log(
+                    logger,
+                    logging.WARNING,
+                    "L3 lock file could not be removed; stale lock may remain: %s",
+                    exc,
+                )
+            finally:
+                _extract_lock.release()
     else:
         record = run_extract()
 

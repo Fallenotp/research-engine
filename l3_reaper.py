@@ -1,6 +1,7 @@
 # Install: launchctl load ~/Library/LaunchAgents/com.cleo.webread-l3-reaper.plist
 from __future__ import annotations
 
+import logging
 import os
 import shlex
 import signal
@@ -12,7 +13,9 @@ from pathlib import Path
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from research_engine import l3_guard
+from research_engine import l3_guard, paths
+
+logger = logging.getLogger(__name__)
 
 WEBREAD_L3_IDLE_S = float(os.environ.get("WEBREAD_L3_IDLE_S", "300"))
 STALE_LOCK_S = float(os.environ.get("WEBREAD_L3_STALE_LOCK_S", "600"))
@@ -42,8 +45,14 @@ def _run_stop_command(env_name: str, default: str) -> None:
             text=True,
             timeout=10,
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        paths.safe_log(
+            logger,
+            logging.WARNING,
+            "reaper stop command %s failed; the reap continues and is still recorded as done: %s",
+            env_name,
+            exc,
+        )
 
 
 def _mlx_port() -> int | None:
@@ -92,8 +101,13 @@ def _write_last_reap() -> None:
     try:
         l3_guard.CACHE_DIR.mkdir(parents=True, exist_ok=True)
         (l3_guard.CACHE_DIR / "last_reap").write_text(str(time.time()), encoding="utf-8")
-    except OSError:
-        pass
+    except OSError as exc:
+        paths.safe_log(
+            logger,
+            logging.WARNING,
+            "last-reap timestamp could not be written; next run may reap early: %s",
+            exc,
+        )
 
 
 def reap(now: float | None = None) -> bool:

@@ -45,6 +45,7 @@ from research_engine.dispatcher import (
     is_unattended_research_run as dispatcher_is_unattended_research_run,
     reserve_gemini_daily_budget,
     resolve_agy_model,
+    trim_output,
 )
 from research_engine.extractor import extract_clean_text
 from research_engine.router import load_router, source_authority_score
@@ -1031,9 +1032,9 @@ def run_multi_territory_research(
     )
 
 
-def slugify_question(question: str) -> str:
+def slugify_question(question: str, *, fallback: str = "search") -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", question.lower()).strip("-")
-    return slug[:80].strip("-") or "search"
+    return slug[:80].strip("-") or fallback
 
 
 def choose_provider(lanes: list[str] | tuple[str, ...]) -> str:
@@ -1231,7 +1232,7 @@ def run_final_synthesis(
             )
         except Exception as exc:  # noqa: BLE001 - final synthesis failure must degrade through the chain
             label = backend if model is None else f"{backend}({model})"
-            failures.append(f"{label}: {type(exc).__name__}: {trim_for_log(str(exc))}")
+            failures.append(f"{label}: {type(exc).__name__}: {trim_output(str(exc))}")
             continue
         return GeminiInterlockAttempt(
             run_type=run_type,
@@ -1279,7 +1280,7 @@ def run_grok_x_search(
     try:
         output_text = execute_grok_worker_spec(spec)
     except Exception as exc:  # noqa: BLE001 - X-search worker failure should not kill search
-        error = f"{type(exc).__name__}: {trim_for_log(str(exc))}"
+        error = f"{type(exc).__name__}: {trim_output(str(exc))}"
     return output_text.strip(), grok_x_query_call(
         question,
         spec=spec,
@@ -1392,15 +1393,15 @@ def _execute_agy_worker_spec(spec: WorkerSpec, *, router) -> tuple[str, str]:
     if completed.returncode != 0:
         raise GeminiProScoutError(
             f"agy Gemini failed with exit={completed.returncode}: "
-            f"{trim_for_log(combined_output) or 'no output'}"
+            f"{trim_output(combined_output) or 'no output'}"
         )
     if stderr_text:
-        logger.warning("agy Gemini worker stderr: %s", trim_for_log(stderr_text))
+        logger.warning("agy Gemini worker stderr: %s", trim_output(stderr_text))
     if not stdout_text:
         raise GeminiProScoutError("agy Gemini returned empty output")
     if _looks_like_worker_failure(stdout_text):
         raise GeminiProScoutError(
-            f"agy Gemini returned failure stub: {trim_for_log(stdout_text)}"
+            f"agy Gemini returned failure stub: {trim_output(stdout_text)}"
         )
     stdout_text = apply_anti_hallucination_gate(
         stdout_text,
@@ -1449,7 +1450,7 @@ def execute_codex_worker_spec(spec: WorkerSpec) -> str:
     if completed.returncode != 0:
         raise RuntimeError(
             f"Codex worker failed with exit={completed.returncode}: "
-            f"{trim_for_log(combined_output) or 'no output'}"
+            f"{trim_output(combined_output) or 'no output'}"
         )
     if not combined_output:
         raise RuntimeError("Codex worker returned empty output")
@@ -1490,7 +1491,7 @@ def execute_mistral_worker_spec(spec: WorkerSpec) -> str:
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
         raise RuntimeError(
-            f"Mistral free API failed with http={exc.code}: {trim_for_log(body)}"
+            f"Mistral free API failed with http={exc.code}: {trim_output(body)}"
         ) from exc
     except urllib.error.URLError as exc:
         raise RuntimeError(f"Mistral free API unavailable: {exc.reason}") from exc
@@ -1607,7 +1608,7 @@ def execute_grok_worker_spec(spec: WorkerSpec) -> str:
     if completed.returncode != 0:
         raise RuntimeError(
             f"Hermes Grok failed with exit={completed.returncode}: "
-            f"{trim_for_log(combined_output) or 'no output'}"
+            f"{trim_output(combined_output) or 'no output'}"
         )
     if not combined_output:
         raise RuntimeError("Hermes Grok returned empty output")
@@ -1666,15 +1667,8 @@ def failed_gemini_attempt(
 ) -> GeminiInterlockAttempt:
     return GeminiInterlockAttempt(
         run_type=run_type,
-        failure_reason=f"{type(exc).__name__}: {trim_for_log(str(exc))}",
+        failure_reason=f"{type(exc).__name__}: {trim_output(str(exc))}",
     )
-
-
-def trim_for_log(text: str, limit: int = 240) -> str:
-    compact = " ".join(text.split())
-    if len(compact) <= limit:
-        return compact
-    return f"{compact[: limit - 3].rstrip()}..."
 
 
 def apply_anti_hallucination_gate(text: str, *, label: str) -> str:
@@ -2486,7 +2480,7 @@ def execute_territory(
         try:
             worker_output = execute_grok_worker_spec(spec)
         except Exception as exc:  # noqa: BLE001 - one worker failure should not kill the run
-            worker_error = f"{type(exc).__name__}: {trim_for_log(str(exc))}"
+            worker_error = f"{type(exc).__name__}: {trim_output(str(exc))}"
         queries.append(
             cli_worker_query_call(
                 territory.description,
@@ -2504,7 +2498,7 @@ def execute_territory(
         try:
             worker_output = execute_gemini_worker_spec(spec, router=router)
         except Exception as exc:  # noqa: BLE001 - one worker failure should not kill the run
-            worker_error = f"{type(exc).__name__}: {trim_for_log(str(exc))}"
+            worker_error = f"{type(exc).__name__}: {trim_output(str(exc))}"
         queries.append(
             cli_worker_query_call(
                 territory.description,
@@ -2522,7 +2516,7 @@ def execute_territory(
         try:
             worker_output = execute_mistral_worker_spec(spec)
         except Exception as exc:  # noqa: BLE001 - one worker failure should not kill the run
-            worker_error = f"{type(exc).__name__}: {trim_for_log(str(exc))}"
+            worker_error = f"{type(exc).__name__}: {trim_output(str(exc))}"
         queries.append(
             cli_worker_query_call(
                 territory.description,
@@ -2540,7 +2534,7 @@ def execute_territory(
         try:
             worker_output = execute_codex_worker_spec(spec)
         except Exception as exc:  # noqa: BLE001 - one worker failure should not kill the run
-            worker_error = f"{type(exc).__name__}: {trim_for_log(str(exc))}"
+            worker_error = f"{type(exc).__name__}: {trim_output(str(exc))}"
         queries.append(
             cli_worker_query_call(
                 territory.description,

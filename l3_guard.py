@@ -1,18 +1,27 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 from contextlib import contextmanager
 from pathlib import Path
+
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from research_engine import paths
 
 try:
     import fcntl
 except ImportError:  # pragma: no cover
     fcntl = None
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_CACHE_DIR = Path.home() / ".cache" / "webread"
 CACHE_DIR = Path(os.environ.get("WEBREAD_CACHE_DIR", str(DEFAULT_CACHE_DIR))).expanduser()
@@ -81,9 +90,15 @@ def _breaker_update_lock():
         if lock_handle is not None:
             try:
                 fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
-            except OSError:
-                pass
-            lock_handle.close()
+            except OSError as exc:
+                paths.safe_log(
+                    logger,
+                    logging.DEBUG,
+                    "advisory lock could not be released; handle is still closed afterwards: %s",
+                    exc,
+                )
+            finally:
+                lock_handle.close()
 
 
 def _breaker_open(now: float | None = None) -> bool:

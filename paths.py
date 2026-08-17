@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
+import traceback
+from collections.abc import Mapping
 from pathlib import Path
 
 PACKAGE_DIR = Path(__file__).resolve().parent
@@ -40,6 +43,114 @@ USER_AGENT_ENV = "RESEARCH_ENGINE_USER_AGENT"
 _DATA_DIR_DEFAULT = Path.home() / ".research_engine"
 _DEFAULT_USER_AGENT = "research-engine/1.0"
 _MISSING_CONTACT_INFO_LOGGED = False
+
+_URL_OR_ABSOLUTE_PATH_RE = re.compile(
+    r"""
+    (?P<double_url>
+        "(?P<double_scheme>[A-Za-z][A-Za-z0-9+.-]*)://
+        (?P<double_url_body>[^\s"]*)"
+    )
+    |
+    (?P<single_url>
+        '(?P<single_scheme>[A-Za-z][A-Za-z0-9+.-]*)://
+        (?P<single_url_body>[^\s']*)'
+    )
+    |
+    (?P<bare_url>
+        (?P<bare_scheme>[A-Za-z][A-Za-z0-9+.-]*)://
+        (?P<bare_url_body>[^\s'\"]*)
+    )
+    |
+    (?<![\w:/])
+    (?P<quote>['"])
+    (?P<quoted_path>/(?:[^/'"\r\n]+/)+[^/'"\r\n]+)
+    (?P=quote)
+    |
+    (?<![\w:/])
+    (?P<bare_path>/(?:[^\s/'"]+/)+[^\s/'"]+)
+    """,
+    re.VERBOSE,
+)
+
+
+def redact_paths(text: str) -> str:
+    """Replace absolute filesystem paths with '<path>/<basename>'.
+
+    Logs from this package are public-facing. The basename is kept because it is what
+    makes a failure diagnosable; the directories are what identify the machine and its
+    user. file:// URLs keep the scheme and host: file://host/Users/me/x becomes
+    file://host/<path>/x. URLs using every other scheme are returned byte-identical.
+
+    Known limitations (recorded, not fixed): UNC paths such as
+    //nas/Users/alice/secret and percent-encoded paths such as
+    %2FUsers%2Falice%2Fsecret are not redacted. Empty segments such as
+    /Users//alice//double//slash are not preserved. Windows drive paths in either
+    C:/Users/alice/secret or C:\\Users\\alice\\secret form are not redacted because
+    this package is POSIX-only. Colon-separated path lists such as
+    PYTHONPATH=/a/b:/c/d collapse to a single redaction, losing detail while removing
+    identity. Keeping the basename is deliberate, so /Users/alice alone becomes
+    <path>/alice even though that basename is the username.
+    """
+
+    def replace(match: re.Match[str]) -> str:
+        for prefix in ("double", "single", "bare"):
+            scheme = match.group(f"{prefix}_scheme")
+            if scheme is None:
+                continue
+            if scheme.lower() != "file":
+                return match.group(0)
+
+            body = match.group(f"{prefix}_url_body")
+            host, separator, path = body.partition("/")
+            if body.startswith("/"):
+                host = ""
+                path = body
+            elif not separator:
+                return match.group(0)
+            basename = path.rsplit("/", 1)[-1]
+            redacted = f"file://{host + '/' if host else ''}<path>/{basename}"
+            quote = '"' if prefix == "double" else "'" if prefix == "single" else ""
+            return f"{quote}{redacted}{quote}"
+
+        path = match.group("quoted_path") or match.group("bare_path")
+        redacted = f"<path>/{path.rsplit('/', 1)[-1]}"
+        quote = match.group("quote") or ""
+        return f"{quote}{redacted}{quote}"
+
+    return _URL_OR_ABSOLUTE_PATH_RE.sub(replace, text)
+
+
+def safe_error(exc: BaseException) -> str:
+    return redact_paths(str(exc))
+
+
+def safe_log(
+    logger: "logging.Logger",
+    level: int,
+    msg: str,
+    *args: object,
+    exc_info: bool = False,
+) -> None:
+    """Log without ever propagating.
+
+    A diagnostic must never change what the caller does. These call sites replaced
+    `except Exception: pass`, which always continued; a raising handler or filter must
+    not turn that into an abort.
+    Exceptions are redacted automatically so callers never have to remember.
+    """
+    try:
+        format_args: object = (
+            args[0]
+            if len(args) == 1 and isinstance(args[0], Mapping) and args[0]
+            else args
+        )
+        rendered_msg = msg % format_args if args else msg
+        safe_msg = redact_paths(rendered_msg)
+        if exc_info:
+            safe_msg = f"{safe_msg}\n{redact_paths(traceback.format_exc()).rstrip()}"
+        logger.log(level, safe_msg)
+    except Exception:  # noqa: BLE001 - a logging failure must never reach the caller
+        pass
 
 
 def package_path(*parts: str) -> Path:
