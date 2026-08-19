@@ -73,6 +73,53 @@ def test_redact_paths_file_url_redacts_absolute_keeps_scheme() -> None:
     assert "/Users/" not in paths.redact_paths("file:///Users/x/y")
 
 
+def test_redact_paths_file_url_with_single_slash_redacts_absolute_path() -> None:
+    assert paths.redact_paths("file:/Users/cleo/secret/x") == "file:/<path>/x"
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("failed:/Users/cleo/secret/x", "failed:<path>/x"),
+        ("source:/Users/cleo/a/b", "source:<path>/b"),
+        ("cache_dir:/Users/cleo/.cache/x", "cache_dir:<path>/x"),
+        ("C:/Users/cleo/secret/x", "C:<path>/x"),
+    ],
+)
+def test_redact_paths_handles_colon_adjacent_paths(
+    text: str, expected: str
+) -> None:
+    assert paths.redact_paths(text) == expected
+
+
+def test_redact_paths_redacts_single_letter_colon_adjacent_paths() -> None:
+    assert "/Users/" not in paths.redact_paths("y:/Users/cleo/secret/output.csv")
+    assert "/Users/" not in paths.redact_paths("n:/Users/cleo/data")
+    assert "/Users/" not in paths.redact_paths("x=a:/Users/cleo/secret")
+    assert "/Users/" not in paths.redact_paths("C:/Users/cleo/secret/x")
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "file:/Users/cleo/secret/x",
+        "file://localhost/Users/x/y",
+        "file:///Users/cleo/secret/x",
+        "file:////Users/x/y",
+        "failed:/Users/cleo/secret/x",
+        "/Users/cleo/secret/x",
+        "y:/Users/cleo/secret/output.csv",
+        "n:/Users/cleo/data",
+        "x=a:/Users/cleo/secret",
+        "C:/Users/cleo/secret/x",
+    ],
+)
+def test_redact_paths_is_idempotent(text: str) -> None:
+    once = paths.redact_paths(text)
+
+    assert paths.redact_paths(once) == once
+
+
 def test_redact_paths_preserves_non_file_urls_byte_identical() -> None:
     assert paths.redact_paths("https://example.com?q=/Users/alice") == (
         "https://example.com?q=/Users/alice"

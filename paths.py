@@ -46,6 +46,21 @@ _MISSING_CONTACT_INFO_LOGGED = False
 
 _URL_OR_ABSOLUTE_PATH_RE = re.compile(
     r"""
+    (?P<double_file_single>
+        "(?P<double_file_single_scheme>file):/(?!/)
+        (?P<double_file_single_url_body>[^\s"]*)"
+    )
+    |
+    (?P<single_file_single>
+        '(?P<single_file_single_scheme>file):/(?!/)
+        (?P<single_file_single_url_body>[^\s']*)'
+    )
+    |
+    (?P<bare_file_single>
+        (?P<bare_file_single_scheme>file):/(?!/)
+        (?P<bare_file_single_url_body>[^\s'\"]*)
+    )
+    |
     (?P<double_url>
         "(?P<double_scheme>[A-Za-z][A-Za-z0-9+.-]*)://
         (?P<double_url_body>[^\s"]*)"
@@ -61,12 +76,12 @@ _URL_OR_ABSOLUTE_PATH_RE = re.compile(
         (?P<bare_url_body>[^\s'\"]*)
     )
     |
-    (?<![\w:/])
+    (?<![\w/])
     (?P<quote>['"])
     (?P<quoted_path>/(?:[^/'"\r\n]+/)+[^/'"\r\n]+)
     (?P=quote)
     |
-    (?<![\w:/])
+    (?<![\w/])
     (?P<bare_path>/(?:[^\s/'"]+/)+[^\s/'"]+)
     """,
     re.VERBOSE,
@@ -78,22 +93,31 @@ def redact_paths(text: str) -> str:
 
     Logs from this package are public-facing. The basename is kept because it is what
     makes a failure diagnosable; the directories are what identify the machine and its
-    user. file:// URLs keep the scheme and host: file://host/Users/me/x becomes
-    file://host/<path>/x. URLs using every other scheme are returned byte-identical.
+    user. file: URLs keep the scheme, slash form, and host:
+    file://host/Users/me/x becomes file://host/<path>/x, while
+    file:/Users/me/x becomes file:/<path>/x. URLs using every other scheme are
+    returned byte-identical.
 
     Known limitations (recorded, not fixed): UNC paths such as
     //nas/Users/alice/secret and percent-encoded paths such as
     %2FUsers%2Falice%2Fsecret are not redacted. Empty segments such as
-    /Users//alice//double//slash are not preserved. Windows drive paths in either
-    C:/Users/alice/secret or C:\\Users\\alice\\secret form are not redacted because
-    this package is POSIX-only. Colon-separated path lists such as
+    /Users//alice//double//slash are not preserved. Windows drive paths using
+    backslashes, such as C:\\Users\\alice\\secret, are not redacted because this
+    package is POSIX-only. Colon-separated path lists such as
     PYTHONPATH=/a/b:/c/d collapse to a single redaction, losing detail while removing
     identity. Keeping the basename is deliberate, so /Users/alice alone becomes
     <path>/alice even though that basename is the username.
     """
 
     def replace(match: re.Match[str]) -> str:
-        for prefix in ("double", "single", "bare"):
+        for prefix, separator in (
+            ("double_file_single", "/"),
+            ("single_file_single", "/"),
+            ("bare_file_single", "/"),
+            ("double", "//"),
+            ("single", "//"),
+            ("bare", "//"),
+        ):
             scheme = match.group(f"{prefix}_scheme")
             if scheme is None:
                 continue
@@ -101,15 +125,24 @@ def redact_paths(text: str) -> str:
                 return match.group(0)
 
             body = match.group(f"{prefix}_url_body")
-            host, separator, path = body.partition("/")
-            if body.startswith("/"):
+            if body == "<path>" or body.startswith("<path>/"):
+                return match.group(0)
+            host, path_separator, path = body.partition("/")
+            if separator == "/":
+                host = ""
+                path = f"/{body}"
+            elif body.startswith("/"):
                 host = ""
                 path = body
-            elif not separator:
+            elif not path_separator:
                 return match.group(0)
             basename = path.rsplit("/", 1)[-1]
-            redacted = f"file://{host + '/' if host else ''}<path>/{basename}"
-            quote = '"' if prefix == "double" else "'" if prefix == "single" else ""
+            redacted = (
+                f"file:{separator}{host + '/' if host else ''}<path>/{basename}"
+            )
+            quote = '"' if prefix.startswith("double") else (
+                "'" if prefix.startswith("single") else ""
+            )
             return f"{quote}{redacted}{quote}"
 
         path = match.group("quoted_path") or match.group("bare_path")
