@@ -37,9 +37,6 @@ GROUNDING_PROTOCOL = "/grounding"
 DEFAULT_GROK_BIN = paths.home_path("bin", "grok")
 DEFAULT_GROK_MODEL = "grok-4.5"
 AGY_SKIP_PERMISSIONS_FLAG = "--dangerously-skip-permissions"
-TELEMETRY_PATH = paths.optional_path(paths.NO_BLUFF_TELEMETRY_ENV) or paths.telemetry_path(
-    "no-bluff-telemetry.jsonl"
-)
 MAX_SEARCH_RESULTS = 5
 MAX_SOURCE_URLS = 3
 SOURCE_EXCERPT_CHARS = 2500
@@ -91,6 +88,22 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 
+def telemetry_path() -> Path:
+    """Return the current grounding telemetry location."""
+    legacy_path = globals().get("TELEMETRY_PATH")
+    if legacy_path is not None:
+        return Path(legacy_path)
+    return paths.optional_path(paths.NO_BLUFF_TELEMETRY_ENV) or paths.telemetry_path(
+        "no-bluff-telemetry.jsonl"
+    )
+
+
+def __getattr__(name: str) -> Path:
+    if name == "TELEMETRY_PATH":
+        return telemetry_path()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 @dataclass(frozen=True, slots=True)
 class GroundSource:
     url: str
@@ -102,7 +115,7 @@ class GroundSource:
 class GroundResult:
     status: GroundStatus
     answer: str
-    confidence: float
+    confidence: float | None
     sources: list[GroundSource]
     backends_used: list[str]
 
@@ -567,7 +580,7 @@ def _synthesize_from_sources(
     *,
     search_results: list[dict],
     backend_answers: list[str],
-) -> tuple[GroundStatus, str, float]:
+) -> tuple[GroundStatus, str, float | None]:
     if not sources:
         return "not_found", "", GROUNDING_NOT_FOUND_CONFIDENCE
 
@@ -635,7 +648,7 @@ def _grounding_status_from_confidence(confidence: float) -> GroundStatus:
 def _llm_synthesis(
     query: str,
     sources: list[_VerifiedSource],
-) -> tuple[GroundStatus, str, float] | None:
+) -> tuple[GroundStatus, str, float | None] | None:
     try:
         from research_engine import llm_call
     except Exception:
@@ -703,8 +716,9 @@ def _append_telemetry(
         "session_id": session_id or _telemetry_session_id(),
     }
     try:
-        TELEMETRY_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with TELEMETRY_PATH.open("a", encoding="utf-8") as handle:
+        output_path = telemetry_path()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with output_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, sort_keys=True) + "\n")
     except Exception:
         paths.safe_log(
@@ -729,7 +743,7 @@ def _telemetry_session_id() -> str:
     return ""
 
 
-def _parse_llm_json(raw: str) -> tuple[GroundStatus, str, float] | None:
+def _parse_llm_json(raw: str) -> tuple[GroundStatus, str, float | None] | None:
     candidates = [raw.strip()]
     match = JSON_RE.search(raw)
     if match:
@@ -751,19 +765,24 @@ def _parse_llm_json(raw: str) -> tuple[GroundStatus, str, float] | None:
         status = payload.get("status")
         answer = " ".join(str(payload.get("answer") or "").split()).strip()
         try:
-            confidence = float(payload.get("confidence", 0.0))
+            confidence = (
+                float(payload["confidence"])
+                if payload.get("confidence") is not None
+                else None
+            )
         except (TypeError, ValueError):
             invalid_confidence = str(payload.get("confidence"))[:120]
             paths.safe_log(
                 logger,
                 logging.WARNING,
-                "Model confidence %r was not measured as a numeric value; flooring to 0.0",
+                "Model confidence %r was not measured as a numeric value",
                 invalid_confidence,
             )
-            confidence = 0.0
+            confidence = None
         if status not in {"grounded", "partial", "not_found"}:
             continue
-        confidence = max(0.0, min(1.0, confidence))
+        if confidence is not None:
+            confidence = max(0.0, min(1.0, confidence))
         if status == "not_found":
             return "not_found", "", 0.0
         if not answer:

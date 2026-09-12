@@ -39,7 +39,8 @@ class VerbatimResult:
     checked_count: int
     supported_count: int
     unsupported_count: int
-    pass_rate: float
+    applicable: bool
+    pass_rate: float | None
     unsupported: list[UnsupportedToken] = field(default_factory=list)
     scope_note: str = HONEST_SCOPE_NOTE
 
@@ -108,12 +109,25 @@ def check_verbatim(synthesis_text: str, source_texts: list[str]) -> VerbatimResu
 
     comparable_sources = [_normalize_text(text) for text in source_texts if text]
     tokens = _extract_tokens(synthesis_text)
+    applicable = bool(tokens) and bool(comparable_sources)
+    if not applicable:
+        return VerbatimResult(0, 0, 0, False, None)
+
+    source_numeric_tokens = set().union(
+        *(_source_numeric_tokens(text) for text in source_texts if text)
+    )
     unsupported: list[UnsupportedToken] = []
     supported_count = 0
 
     for token_type, token, context in tokens:
-        comparable = _normalize_text(token)
-        if comparable and any(comparable in source for source in comparable_sources):
+        if token_type in {"number", "date"}:
+            supported = _normalise_numeric(token) in source_numeric_tokens
+        else:
+            comparable = _normalize_text(token)
+            supported = bool(comparable) and any(
+                comparable in source for source in comparable_sources
+            )
+        if supported:
             supported_count += 1
         else:
             unsupported.append(
@@ -131,6 +145,7 @@ def check_verbatim(synthesis_text: str, source_texts: list[str]) -> VerbatimResu
         checked_count=checked_count,
         supported_count=supported_count,
         unsupported_count=unsupported_count,
+        applicable=True,
         pass_rate=round(pass_rate, 4),
         unsupported=unsupported,
     )
@@ -170,9 +185,8 @@ def result_to_markdown(result: VerbatimResult, unavailable_sources: list[str] | 
         for source in unavailable_sources:
             lines.append(f"- {source}")
     lines.append("")
-    lines.append(
-        f"Checked {result.checked_count} token(s); pass rate {result.pass_rate:.0%}."
-    )
+    pass_rate = "not applicable" if result.pass_rate is None else f"{result.pass_rate:.0%}"
+    lines.append(f"Checked {result.checked_count} token(s); pass rate {pass_rate}.")
     return "\n".join(lines)
 
 
@@ -259,6 +273,31 @@ def _normalize_quotes(text: str) -> str:
 
 def _normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", _normalize_quotes(text)).strip().lower()
+
+
+def _normalise_numeric(token: str) -> str:
+    """Normalize comparable numeric/date forms without changing their boundaries."""
+
+    normalized = _normalize_text(token)
+    normalized = re.sub(r"[€£$\s,]", "", normalized)
+    normalized = re.sub(r"percent\b", "%", normalized)
+    normalized = re.sub(r"million\b", "m", normalized)
+    normalized = re.sub(r"billion\b", "bn", normalized)
+    normalized = re.sub(r"trillion\b", "tn", normalized)
+    normalized = re.sub(r"thousand\b", "k", normalized)
+    return normalized
+
+
+def _source_numeric_tokens(text: str) -> set[str]:
+    """Extract normalized number and date tokens from one captured source."""
+
+    tokens = {
+        _normalise_numeric(match.group(0))
+        for date_re in _DATE_RES
+        for match in date_re.finditer(text)
+    }
+    tokens.update(_normalise_numeric(match.group(0)) for match in _NUMBER_RE.finditer(text))
+    return tokens
 
 
 def _compact(text: str, limit: int) -> str:

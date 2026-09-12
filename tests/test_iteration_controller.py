@@ -31,6 +31,9 @@ from research_engine.schema import (
 )
 
 
+SESSION_TOTALS = {"total_duration_ms": 1350, "total_cost_usd_estimate": 0.0042}
+
+
 class FakeCheckerClient:
     def __init__(
         self,
@@ -119,6 +122,7 @@ def _session(
         open_questions=["What exact evidence would resolve this?"]
         if answer_kind in {AnswerKind.PARTIAL, AnswerKind.ABSTAIN}
         else [],
+        **SESSION_TOTALS,
     )
 
 
@@ -177,6 +181,7 @@ class IterationControllerTests(unittest.TestCase):
             question="What changed this morning in the merger talks?",
             final_status=FinalStatus.COMPLETE,
             answer="A grounded answer.",
+            confidence=0.9,
             sources=[strong_source_a, strong_source_b],
             evidence_chunks=[strong_chunk_a, strong_chunk_b],
             rerank_passed_count=2,
@@ -193,6 +198,7 @@ class IterationControllerTests(unittest.TestCase):
                     "skeptical_lens_notes": "ok",
                 }
             ],
+            **SESSION_TOTALS,
         )
 
         stale_date = "2026-08-10"
@@ -205,12 +211,14 @@ class IterationControllerTests(unittest.TestCase):
             question="What was announced today about the merger?",
             final_status=FinalStatus.COMPLETE,
             answer="Thin answer.",
+            confidence=0.9,
             sources=[weak_source_a, weak_source_b],
             evidence_chunks=[weak_chunk_a, weak_chunk_b],
             rerank_passed_count=1,
             rerank_failed_count=3,
             open_questions=["What did regulators say?"],
             cross_model_verifications=[],
+            **SESSION_TOTALS,
         )
 
         strong_decision = decide_next_iteration(strong_session.question, strong_session)
@@ -231,6 +239,7 @@ class IterationControllerTests(unittest.TestCase):
             question="What was announced today about the merger?",
             final_status=FinalStatus.COMPLETE,
             answer="Answer.",
+            confidence=0.9,
             sources=[stale_source],
             evidence_chunks=[stale_chunk],
             rerank_passed_count=1,
@@ -247,6 +256,7 @@ class IterationControllerTests(unittest.TestCase):
                     "skeptical_lens_notes": "ok",
                 }
             ],
+            **SESSION_TOTALS,
         )
 
         gaps = detect_gaps(session)
@@ -268,6 +278,7 @@ class IterationControllerTests(unittest.TestCase):
             question="What was announced today about the merger?",
             final_status=FinalStatus.COMPLETE,
             answer="Answer.",
+            confidence=0.9,
             sources=[fresh_offset_source],
             evidence_chunks=[fresh_offset_chunk],
             rerank_passed_count=1,
@@ -284,6 +295,7 @@ class IterationControllerTests(unittest.TestCase):
                     "skeptical_lens_notes": "ok",
                 }
             ],
+            **SESSION_TOTALS,
         )
 
         with patch("research_engine.iteration_controller.datetime") as mocked_datetime:
@@ -302,6 +314,8 @@ class IterationControllerTests(unittest.TestCase):
             question="How should a launch work?",
             final_status=FinalStatus.COMPLETE,
             answer="Draft answer.",
+            confidence=0.9,
+            **SESSION_TOTALS,
         )
 
         plan = plan_recursive_research(

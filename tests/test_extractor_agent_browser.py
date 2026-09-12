@@ -79,7 +79,9 @@ def test_agent_browser_success_returns_payload() -> None:
         ("get", "text", "body", "--json"),
         ("close",),
     ]
-    politeness.wait.assert_called_once_with("example.org")
+    politeness.fetch_gate.assert_called_once_with(
+        "https://example.org", group_url=None
+    )
     record_success.assert_called_once_with()
 
 

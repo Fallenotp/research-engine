@@ -20,7 +20,6 @@ import yaml
 
 from research_engine import extractor
 from research_engine import paths
-from research_engine.fetch_proxy import FIRECRAWL_ENV_VARS
 from research_engine.schema import ExtractionMethod
 from research_engine.tools.lane_health_check import load_env_map, parse_env_file as parse_env_file
 
@@ -39,6 +38,29 @@ APIFY_INDEXED_PREFIXES = (
     "APIFY_TOKEN_",
     "APIFY_KEY_",
 )
+# The document and fallback helpers are deliberately named at the extractor
+# boundary.  The AST scan remains authoritative when it can see an _attempt(),
+# while this small fallback keeps a refactor of call shape from hiding a rung.
+EXPLICIT_NON_WEB_RUNGS = (
+    ("docling", "_pdf_docling"),
+    ("pymupdf", "_pdf_pymupdf"),
+    ("markitdown", "_markitdown_payload"),
+    ("unstructured", "_local_text"),
+    ("gitingest", "_gitingest"),
+    ("apify", "_apify_actor_fetch"),
+    ("publisher_oa", "_extract_publisher_or_wayback"),
+    ("wayback", "_extract_publisher_or_wayback"),
+    ("agent_browser", "_agent_browser"),
+)
+WEB_RUNG_HELPERS = {
+    "cloudflare_markdown": "_cloudflare_markdown",
+    "trafilatura": "_trafilatura",
+    "firecrawl": "_firecrawl",
+    "crawl4ai": "_crawl4ai",
+    "scrapling": "_scrapling_stealth",
+    "crawlee": "_crawlee_http",
+    "jina": "_jina",
+}
 
 
 @dataclass(frozen=True)
@@ -196,6 +218,41 @@ def derive_reader_rungs(source_text: str) -> list[RungSpec]:
                     walk_helper(helper_name, guards)
 
     walk(function.body)
+    has_web_registry = any(
+        isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "WEB_RUNGS" for target in node.targets)
+        for node in module.body
+    )
+    if has_web_registry:
+        known_methods = {rung.method for rung in rungs}
+        web_rung_line = next(
+            node.lineno
+            for node in module.body
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "WEB_RUNGS" for target in node.targets)
+        )
+        for rung in extractor.WEB_RUNGS:
+            if rung.name not in known_methods:
+                rungs.append(
+                    RungSpec(
+                        method=rung.name,
+                        helper=WEB_RUNG_HELPERS.get(rung.name, f"_{rung.name}"),
+                        line=web_rung_line,
+                        guards=(),
+                    )
+                )
+        known_methods = {rung.method for rung in rungs}
+        for method, helper in EXPLICIT_NON_WEB_RUNGS:
+            if method not in known_methods:
+                implementation = functions.get(helper)
+                rungs.append(
+                    RungSpec(
+                        method=method,
+                        helper=helper,
+                        line=implementation.lineno if implementation else function.lineno,
+                        guards=(),
+                    )
+                )
     return sorted(rungs, key=lambda rung: (rung.line, rung.method, rung.helper))
 
 
@@ -249,17 +306,11 @@ def service_status(url: str) -> tuple[str, str]:
     return "OK", f"port open: {host}:{port}"
 
 
-def firecrawl_status(
-    env_map: dict[str, str],
-    router_config: dict[str, Any],
-) -> tuple[str, str]:
-    present = [name for name in FIRECRAWL_ENV_VARS if env_map.get(name)]
-    if present:
-        return "OK", f"direct keys present: {len(present)} ({', '.join(present)})"
-    firecrawl_lane = ((router_config.get("lanes") or {}).get("firecrawl_direct") or {})
-    endpoint = str(firecrawl_lane.get("endpoint") or "").strip()
-    status, detail = service_status(endpoint)
-    return status, f"direct keys absent; proxy lane {detail}"
+def firecrawl_status() -> tuple[str, str]:
+    available, reason = extractor._firecrawl_available()
+    if available:
+        return "OK", "available to the extractor ladder"
+    return "MISSING_KEY", reason
 
 
 def apify_status(env_map: dict[str, str]) -> tuple[str, str]:
@@ -327,7 +378,7 @@ def classify_rung(
             paths.executable(paths.AGENT_BROWSER_BIN_ENV, "agent-browser") or "agent-browser"
         )
     elif helper == "_firecrawl":
-        status, detail = firecrawl_status(env_map, router_config)
+        status, detail = firecrawl_status()
     elif helper == "try_publisher_fallback":
         status, detail = import_status("research_engine.publisher_fallback")
     elif helper == "try_wayback":
@@ -481,6 +532,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    for rung in extractor.WEB_RUNGS:
+        available, reason = extractor._rung_availability(rung.name)
+        detail = "available" if available else f"skipped ({reason})"
+        print(f"{rung.name}: {detail}")
+    from research_engine.wayback_fallback import keys_available
+
+    available, reason = keys_available()
+    print(f"wayback: {'available' if available else f'skipped ({reason})'}")
+    print("agent_browser (T3 only, gated)")
+    if not args.live:
+        return 0
     report = build_report(live=args.live)
     print_report(report)
     write_report(report)

@@ -15,7 +15,7 @@ from urllib.parse import parse_qs, urlparse
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from research_engine import l3_guard, paths
+from research_engine import extractor, l3_guard, paths
 from research_engine.extractor import extract_clean_text
 from research_engine.schema import ExtractionMethod
 from research_engine.schema import SourceTier
@@ -86,12 +86,13 @@ def _prune_cache() -> None:
         stale_path.unlink(missing_ok=True)
 
 
-def _write_cache(url: str, text: str, receipt: dict) -> None:
+def _write_cache(url: str, text: str, excerpt: str, receipt: dict) -> None:
     cache_dir = _cache_dir()
     cache_dir.mkdir(parents=True, exist_ok=True)
     payload = {
         "url": url,
         "text": text,
+        "excerpt": excerpt,
         "receipt": receipt,
         "cached_at": time.time(),
     }
@@ -144,7 +145,11 @@ def _extract(url: str, max_layer: int, ask: str | None) -> tuple[int, dict]:
                     "error": None,
                 }
             )
-            return 200, {"text": str(cached.get("text") or ""), "receipt": receipt}
+            return 200, {
+                "text": str(cached.get("text") or ""),
+                "excerpt": str(cached.get("excerpt") or ""),
+                "receipt": receipt,
+            }
 
     l3_requested = max_layer >= 3
     requested_tier = (
@@ -264,9 +269,10 @@ def _extract(url: str, max_layer: int, ask: str | None) -> tuple[int, dict]:
         "chars": len(text),
         "error": None,
     }
-    response_body = {"text": text, "receipt": receipt}
+    excerpt = str(record.get("excerpt") or text[:extractor.EXCERPT_CHARS])
+    response_body = {"text": text, "excerpt": excerpt, "receipt": receipt}
     if not ask:
-        _write_cache(url, text, receipt)
+        _write_cache(url, text, excerpt, receipt)
     return 200, response_body
 
 

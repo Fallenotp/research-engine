@@ -37,6 +37,11 @@ def extract_clean_text():
     assert [rung.method for rung in synthetic] == ["new_rung"]
 
 
+def test_explicit_non_web_rung_helpers_exist_in_extractor() -> None:
+    for _method, helper in checker.EXPLICIT_NON_WEB_RUNGS:
+        assert hasattr(extractor, helper), helper
+
+
 def test_default_mode_makes_no_network_call(tmp_path, monkeypatch) -> None:
     called: list[str] = []
 
@@ -82,6 +87,15 @@ def test_missing_key_reports_without_printing_secret() -> None:
     assert row["status"] == "MISSING_KEY"
     assert "sk-test-123" not in row["detail"]
     assert "APIFY_API_KEY" in row["detail"]
+
+
+def test_firecrawl_health_uses_ladder_availability_predicate(monkeypatch) -> None:
+    monkeypatch.setattr(extractor, "_firecrawl_available", lambda: (False, "ladder says no key"))
+
+    status, detail = checker.firecrawl_status()
+
+    assert status == "MISSING_KEY"
+    assert detail == "ladder says no key"
 
 
 def test_is_listicle_matches_titles_and_urls() -> None:

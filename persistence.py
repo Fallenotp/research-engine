@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Union
@@ -11,10 +12,13 @@ from uuid import UUID
 
 from pydantic import ValidationError
 
+from research_engine import evidence_gate
 from research_engine.evidence_gate import enforce_evidence_gate, write_evidence_gate_sidecar
+from research_engine.verbatim_check import VerbatimResult, check_verbatim
 
 from . import paths
 from research_engine.schema import (
+    AnswerKind,
     EvidenceChunk,
     ExtractionMethod,
     FinalStatus,
@@ -31,20 +35,34 @@ LOGGER = logging.getLogger(__name__)
 _CLAUDE_RESEARCH_SESSIONS_ROOT = paths.home_path(".claude", "research-sessions")
 DEFAULT_ROOT = paths.optional_path(paths.RESEARCH_SESSIONS_DIR_ENV) or _CLAUDE_RESEARCH_SESSIONS_ROOT
 INDEX_KEYS = {"session_id", "created_at", "protocol", "question", "final_status"}
-CANONICAL_GEMINI_PRO_MODEL_ID = "Gemini 3.7 Flash (Medium)"
-_AGY_GEMINI_FLASH_MODEL_PREFIX = "Gemini 3.7 Flash"
+CANONICAL_GEMINI_PRO_MODEL_ID = "Gemini 3.8 Flash (Medium)"
+_AGY_GEMINI_FLASH_MODEL_PREFIX = "Gemini 3.8 Flash"
 
 
 def save_session(
     session: "ResearchSession",
     root: Path = DEFAULT_ROOT,
 ) -> Path:
-    """Persist session to root/YYYY-MM-DD/{session_id}.json."""
-    root = root.expanduser().resolve()
-    root.mkdir(parents=True, exist_ok=True)
+    """Finalize a session, then persist it to root/YYYY-MM-DD/{session_id}.json."""
+    return write_session(finalize_session(session), root=root)
+
+
+def finalize_session(session: "ResearchSession") -> "ResearchSession":
+    """Run every non-storage save interlock and validate the finalized session."""
+    answer_to_check = session.answer
+    answer_kind_before_gates = session.answer_kind
     session.updated_at = datetime.now(timezone.utc)
     session = enforce_evidence_gate(session)
     session = enforce_gemini_pro_interlock(session)
+    if answer_to_check and answer_kind_before_gates != AnswerKind.ABSTAIN:
+        result = check_verbatim(answer_to_check, _verbatim_source_texts(session))
+        session.verbatim_check = result.to_dict()
+        if (
+            result.applicable
+            and result.unsupported_count > 0
+            and session.answer_kind == AnswerKind.FULL
+        ):
+            session = apply_verbatim_result(session, result)
     try:
         ResearchSession.model_validate(session.model_dump(mode="python"))
     except ValidationError as exc:
@@ -52,7 +70,48 @@ def save_session(
             f"ResearchSession(session_id={session.session_id})",
             exc.errors(),
         ) from exc
+    return session
 
+
+def apply_verbatim_result(
+    session: ResearchSession, result: VerbatimResult
+) -> ResearchSession:
+    """Demote a FULL answer whose extracted tokens lack captured-source support."""
+
+    if session.confidence is None:
+        return evidence_gate.force_abstain(
+            session, reason="verbatim_without_measured_confidence"
+        )
+    session.answer_kind = AnswerKind.PARTIAL
+    session.final_status = FinalStatus.WEAK_SOURCES
+    session.confidence = min(float(session.confidence), 0.5)
+    if session.answer_confidence is None:
+        session.answer_confidence = session.confidence
+    else:
+        session.answer_confidence = min(float(session.answer_confidence), 0.5)
+    tokens = ", ".join(item.token for item in result.unsupported)
+    question = (
+        f"verbatim: {result.unsupported_count} token(s) not found in captured "
+        f"sources: {tokens}"
+    )
+    if question not in session.open_questions:
+        session.open_questions.append(question)
+    return session
+
+
+def _verbatim_source_texts(session: ResearchSession) -> list[str]:
+    texts = [
+        evidence_gate._read_raw_source_text(source.raw_text_path)
+        for source in session.sources
+    ]
+    texts.extend(chunk.paragraph_text for chunk in session.evidence_chunks)
+    return [text for text in texts if text]
+
+
+def write_session(session: "ResearchSession", *, root: Path) -> Path:
+    """Write an already-finalized session without applying any save policy."""
+    root = root.expanduser().resolve()
+    root.mkdir(parents=True, exist_ok=True)
     path = session.to_jsonl_path(root).resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = Path(f"{path}.tmp")
@@ -147,11 +206,11 @@ def enforce_gemini_pro_interlock(session: ResearchSession) -> ResearchSession:
     final_status = getattr(session.final_status, "value", str(session.final_status))
     detail = _describe_gemini_pro_runs(session)
     raise GeminiProScoutError(
-        "Gemini 3.7 Flash interlock failed closed: "
+        "Gemini 3.8 Flash interlock failed closed: "
         f"{protocol} session {session.session_id} with final_status={final_status!r} "
-        "cannot be saved without a successful Gemini 3.7 Flash scout record or a "
+        "cannot be saved without a successful Gemini 3.8 Flash scout record or a "
         "successful final-synthesis fallback record. "
-        "Scout records must use a live agy Gemini 3.7 Flash model id, such as "
+        "Scout records must use a live agy Gemini 3.8 Flash model id, such as "
         f"{CANONICAL_GEMINI_PRO_MODEL_ID!r}. "
         f"Recorded runs: {detail}."
     )
@@ -257,6 +316,8 @@ def _describe_gemini_pro_runs(session: ResearchSession) -> str:
 
 
 def _build_self_test_session() -> ResearchSession:
+    started = time.perf_counter()
+    queries_run = []
     now = datetime.now(timezone.utc)
     source = SourceRecord(
         url="https://example.com/research",
@@ -288,6 +349,7 @@ def _build_self_test_session() -> ResearchSession:
         evidence_chunks=[chunk],
         rerank_passed_count=1,
         answer="x",
+        queries_run=queries_run,
         gemini_pro_runs=[
             GeminiProRunRecord(
                 run_type=GeminiProRunKind.SCOUT,
@@ -295,6 +357,8 @@ def _build_self_test_session() -> ResearchSession:
                 model_id=CANONICAL_GEMINI_PRO_MODEL_ID,
             )
         ],
+        total_duration_ms=int((time.perf_counter() - started) * 1000),
+        total_cost_usd_estimate=sum(call.cost_usd_estimate for call in queries_run),
     )
 
 

@@ -46,6 +46,10 @@ def enforce_evidence_gate(session: ResearchSession) -> ResearchSession:
     if terminal_state == "partial":
         return mark_partial(session, result)
 
+    if terminal_state == "unchecked":
+        _clear_evidence_as_failed(session, total_chunks=len(session.evidence_chunks))
+        return force_abstain(session, reason="checker_unavailable")
+
     _clear_evidence_as_failed(session, total_chunks=len(session.evidence_chunks))
     return force_abstain(session, reason="sufficiency_exhausted")
 
@@ -119,9 +123,11 @@ def mark_partial(session: ResearchSession, decision: dict[str, Any]) -> Research
     )
     session.evidence_gate_decision = decision
     session.final_status = FinalStatus.WEAK_SOURCES
-    session.answer_kind = AnswerKind.PARTIAL
     measured_confidence = session.confidence
-    session.confidence = 0.0 if measured_confidence is None else min(float(measured_confidence), 0.5)
+    if measured_confidence is None:
+        return force_abstain(session, reason="partial_without_measured_confidence")
+    session.answer_kind = AnswerKind.PARTIAL
+    session.confidence = min(float(measured_confidence), 0.5)
     measured_answer_confidence = session.answer_confidence
     if measured_answer_confidence is None:
         session.answer_confidence = session.confidence
@@ -146,8 +152,8 @@ def force_abstain(session: ResearchSession, *, reason: str) -> ResearchSession:
     session.final_status = FinalStatus.INSUFFICIENT_EVIDENCE
     session.answer_kind = AnswerKind.ABSTAIN
     session.answer = None
-    session.confidence = 0.0
-    session.answer_confidence = 0.0
+    session.confidence = None
+    session.answer_confidence = None
     if not session.open_questions:
         session.open_questions.append(ABSTAIN_OPEN_QUESTION)
     _prune_invalid_chunk_references(session)

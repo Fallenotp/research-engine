@@ -6,16 +6,21 @@ from types import SimpleNamespace
 
 import pytest
 
-from research_engine import research_cli
+from research_engine import evidence_gate, research_cli, sufficiency
 from research_engine.grounding import _source_record_from_extract
 from research_engine.schema import (
     AnswerKind,
     EvidenceChunk,
     ExtractionMethod,
     FinalStatus,
+    Protocol,
     SourceRecord,
     SourceTier,
+    ResearchSession,
 )
+
+
+SESSION_TOTALS = {"total_duration_ms": 1350, "total_cost_usd_estimate": 0.0042}
 
 
 def _write_source(tmp_path: Path, name: str, text: str, *, domain: str = "example.com") -> dict[str, object]:
@@ -63,10 +68,95 @@ def _make_chunk(source: SourceRecord, *, rerank_score: float, passed: bool) -> E
         char_offset=0,
         char_length=19,
         rerank_score=rerank_score,
+        lexical_overlap_score=rerank_score,
         supports_claim="synthetic claim",
         crystal_check_passed=passed,
         crystal_check_score=rerank_score,
     )
+
+
+def test_unchecked_gate_forces_abstain_with_checker_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _make_source(tmp_path, "one", "The policy changed its appeal window.")
+    session = ResearchSession(
+        protocol=Protocol.RESEARCH,
+        question="What changed in the policy?",
+        final_status=FinalStatus.COMPLETE,
+        sources=[source],
+        evidence_chunks=[_make_chunk(source, rerank_score=0.95, passed=True)],
+        rerank_passed_count=1,
+        answer="The policy changed its appeal window.",
+        answer_kind=AnswerKind.FULL,
+        confidence=0.9,
+        answer_confidence=0.9,
+        **SESSION_TOTALS,
+    )
+    monkeypatch.setattr(sufficiency, "get_sufficiency_clients", lambda: (None, None))
+    monkeypatch.setattr(evidence_gate, "get_sufficiency_clients", lambda: (None, None))
+
+    result = evidence_gate.enforce_evidence_gate(session)
+
+    assert result.answer_kind == AnswerKind.ABSTAIN
+    assert result.evidence_gate_decision["terminal_state"] == "unchecked"
+    assert result.evidence_gate_decision["gate_reason"] == "checker_unavailable"
+
+
+def test_force_abstain_leaves_confidence_none_not_zero(tmp_path: Path) -> None:
+    source = _make_source(tmp_path, "one", "The policy changed its appeal window.")
+    session = ResearchSession(
+        protocol=Protocol.RESEARCH,
+        question="What changed in the policy?",
+        final_status=FinalStatus.COMPLETE,
+        sources=[source],
+        evidence_chunks=[_make_chunk(source, rerank_score=0.95, passed=True)],
+        rerank_passed_count=1,
+        answer="The policy changed its appeal window.",
+        answer_kind=AnswerKind.FULL,
+        confidence=0.9,
+        answer_confidence=0.9,
+        **SESSION_TOTALS,
+    )
+
+    result = evidence_gate.force_abstain(session, reason="x")
+
+    assert result.confidence is None
+    assert result.answer_confidence is None
+
+
+def test_negated_claim_is_stored_as_overlap_not_faithfulness(tmp_path: Path) -> None:
+    source = _make_source(tmp_path, "one", "The treatment does reduce mortality.")
+
+    chunk = research_cli.evidence_chunk(
+        source,
+        "The treatment does reduce mortality.",
+        "The treatment does not reduce mortality.",
+    )
+
+    assert chunk.lexical_overlap_score >= 0.8
+    assert chunk.crystal_check_passed is None
+    assert chunk.crystal_check_score is None
+
+
+def test_full_answer_requires_confidence(tmp_path: Path) -> None:
+    source = _make_source(tmp_path, "one", "The policy changed its appeal window.")
+    values = dict(
+        protocol=Protocol.RESEARCH,
+        question="What changed in the policy?",
+        final_status=FinalStatus.COMPLETE,
+        sources=[source],
+        evidence_chunks=[_make_chunk(source, rerank_score=0.95, passed=True)],
+        rerank_passed_count=1,
+        answer="The policy changed its appeal window.",
+        answer_kind=AnswerKind.FULL,
+        **SESSION_TOTALS,
+    )
+
+    with pytest.raises(ValueError, match="confidence"):
+        ResearchSession(**values, confidence=None)
+
+    assert ResearchSession(**values, confidence=0.7).confidence == 0.7
 
 
 @pytest.mark.parametrize("builder", [research_cli.source_record, _source_record_from_extract])
@@ -82,10 +172,10 @@ def test_supporting_paragraph_scores_higher_than_unrelated(builder, tmp_path: Pa
     unrelated_chunk = research_cli.evidence_chunk(unrelated_source, unrelated_text, claim)
 
     assert supporting_chunk.rerank_score > unrelated_chunk.rerank_score
-    assert supporting_chunk.crystal_check_passed is True
+    assert supporting_chunk.crystal_check_passed is None
     assert supporting_chunk.rerank_score > research_cli.EVIDENCE_OVERLAP_PASS_THRESHOLD
     assert supporting_chunk.supports_claim == claim
-    assert unrelated_chunk.crystal_check_passed is False
+    assert unrelated_chunk.crystal_check_passed is None
     assert unrelated_chunk.rerank_score < research_cli.EVIDENCE_OVERLAP_PASS_THRESHOLD
 
 
@@ -150,8 +240,8 @@ Print is not manufacture. Teemill [3], source [1] and Garment Printing [4] all p
     )
 
     assert chunk_from_answer.rerank_score == pytest.approx(chunk_from_claim.rerank_score)
-    assert chunk_from_answer.crystal_check_passed is True
-    assert chunk_from_answer.crystal_check_passed == chunk_from_claim.crystal_check_passed
+    assert chunk_from_answer.crystal_check_passed is None
+    assert chunk_from_claim.crystal_check_passed is None
     assert chunk_from_answer.supports_claim == target_claim
     assert chunk_from_answer.supports_claim == chunk_from_claim.supports_claim
     assert chunk_from_answer.rerank_score > research_cli.EVIDENCE_OVERLAP_PASS_THRESHOLD
@@ -373,7 +463,16 @@ def test_skip_web_avoids_searxng_and_runs_local_lanes(monkeypatch, tmp_path: Pat
     def fake_local_lanes(*args, **kwargs):
         nonlocal local_calls
         local_calls += 1
-        return [("mentor_memory", {"results": [{"url": raw_text_path.resolve().as_uri()}]})]
+        return [
+            (
+                "mentor_memory",
+                {
+                    "results": [{"url": raw_text_path.resolve().as_uri()}],
+                    "duration_ms": 1350,
+                    "cost_usd_estimate": 0.0042,
+                },
+            )
+        ]
 
     def fail_if_called(*args, **kwargs):
         raise AssertionError("web search should be skipped when skip_web=True")

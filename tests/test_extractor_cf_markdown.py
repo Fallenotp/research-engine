@@ -4,6 +4,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from research_engine import extractor
+from research_engine.schema import ExtractionMethod
 
 
 class _Response:
@@ -81,15 +82,15 @@ def test_extract_clean_text_falls_through_when_preflight_is_not_markdown() -> No
     assert get_mock.call_count == 1
 
 
-def test_extract_clean_text_skips_cloudflare_markdown_auto_chain(tmp_path) -> None:
+def test_extract_uses_cloudflare_markdown_first_when_available(tmp_path) -> None:
     with patch.object(extractor, "_is_pdf", return_value=False), patch.object(
         extractor,
         "_cloudflare_markdown_preflight",
-        side_effect=AssertionError("cloudflare-md is not in the web ladder"),
+        return_value=(_payload(2400), {}),
     ), patch.object(
         extractor,
-        "_crawl4ai",
-        return_value=_payload(2400),
+        "_trafilatura",
+        side_effect=AssertionError("must not be reached"),
     ):
         result = extractor.extract_clean_text(
             "https://example.com/article",
@@ -97,5 +98,18 @@ def test_extract_clean_text_skips_cloudflare_markdown_auto_chain(tmp_path) -> No
         )
 
     assert result is not None
-    assert result["extraction_method"] == "crawl4ai"
+    assert result["extraction_method"] == ExtractionMethod.CLOUDFLARE_MARKDOWN.value
     assert Path(result["raw_text_path"]).exists()
+
+
+def test_extract_falls_through_cloudflare_markdown_when_unavailable(tmp_path) -> None:
+    with patch.object(extractor, "_is_pdf", return_value=False), patch.object(
+        extractor, "_cloudflare_markdown_preflight", return_value=None
+    ), patch.object(extractor, "_trafilatura", return_value=_payload(2400)):
+        result = extractor.extract_clean_text(
+            "https://example.com/article",
+            seen_urls_path=tmp_path / "seen.txt",
+        )
+
+    assert result is not None
+    assert result["extraction_method"] == "trafilatura"

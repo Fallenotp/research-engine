@@ -73,7 +73,7 @@ AGY_CLI = paths.executable(paths.AGY_BIN_ENV, "agy-cli-1", "agy-cli-2", "agy") o
 AGY_SKIP_PERMISSIONS_FLAG = "--dangerously-skip-permissions"
 AGY_INTERACTIVE_GEMINI_MODEL = os.environ.get(
     "RESEARCH_ENGINE_GEMINI_MODEL",
-    "Gemini 3.7 Flash (Medium)",
+    "Gemini 3.8 Flash (Medium)",
 )
 AGY_SCHEDULED_WORKER_MODEL = os.environ.get(
     "RESEARCH_ENGINE_SCHEDULED_WORKER_MODEL",
@@ -82,7 +82,7 @@ AGY_SCHEDULED_WORKER_MODEL = os.environ.get(
 GEMINI_CLI_HOME = AGY_CLI
 GEMINI_SCOUT_CLI_HOME = AGY_CLI
 RESERVED_GEMINI_CLI_HOME = ""
-# Per Ian's locked decision: use Gemini 3.7 Flash for the scout too. Pro is not
+# Per Ian's locked decision: use Gemini 3.8 Flash for the scout too. Pro is not
 # allowed for /research or /deep-research scouting.
 # (Name kept as *_PRO_* to avoid breaking references; the value is the Flash model.)
 GEMINI_PRO_MODEL_CANDIDATES = (
@@ -381,7 +381,7 @@ def discover_gemini_pro_model(
     backoff_seconds: Sequence[int] = GEMINI_TRANSIENT_BACKOFF_SECONDS,
     use_cache: bool = True,
 ) -> GeminiProHealthResult:
-    """Health-check agy and cache the logical Gemini 3.7 Flash model id.
+    """Health-check agy and cache the logical Gemini 3.8 Flash model id.
 
     The scout uses agy with an explicit friendly --model and no HOME switching.
     Gemini outage now degrades instead of raising:
@@ -434,15 +434,15 @@ def discover_gemini_pro_model(
             f"output={trim_output(combined_output)}"
         )
 
-    reason = "; ".join(failures) or "no Gemini 3.7 Flash model candidates were checked"
+    reason = "; ".join(failures) or "no Gemini 3.8 Flash model candidates were checked"
     _maybe_alert_scout_failure(reason, channel_id=alert_channel_id)
-    logger.warning("Gemini 3.7 Flash scout unavailable; continuing without scout: %s", reason)
+    logger.warning("Gemini 3.8 Flash scout unavailable; continuing without scout: %s", reason)
     return GeminiProHealthResult(False, None, candidate_tuple, reason)
 
 
 def build_blocking_scout_alert(reason: str) -> str:
     return (
-        f"Gemini 3.7 Flash scout via {AGY_CLI} unavailable: {reason}. "
+        f"Gemini 3.8 Flash scout via {AGY_CLI} unavailable: {reason}. "
         "Continuing with the configured fallback path; fix agy to restore scout coverage."
     )
 
@@ -456,7 +456,7 @@ def dispatch_scout(
     runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
 ) -> WorkerSpec | None:
     if protocol not in (Protocol.RESEARCH, Protocol.DEEP_RESEARCH):
-        raise ValueError("Gemini 3.7 Flash scout is only for /research and /deep-research")
+        raise ValueError("Gemini 3.8 Flash scout is only for /research and /deep-research")
 
     scout_config = _router_config(router, "scout_config")
     candidates = scout_config.get("model_candidates") or GEMINI_PRO_MODEL_CANDIDATES
@@ -472,7 +472,7 @@ def dispatch_scout(
     )
     if not health.ok or health.model_id is None:
         logger.warning(
-            "Skipping Gemini 3.7 Flash scout for %s after health check failure: %s",
+            "Skipping Gemini 3.8 Flash scout for %s after health check failure: %s",
             protocol.value,
             health.reason,
         )
@@ -504,7 +504,7 @@ def dispatch_scout(
         brief_path=brief_path,
         output_path=output_path,
         lanes=["gemini_pro_scout", "searxng_general", "linkup_direct", "firecrawl_direct"],
-        rationale="Gemini 3.7 Flash scout runs first through agy and returns a first-picture summary plus depth targets.",
+        rationale="Gemini 3.8 Flash scout runs first through agy and returns a first-picture summary plus depth targets.",
         model_id=health.model_id,
     )
 
@@ -556,7 +556,7 @@ def dispatch_pro_synthesis_fallback(
         brief_path=brief_path,
         output_path=output_path,
         lanes=["gemini_pro_scout"],
-        rationale="--pro-synthesis-fallback skips the scout and uses Gemini 3.7 Flash through agy for final synthesis.",
+        rationale="--pro-synthesis-fallback skips the scout and uses Gemini 3.8 Flash through agy for final synthesis.",
         model_id=health.model_id,
     )
 
@@ -961,7 +961,7 @@ def _dod_oss_q_clause(query: str, resource: str) -> str:
 
 
 def _scout_brief_text(question: str, *, protocol: Protocol) -> str:
-    return f"""You are the Gemini 3.7 Flash scout for {protocol.value}.
+    return f"""You are the Gemini 3.8 Flash scout for {protocol.value}.
 
 Run one broad, bounded first sweep before any parallel workers are assigned.
 Use the normal research-engine search and fetch tools: free community/search
@@ -982,7 +982,7 @@ Return exactly these sections:
 
 
 def _pro_synthesis_fallback_brief_text(question: str, *, protocol: Protocol) -> str:
-    return f"""You are Gemini 3.7 Flash through agy doing final synthesis for {protocol.value}.
+    return f"""You are Gemini 3.8 Flash through agy doing final synthesis for {protocol.value}.
 
 The scout was intentionally skipped by --pro-synthesis-fallback. Read the
 worker outputs already gathered by the normal lanes, synthesize only grounded
@@ -1023,7 +1023,7 @@ def _maybe_alert_scout_failure(reason: str, *, channel_id: str | None = None) ->
             check=False,
         )
     except (OSError, subprocess.SubprocessError):
-        logger.exception("Failed to post Gemini 3.7 Flash scout alert to Discord")
+        logger.exception("Failed to post Gemini 3.8 Flash scout alert to Discord")
 
 
 def _warn_ignored_api_lane_fields(lane_name: str, lane_config: dict[str, Any]) -> None:
@@ -1400,7 +1400,7 @@ if __name__ == "__main__":
         f"{AGY_CLI} --dangerously-skip-permissions -p "
     )
     assert '-p "$(cat ' in spec.invocation_hint
-    assert "--model 'Gemini 3.7 Flash (Medium)'" in spec.invocation_hint
+    assert "--model 'Gemini 3.8 Flash (Medium)'" in spec.invocation_hint
     assert "HOME=" not in spec.invocation_hint
     assert "--dangerously-skip-permissions" in spec.invocation_hint
 

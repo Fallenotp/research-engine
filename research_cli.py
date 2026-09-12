@@ -12,6 +12,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+import time
 import tempfile
 import urllib.error
 import urllib.request
@@ -24,7 +25,8 @@ from urllib.parse import urlparse
 if __package__ in {None, ""}:  # pragma: no cover - direct file execution
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from research_engine import llm_call, logged_search, telemetry_observer
+from research_engine import extractor, llm_call, logged_search, telemetry_observer
+from research_engine import windows as extractor_windows
 from research_engine.anti_hallucination_gate import validate as validate_model_output
 
 from . import paths
@@ -70,6 +72,7 @@ import research_engine.persistence as persistence
 
 
 SPECIALIZED_PROVIDERS = ("tavily", "linkup", "exa", "youcom")
+PAGE_BUDGET = {"/search": 5, "/research": 6, "/deep-research": 8}
 ABSTAIN_MESSAGE = "Insufficient evidence to answer from the retrieved sources."
 CODEX_TIMEOUT_SECONDS = 180
 CODEX_MODEL_ID = "gpt-5.4-mini"
@@ -280,6 +283,11 @@ DEFAULT_GRADUATED_ANSWER_THRESHOLDS = GraduatedAnswerThresholds(
 )
 
 
+def page_budget_for(protocol: str) -> int:
+    """Return the run-wide successful-page allowance for a protocol."""
+    return PAGE_BUDGET.get(protocol, PAGE_BUDGET["/search"])
+
+
 @dataclass(frozen=True)
 class AnswerDecision:
     answer_kind: AnswerKind
@@ -488,7 +496,8 @@ def compute_session_confidence(
     - source_count_factor = min(number_of_sources / 3, 1.0)
     - authority_mean = average topic_authority_score across sources
     - rerank_mean = average rerank_score across evidence chunks
-    - support_ratio = fraction of chunks that passed the overlap threshold
+    - support_ratio = fraction of chunks whose measured token overlap passed the
+      overlap threshold; claim-level faithfulness is not inferred from overlap
 
     Confidence = 0.2*source_count_factor + 0.3*authority_mean
                + 0.3*rerank_mean + 0.2*support_ratio
@@ -502,7 +511,14 @@ def compute_session_confidence(
     authority_mean = sum(source.topic_authority_score for source in sources) / len(sources)
     rerank_mean = sum(chunk.rerank_score for chunk in evidence_chunks) / len(evidence_chunks)
     support_ratio = sum(
-        1.0 for chunk in evidence_chunks if chunk.crystal_check_passed
+        1.0
+        for chunk in evidence_chunks
+        if (
+            chunk.crystal_check_passed is True
+            if chunk.crystal_check_passed is not None
+            else chunk.lexical_overlap_score is not None
+            and chunk.lexical_overlap_score >= EVIDENCE_OVERLAP_PASS_THRESHOLD
+        )
     ) / len(evidence_chunks)
     return clamp_unit_interval(
         (SESSION_CONFIDENCE_SOURCE_WEIGHT * source_count_factor)
@@ -676,6 +692,7 @@ def run_search(
     agent: str | None = None,
     llm_prefer: str | None = None,
 ) -> SearchRunResult:
+    run_started = time.perf_counter()
     topic = topic or slugify_question(question)
     agent = agent or os.environ.get("RESEARCH_AGENT") or "harness"
     errors: list[str] = []
@@ -710,7 +727,9 @@ def run_search(
         )
         queries_run = build_local_query_calls(question, local_payloads=local_payloads)
         grok_x_summary = ""
-        source_urls = candidate_urls(*(payload for _lane, payload in local_payloads))
+        candidate_results = compact_candidates(
+            *(payload for _lane, payload in local_payloads)
+        )
     else:
         sx = run_logged_search(
             logged_search.searxng,
@@ -761,11 +780,13 @@ def run_search(
             router=router,
         )
         queries_run.append(grok_x_query)
-        source_urls = candidate_urls(sx, *free_payloads[1:], px)
+        candidate_results = compact_candidates(sx, *free_payloads[1:], px)
 
+    ranked = extractor_windows.rank_candidates(question, candidate_results)
     source_pairs = extract_sources(
-        source_urls,
+        [str(candidate["url"]) for candidate in ranked],
         errors=errors,
+        page_budget=page_budget_for(Protocol.SEARCH.value),
         topic=authority_topic,
         require_tier_1=require_tier_1,
     )
@@ -775,6 +796,7 @@ def run_search(
             agent=agent,
             queries_run=queries_run,
             open_question=first_error_or("no usable sources retrieved", errors),
+            run_started=run_started,
         )
         path = save_session_safely(session)
         telemetry_safely()
@@ -798,6 +820,7 @@ def run_search(
             queries_run=queries_run,
             sources=[source for source, _ in source_pairs],
             open_question=f"synthesis failed: {type(exc).__name__}: {exc}",
+            run_started=run_started,
         )
         path = save_session_safely(session)
         telemetry_safely()
@@ -815,6 +838,7 @@ def run_search(
         queries_run=queries_run,
         source_pairs=source_pairs,
         router=router,
+        run_started=run_started,
     )
     path = save_session_safely(session)
     telemetry_safely()
@@ -1277,15 +1301,18 @@ def run_grok_x_search(
     )
     output_text = ""
     error = None
+    started = time.perf_counter()
     try:
         output_text = execute_grok_worker_spec(spec)
     except Exception as exc:  # noqa: BLE001 - X-search worker failure should not kill search
         error = f"{type(exc).__name__}: {trim_output(str(exc))}"
+    elapsed_ms = int((time.perf_counter() - started) * 1000)
     return output_text.strip(), grok_x_query_call(
         question,
         spec=spec,
         output_text=output_text,
         error=error,
+        elapsed_ms=elapsed_ms,
     )
 
 
@@ -1320,13 +1347,14 @@ def grok_x_query_call(
     spec: WorkerSpec,
     output_text: str,
     error: str | None,
+    elapsed_ms: int,
 ) -> QueryCall:
     return QueryCall(
         query_text=query,
         lane="grok_x_search",
         worker_model=WorkerModel.GROK,
         started_at=datetime.now(timezone.utc),
-        duration_ms=0,
+        duration_ms=elapsed_ms,
         result_count=1 if output_text.strip() else 0,
         error=error,
     )
@@ -1776,11 +1804,15 @@ def run_local_search_lanes(
             continue
         if str(lane_config.get("type")) != "local":
             continue
+        started = time.perf_counter()
         try:
             payload = local_lane_payload(lane_config, question)
         except Exception as exc:  # noqa: BLE001 - one lane should not abort search
             errors.append(f"{lane} local lane failed: {type(exc).__name__}: {exc}")
             payload = {"results": [], "error": str(exc)}
+        payload = dict(payload)
+        payload["duration_ms"] = int((time.perf_counter() - started) * 1000)
+        payload["cost_usd_estimate"] = 0.0
         if payload.get("not_configured") and payload.get("error"):
             errors.append(str(payload["error"]))
         payloads.append((lane, payload))
@@ -1949,11 +1981,14 @@ def _run_worker(
         query_call(worker_query, lane=lane, payload=payload, worker_model=worker_model)
         for worker_query, lane, payload in payloads
     ]
-    urls = candidate_urls(*(payload for _worker_query, _lane, payload in payloads))
+    candidates = compact_candidates(
+        *(payload for _worker_query, _lane, payload in payloads)
+    )
+    ranked = extractor_windows.rank_candidates(query, candidates)
     source_pairs = extract_sources(
-        urls,
+        [str(candidate["url"]) for candidate in ranked],
         errors=errors,
-        max_sources=2,
+        page_budget=page_budget_for(protocol),
         seen_urls=seen_urls,
         counter_evidence=counter,
         topic=authority_topic,
@@ -1973,13 +2008,16 @@ def query_call(
     payload: dict[str, Any],
     worker_model: WorkerModel,
 ) -> QueryCall:
+    if "duration_ms" not in payload:
+        raise ValueError(f"payload has no duration_ms for lane {lane}")
     return QueryCall(
         query_text=query,
         lane=lane,
         worker_model=worker_model,
-        started_at=datetime.now(timezone.utc),
-        duration_ms=0,
+        started_at=payload.get("started_at", datetime.now(timezone.utc)),
+        duration_ms=payload["duration_ms"],
         result_count=len(_results(payload)),
+        cost_usd_estimate=payload.get("cost_usd_estimate", 0.0),
         error=payload.get("error") if isinstance(payload.get("error"), str) else None,
     )
 
@@ -1997,6 +2035,16 @@ def candidate_urls(*payloads: dict[str, Any]) -> list[str]:
     return urls
 
 
+def compact_candidates(*payloads: dict[str, Any]) -> list[dict]:
+    """Normalize all lane results before lexical candidate ranking."""
+    results = [
+        {**result, "title": str(result.get("title") or result.get("url") or "")}
+        for payload in payloads
+        for result in _results(payload)
+    ]
+    return extractor.compact_search_results(results, max_results=50)
+
+
 def has_enough_free_results(
     payload: dict[str, Any],
     *,
@@ -2009,18 +2057,23 @@ def extract_sources(
     urls: list[str],
     *,
     errors: list[str],
-    max_sources: int = 3,
+    page_budget: int = PAGE_BUDGET["/search"],
     seen_urls: set[str] | None = None,
     counter_evidence: bool = False,
     topic: str | None = None,
     require_tier_1: bool = False,
 ) -> list[tuple[SourceRecord, str]]:
     source_pairs: list[tuple[SourceRecord, str]] = []
+    claimed_urls = {
+        extractor._canonical_seen_url(seen_url) for seen_url in seen_urls or set()
+    }
     for url in urls:
-        if len(source_pairs) >= max_sources:
+        if len(source_pairs) >= page_budget:
             break
-        if seen_urls is not None and url in seen_urls:
+        canonical_url = extractor._canonical_seen_url(url)
+        if canonical_url in claimed_urls:
             continue
+        claimed_urls.add(canonical_url)
         try:
             requested_tier = authority_tier(
                 urlparse(url).netloc or "unknown",
@@ -2054,7 +2107,7 @@ def extract_sources(
                 )
             )
             if seen_urls is not None:
-                seen_urls.add(url)
+                seen_urls.add(canonical_url)
         except Exception as exc:  # noqa: BLE001 - source-level failure should not abort run
             errors.append(f"extract failed for {url}: {type(exc).__name__}: {exc}")
     return source_pairs
@@ -2477,10 +2530,12 @@ def execute_territory(
     if spec.provider == "grok_cli":
         worker_output = ""
         worker_error = None
+        started = time.perf_counter()
         try:
             worker_output = execute_grok_worker_spec(spec)
         except Exception as exc:  # noqa: BLE001 - one worker failure should not kill the run
             worker_error = f"{type(exc).__name__}: {trim_output(str(exc))}"
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
         queries.append(
             cli_worker_query_call(
                 territory.description,
@@ -2489,16 +2544,19 @@ def execute_territory(
                 worker_model=WorkerModel.GROK,
                 output_text=worker_output,
                 error=worker_error,
+                elapsed_ms=elapsed_ms,
             )
         )
         summary = worker_output.strip()
     elif spec.provider == "agy_cli":
         worker_output = ""
         worker_error = None
+        started = time.perf_counter()
         try:
             worker_output = execute_gemini_worker_spec(spec, router=router)
         except Exception as exc:  # noqa: BLE001 - one worker failure should not kill the run
             worker_error = f"{type(exc).__name__}: {trim_output(str(exc))}"
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
         queries.append(
             cli_worker_query_call(
                 territory.description,
@@ -2507,16 +2565,19 @@ def execute_territory(
                 worker_model=WorkerModel.GEMINI_FLASH,
                 output_text=worker_output,
                 error=worker_error,
+                elapsed_ms=elapsed_ms,
             )
         )
         summary = worker_output.strip()
     elif spec.provider == "mistral_free_api":
         worker_output = ""
         worker_error = None
+        started = time.perf_counter()
         try:
             worker_output = execute_mistral_worker_spec(spec)
         except Exception as exc:  # noqa: BLE001 - one worker failure should not kill the run
             worker_error = f"{type(exc).__name__}: {trim_output(str(exc))}"
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
         queries.append(
             cli_worker_query_call(
                 territory.description,
@@ -2525,16 +2586,19 @@ def execute_territory(
                 worker_model=WorkerModel.MISTRAL,
                 output_text=worker_output,
                 error=worker_error,
+                elapsed_ms=elapsed_ms,
             )
         )
         summary = worker_output.strip()
     elif spec.provider == "codex_cli":
         worker_output = ""
         worker_error = None
+        started = time.perf_counter()
         try:
             worker_output = execute_codex_worker_spec(spec)
         except Exception as exc:  # noqa: BLE001 - one worker failure should not kill the run
             worker_error = f"{type(exc).__name__}: {trim_output(str(exc))}"
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
         queries.append(
             cli_worker_query_call(
                 territory.description,
@@ -2543,6 +2607,7 @@ def execute_territory(
                 worker_model=WorkerModel.CODEX_5_4,
                 output_text=worker_output,
                 error=worker_error,
+                elapsed_ms=elapsed_ms,
             )
         )
         summary = worker_output.strip()
@@ -2606,7 +2671,7 @@ def worker_territory_brief(
         ]
     )
     if source_pairs:
-        sections.extend(numbered_sources(source_pairs, max_chars=1200))
+        sections.extend(numbered_sources(question, source_pairs))
     else:
         sections.append("No extracted source text was available before the Grok pass.")
     return "\n".join(sections).strip()
@@ -2620,15 +2685,19 @@ def cli_worker_query_call(
     worker_model: WorkerModel,
     output_text: str,
     error: str | None,
+    elapsed_ms: int,
 ) -> QueryCall:
-    return QueryCall(
-        query_text=query,
-        lane="grok_x_search" if lane == "grok_cli" and "grok_x_search" in spec.lanes else lane,
+    call_lane = "grok_x_search" if lane == "grok_cli" and "grok_x_search" in spec.lanes else lane
+    return query_call(
+        query,
+        lane=call_lane,
         worker_model=worker_model,
-        started_at=datetime.now(timezone.utc),
-        duration_ms=0,
-        result_count=1 if output_text.strip() else 0,
-        error=error,
+        payload={
+            "results": [{}] if output_text.strip() else [],
+            "duration_ms": elapsed_ms,
+            "cost_usd_estimate": 0.0,
+            "error": error,
+        },
     )
 
 
@@ -2667,7 +2736,7 @@ def territory_summary_prompt(
         "",
         "Sources:",
     ]
-    sections.extend(numbered_sources(source_pairs, max_chars=1200))
+    sections.extend(numbered_sources(question, source_pairs))
     return "\n".join(sections).strip()
 
 
@@ -2693,10 +2762,7 @@ def synthesis_prompt(
             ]
         )
     sections.extend(["", "Sources:"])
-    for index, (source, full_text) in enumerate(source_pairs, start=1):
-        sections.append(f"[{index}] {source.title}")
-        sections.append(full_text[:1500])
-        sections.append("")
+    sections.extend(numbered_sources(question, source_pairs))
     return "\n".join(sections).strip()
 
 
@@ -2754,7 +2820,7 @@ def final_research_prompt(
             for disagreement in worker_disagreements
         )
     sections.extend(["", "Numbered sources:"])
-    sections.extend(numbered_sources(source_pairs, max_chars=1500))
+    sections.extend(numbered_sources(question, source_pairs))
     return "\n".join(sections).strip()
 
 
@@ -2788,16 +2854,32 @@ def write_worker_output_note(
 
 
 def numbered_sources(
+    question: str,
     source_pairs: list[tuple[SourceRecord, str]],
-    *,
-    max_chars: int,
 ) -> list[str]:
     sections: list[str] = []
     for index, (source, full_text) in enumerate(source_pairs, start=1):
         sections.append(f"[{index}] {source.title}")
-        sections.append(full_text[:max_chars])
+        selected = extractor_windows.select_windows(
+            question,
+            full_text,
+            budget_chars=4_000,
+        )
+        selected = [window for window in selected if window.score > 0.0] or selected
+        sections.append(extractor_windows.render_windows(selected))
         sections.append("")
     return sections
+
+
+def session_measurements(
+    run_started: float | None,
+    queries_run: list[QueryCall],
+) -> dict[str, int | float]:
+    started = run_started if run_started is not None else time.perf_counter()
+    return {
+        "total_duration_ms": int((time.perf_counter() - started) * 1000),
+        "total_cost_usd_estimate": sum(call.cost_usd_estimate for call in queries_run),
+    }
 
 
 def build_complete_session(
@@ -2808,10 +2890,20 @@ def build_complete_session(
     queries_run: list[QueryCall],
     source_pairs: list[tuple[SourceRecord, str]],
     router,
+    run_started: float | None = None,
 ) -> ResearchSession:
     sources = [source for source, _ in source_pairs]
     evidence_chunks = [
-        evidence_chunk(source, full_text, answer)
+        evidence_chunk(
+            source,
+            full_text,
+            answer,
+            windows=extractor_windows.select_windows(
+                question,
+                full_text,
+                budget_chars=4_000,
+            ),
+        )
         for source, full_text in source_pairs
     ]
     decision = session_answer_decision(sources, evidence_chunks, router=router)
@@ -2835,6 +2927,7 @@ def build_complete_session(
         rerank_failed_count=rerank_failed_count,
         queries_run=queries_run,
         open_questions=list(decision.open_questions),
+        **session_measurements(run_started, queries_run),
     )
 
 
@@ -3023,7 +3116,16 @@ def build_research_session_from_runs(
 
     sources = [source for source, _full_text in source_pairs]
     evidence_chunks = [
-        evidence_chunk(source, full_text, answer)
+        evidence_chunk(
+            source,
+            full_text,
+            answer,
+            windows=extractor_windows.select_windows(
+                question,
+                full_text,
+                budget_chars=4_000,
+            ),
+        )
         for source, full_text in source_pairs
     ]
     decision = session_answer_decision(sources, evidence_chunks, router=router)
@@ -3050,6 +3152,7 @@ def build_research_session_from_runs(
         open_questions=list(decision.open_questions),
         iteration_count=iteration_count,
         agent_disagreements=detect_worker_disagreements(question, runs),
+        **session_measurements(None, queries_run),
     )
     return session, backend
 
@@ -3064,6 +3167,7 @@ def build_abstain_session(
     sources: list[SourceRecord] | None = None,
     territories: list[Territory] | None = None,
     gemini_pro_runs: list[GeminiProRunRecord] | None = None,
+    run_started: float | None = None,
 ) -> ResearchSession:
     return ResearchSession(
         protocol=protocol,
@@ -3072,14 +3176,15 @@ def build_abstain_session(
         final_status=FinalStatus.INSUFFICIENT_EVIDENCE,
         answer=None,
         answer_kind=AnswerKind.ABSTAIN,
-        confidence=0.0,
-        answer_confidence=0.0,
+        confidence=None,
+        answer_confidence=None,
         sources=sources or [],
         territories=territories or [],
         evidence_chunks=[],
         queries_run=queries_run,
         open_questions=[open_question or "no usable sources retrieved"],
         gemini_pro_runs=gemini_pro_runs or [],
+        **session_measurements(run_started, queries_run),
     )
 
 
@@ -3089,7 +3194,38 @@ def evidence_chunk(
     answer: str,
     *,
     claim: str | None = None,
+    windows: list[extractor_windows.Window] | None = None,
 ) -> EvidenceChunk:
+    windows_to_score = windows or extractor_windows.select_windows(
+        claim or answer,
+        full_text,
+        budget_chars=4_000,
+    )
+    claim_candidates = _claim_candidates(answer, explicit_claim=claim)
+    best_window = max(
+        windows_to_score,
+        key=lambda window: max(
+            (lexical_overlap_score(window.text, claim_text) for claim_text in claim_candidates),
+            default=0.0,
+        ),
+        default=None,
+    )
+    if best_window is not None:
+        matched_claim = max(
+            claim_candidates,
+            key=lambda claim_text: lexical_overlap_score(best_window.text, claim_text),
+            default="n/a",
+        )
+        overlap_score = lexical_overlap_score(best_window.text, matched_claim)
+        return EvidenceChunk(
+            source_id=source.source_id,
+            paragraph_text=best_window.text,
+            char_offset=best_window.char_offset,
+            char_length=best_window.char_length,
+            rerank_score=overlap_score,
+            lexical_overlap_score=overlap_score,
+            supports_claim=matched_claim,
+        )
     paragraph, matched_claim, overlap_score = best_supporting_paragraph(
         full_text,
         answer,
@@ -3098,12 +3234,11 @@ def evidence_chunk(
     return EvidenceChunk(
         source_id=source.source_id,
         paragraph_text=paragraph,
-        char_offset=0,
+        char_offset=full_text.find(paragraph),
         char_length=max(1, len(paragraph)),
         rerank_score=overlap_score,
+        lexical_overlap_score=overlap_score,
         supports_claim=matched_claim,
-        crystal_check_passed=overlap_score >= EVIDENCE_OVERLAP_PASS_THRESHOLD,
-        crystal_check_score=overlap_score,
     )
 
 
@@ -3192,40 +3327,30 @@ def build_query_calls(
     chosen_provider: str,
     api_payloads: list[tuple[str, dict[str, Any]]] | None = None,
 ) -> list[QueryCall]:
-    now = datetime.now(timezone.utc)
     calls = [
-        QueryCall(
-            query_text=question,
+        query_call(
+            question,
             lane="searxng_general",
             worker_model=WorkerModel.HAIKU,
-            started_at=now,
-            duration_ms=0,
-            result_count=len(_results(sx)),
-            error=sx.get("error"),
+            payload=sx,
         )
     ]
     for lane, payload in api_payloads or []:
         calls.append(
-            QueryCall(
-                query_text=question,
+            query_call(
+                question,
                 lane=lane,
                 worker_model=WorkerModel.HAIKU,
-                started_at=now,
-                duration_ms=0,
-                result_count=len(_results(payload)),
-                error=payload.get("error") if isinstance(payload.get("error"), str) else None,
+                payload=payload,
             )
         )
     if not px.get("skipped"):
         calls.append(
-            QueryCall(
-                query_text=question,
+            query_call(
+                question,
                 lane=chosen_provider,
                 worker_model=WorkerModel.HAIKU,
-                started_at=now,
-                duration_ms=0,
-                result_count=len(_results(px)),
-                error=px.get("error"),
+                payload=px,
             )
         )
     return calls
@@ -3236,16 +3361,12 @@ def build_local_query_calls(
     *,
     local_payloads: list[tuple[str, dict[str, Any]]],
 ) -> list[QueryCall]:
-    now = datetime.now(timezone.utc)
     return [
-        QueryCall(
-            query_text=question,
+        query_call(
+            question,
             lane=lane,
             worker_model=WorkerModel.HAIKU,
-            started_at=now,
-            duration_ms=0,
-            result_count=len(_results(payload)),
-            error=payload.get("error") if isinstance(payload.get("error"), str) else None,
+            payload=payload,
         )
         for lane, payload in local_payloads
     ]
@@ -3265,10 +3386,15 @@ def weakest_territory_run(runs: list[TerritoryRun]) -> TerritoryRun:
 
 def save_session_with_fallback(session: ResearchSession) -> tuple[ResearchSession, Path | None]:
     try:
-        return session, persistence.save_session(session, root=persistence.DEFAULT_ROOT)
-    except Exception as exc:  # noqa: BLE001 - preserve the session; storage failure is not a false abstain
-        logger.warning("save_session failed, preserving original session: %s", exc)
-        return session, write_session_directly(session)
+        gated = persistence.finalize_session(session)
+    except Exception as exc:  # noqa: BLE001 - never bypass a failed gate
+        logger.warning("session finalization failed; refusing direct write: %s", exc)
+        return session, None
+    try:
+        return gated, persistence.write_session(gated, root=persistence.DEFAULT_ROOT)
+    except Exception as exc:  # noqa: BLE001 - finalized sessions must be retained
+        logger.warning("session storage failed; writing gated session directly: %s", exc)
+        return gated, write_session_directly(gated)
 
 
 def save_session_safely(session: ResearchSession) -> Path | None:

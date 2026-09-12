@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import fcntl
+import functools
 import hashlib
+import importlib.util
 import json
 import logging
 import os
@@ -11,8 +13,10 @@ import subprocess
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 from urllib.parse import parse_qsl, unquote, urlencode, urlparse, urlunparse
 
 import requests
@@ -29,13 +33,10 @@ from research_engine.apify_accounts import (
 
 from . import l3_guard, paths
 from research_engine.schema import ExtractionMethod, SourceTier
-from research_engine.politeness import Politeness, respect_robots
+from research_engine.politeness import DomainCooldown, Politeness, respect_robots
 
 logger = logging.getLogger("extractor")
-CACHE_DIR = paths.package_path("cache")
-READER_TELEMETRY_LOG = paths.telemetry_path("research-reader-telemetry.jsonl")
 BLOCK_STATUSES = frozenset({401, 403, 407, 429, 451})
-BLOCKED_LOG_PATH = paths.telemetry_path("research-blocked-sources.jsonl")
 _BLOCK_EVENTS: list[dict] = []
 CRAWL4AI_SCRIPT = paths.optional_path(paths.CRAWL4AI_SCRIPT_ENV) or paths.package_path(
     "scripts",
@@ -75,8 +76,45 @@ MARKITDOWN_MIME_TYPES = {
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
 }
 MARKITDOWN_MIME_PREFIXES = ("audio/", "image/")
+
+
+def cache_dir() -> Path:
+    """Return the current extraction cache location."""
+    legacy_path = globals().get("CACHE_DIR")
+    if legacy_path is not None:
+        return Path(legacy_path)
+    return paths.cache_dir()
+
+
+def reader_telemetry_path() -> Path:
+    """Return the current reader telemetry location."""
+    legacy_path = globals().get("READER_TELEMETRY_LOG")
+    if legacy_path is not None:
+        return Path(legacy_path)
+    return paths.telemetry_path("research-reader-telemetry.jsonl")
+
+
+def blocked_log_path() -> Path:
+    """Return the current blocked-source telemetry location."""
+    legacy_path = globals().get("BLOCKED_LOG_PATH")
+    if legacy_path is not None:
+        return Path(legacy_path)
+    return paths.telemetry_path("research-blocked-sources.jsonl")
+
+
+def __getattr__(name: str) -> Path:
+    legacy_paths = {
+        "CACHE_DIR": cache_dir,
+        "READER_TELEMETRY_LOG": reader_telemetry_path,
+        "BLOCKED_LOG_PATH": blocked_log_path,
+    }
+    try:
+        return legacy_paths[name]()
+    except KeyError as exc:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from exc
 KNOWN_METHODS = {method.value for method in ExtractionMethod}
 CF_MARKDOWN_MIN_CHARS = 200
+EXCERPT_CHARS = 1_500
 _GITHUB_SUB_RESOURCES = frozenset(
     {
         "actions",
@@ -107,7 +145,6 @@ _GITINGEST_EXCLUDE_PATTERNS = {
     "*.zip",
 }
 _GITINGEST_TIMEOUT_S = 90
-_GITINGEST_CHAR_CAP = 200_000
 REQUEST_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) "
@@ -168,11 +205,15 @@ PUBLISHER_HOSTS = (
 )
 PAPER_DOI_RE = re.compile(r"10\.\d{4,9}/[^\s\"'<>&]+", re.IGNORECASE)
 PAPER_PII_RE = re.compile(r"S\d{15,17}", re.IGNORECASE)
-__all__ = ["compact_search_results", "extract_clean_text"]
+__all__ = ["compact_search_results", "extract_clean_text", "reset_process_state"]
 
 
 class _MissingPdfDependencyError(RuntimeError):
     pass
+
+
+class _UncacheableHeadResult(RuntimeError):
+    """A failed HEAD probe whose result must not be retained by the cache."""
 
 
 def _is_web_url(value: str) -> bool:
@@ -227,8 +268,9 @@ def note_block(
         status,
     )
     try:
-        BLOCKED_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with BLOCKED_LOG_PATH.open("a", encoding="utf-8") as handle:
+        log_path = blocked_log_path()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(event, default=str) + "\n")
     except Exception as exc:  # pragma: no cover - best-effort side log
         logger.debug("failed to append blocked-source log: %s", exc)
@@ -277,6 +319,21 @@ def _get_politeness():
     return _POLITENESS
 
 
+def reset_process_state() -> None:
+    """Clear extractor-owned process state so each test starts independently."""
+    global _APIFY_ACCOUNT_POOL, _FIRECRAWL_KEY_INDEX, _POLITENESS, _PROXY_BACKEND
+
+    _POLITENESS = None
+    _PROXY_BACKEND = None
+    _APIFY_ACCOUNT_POOL = None
+    _FIRECRAWL_KEY_INDEX = 0
+    _head_content_type_cached.cache_clear()
+    _rung_availability.cache_clear()
+    clear_blocked_events()
+    for legacy_path_name in ("CACHE_DIR", "READER_TELEMETRY_LOG", "BLOCKED_LOG_PATH"):
+        globals().pop(legacy_path_name, None)
+
+
 def _get_apify_account_pool() -> AccountPool | None:
     global _APIFY_ACCOUNT_POOL
     if _APIFY_ACCOUNT_POOL is None:
@@ -313,10 +370,13 @@ def _canonical_seen_url(source_url: str) -> str:
     ]
     query = urlencode(sorted(query_items, key=lambda item: (item[0], item[1])))
     path = parsed.path.rstrip("/") if parsed.path else ""
+    host = parsed.netloc.lower()
+    if host.startswith("www."):
+        host = host[4:]
     return urlunparse(
         (
-            parsed.scheme.lower(),
-            parsed.netloc.lower(),
+            "https" if parsed.scheme.lower() in {"http", "https"} else parsed.scheme.lower(),
+            host,
             path,
             parsed.params,
             query,
@@ -428,8 +488,9 @@ def _ok(payload: dict[str, str | None], *, min_chars: int = 200) -> bool:
 
 def _append_telemetry_row(row: dict) -> None:
     try:
-        READER_TELEMETRY_LOG.parent.mkdir(parents=True, exist_ok=True)
-        with READER_TELEMETRY_LOG.open("a", encoding="utf-8") as handle:
+        log_path = reader_telemetry_path()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as handle:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
             try:
                 handle.write(json.dumps(row) + "\n")
@@ -440,29 +501,31 @@ def _append_telemetry_row(row: dict) -> None:
         logger.warning("reader telemetry append failed: %s", exc)
 
 
-def _log(method: str, started_at: float, success: bool, char_count: int, error: str = "") -> None:
+def _log(method: str, started_at: float, success: bool, char_count: int, error: str = "", *, status: str | None = None, reason: str = "") -> None:
     elapsed_ms = int((time.perf_counter() - started_at) * 1000)
-    status = "success" if success else "fail"
+    row_status = status or ("success" if success else "fail")
     if error:
         logger.warning(
             "method=%s ms=%s status=%s char_count=%s error=%s",
             method,
             elapsed_ms,
-            status,
+            row_status,
             char_count,
             error,
         )
     else:
-        logger.info("method=%s ms=%s status=%s char_count=%s", method, elapsed_ms, status, char_count)
+        logger.info("method=%s ms=%s status=%s char_count=%s", method, elapsed_ms, row_status, char_count)
     row = {
         "ts": time.time(),
         "method": method,
-        "status": status,
+        "status": row_status,
         "elapsed_ms": elapsed_ms,
         "char_count": char_count,
     }
     if error:
         row["error"] = error
+    if reason:
+        row["reason"] = reason
     _append_telemetry_row(row)
 
 
@@ -473,6 +536,8 @@ def _attempt(method: str, fn, *, min_chars: int = 200) -> dict[str, str | None] 
     except _MissingPdfDependencyError:
         _log(method, started_at, False, 0, "MissingPdfDependencyError")
         return None
+    except DomainCooldown:
+        raise
     except Exception as exc:  # pragma: no cover - hard boundary for caller contract
         _log(method, started_at, False, 0, f"{type(exc).__name__}: {exc}")
         return None
@@ -494,6 +559,8 @@ def _attempt_pdf_rung(
     except _MissingPdfDependencyError as exc:
         _log(method, started_at, False, 0, "MissingPdfDependencyError")
         return None, exc
+    except DomainCooldown:
+        raise
     except Exception as exc:  # pragma: no cover - hard boundary for caller contract
         _log(method, started_at, False, 0, f"{type(exc).__name__}: {exc}")
         return None, None
@@ -507,12 +574,18 @@ def _get(
     url: str,
     timeout: int = 30,
     headers: dict[str, str] | None = None,
+    *,
+    group_url: str | None = None,
 ) -> requests.Response:
+    fetch_gate(url, group_url=group_url)
     request_headers = dict(REQUEST_HEADERS)
     if headers:
         request_headers.update(headers)
     response = requests.get(url, headers=request_headers, timeout=timeout)
     if response.status_code in BLOCK_STATUSES:
+        _get_politeness().note_block(
+            _domain(url), response.status_code, response.headers.get("Retry-After")
+        )
         note_block(url, method="http_get", reason="http_status", status=response.status_code)
     return response
 
@@ -522,20 +595,27 @@ def _apify_api_request(
     method: str,
     path: str,
     *,
+    source_url: str,
     json_body: dict | None = None,
     params: dict[str, str | int] | None = None,
     timeout: int = 60,
 ):
     headers = dict(REQUEST_HEADERS)
     headers["Authorization"] = f"Bearer {account.token}"
+    api_url = f"https://api.apify.com{path}"
+    fetch_gate(api_url, group_url=source_url)
     response = requests.request(
         method,
-        f"https://api.apify.com{path}",
+        api_url,
         headers=headers,
         json=json_body,
         params=params,
         timeout=timeout,
     )
+    if response.status_code in BLOCK_STATUSES:
+        _get_politeness().note_block(
+            _domain(api_url), response.status_code, response.headers.get("Retry-After")
+        )
     response.raise_for_status()
     try:
         return response.json()
@@ -559,13 +639,39 @@ def _pdf_detection(source_url: str, local_path: Path | None) -> tuple[bool, bool
     return is_pdf, is_pdf
 
 
+def fetch_gate(url: str, *, group_url: str | None = None) -> None:
+    """The single pre-dispatch door for extractor page requests."""
+    politeness = _get_politeness()
+    politeness.fetch_gate(url, group_url=None)
+    if group_url is not None:
+        politeness.fetch_gate(group_url)
+
+
+@functools.lru_cache(maxsize=4096)
+def _head_content_type_cached(source_url: str) -> str | None:
+    fetch_gate(source_url)
+    response = requests.head(
+        source_url, headers=REQUEST_HEADERS, allow_redirects=True, timeout=10
+    )
+    if response.status_code in BLOCK_STATUSES:
+        _get_politeness().note_block(
+            _domain(source_url), response.status_code, response.headers.get("Retry-After")
+        )
+        note_block(source_url, method="http_head", reason="http_status", status=response.status_code)
+        raise _UncacheableHeadResult()
+    if not 200 <= response.status_code < 300:
+        raise _UncacheableHeadResult()
+    content_type = response.headers.get("content-type", "")
+    return content_type.split(";", 1)[0].strip().lower() or None
+
+
 def _head_content_type(source_url: str) -> str | None:
     try:
-        response = requests.head(
-            source_url, headers=REQUEST_HEADERS, allow_redirects=True, timeout=10
-        )
-        content_type = response.headers.get("content-type", "")
-        return content_type.split(";", 1)[0].strip().lower() or None
+        return _head_content_type_cached(source_url)
+    except DomainCooldown:
+        raise
+    except _UncacheableHeadResult:
+        return None
     except Exception as exc:
         logger.debug("content-type probe failed for %s: %s", source_url, exc)
         return None
@@ -605,28 +711,12 @@ def _fetch_html(source_url: str, local_path: Path | None) -> tuple[str, dict[str
 
 
 def _write_cache(cleaned_text: str) -> tuple[str, str]:
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    active_cache_dir = cache_dir()
+    active_cache_dir.mkdir(parents=True, exist_ok=True)
     content_hash = hashlib.sha256(cleaned_text.encode("utf-8")).hexdigest()
-    raw_text_path = CACHE_DIR / f"{content_hash}.txt"
+    raw_text_path = active_cache_dir / f"{content_hash}.txt"
     raw_text_path.write_text(cleaned_text, encoding="utf-8")
     return content_hash, str(raw_text_path)
-
-
-def _tier_text(cleaned_text: str, tier: SourceTier | None) -> tuple[str, int]:
-    if tier in (None, SourceTier.T1):
-        return cleaned_text, len(cleaned_text)
-    if tier == SourceTier.T2:
-        if len(cleaned_text) <= 9000:
-            return cleaned_text, len(cleaned_text)
-        trimmed_chars = len(cleaned_text) - 9000
-        trimmed_text = (
-            f"{cleaned_text[:8000]}\n\n"
-            f"[... trimmed {trimmed_chars} chars ...]\n\n"
-            f"{cleaned_text[-1000:]}"
-        )
-        return trimmed_text, 9000
-    trimmed_text = cleaned_text[:1500]
-    return trimmed_text, min(len(cleaned_text), 1500)
 
 
 def _claim_seen_url(seen_urls_path: Path | str, source_url: str) -> bool:
@@ -661,7 +751,6 @@ def _record(
 ) -> dict:
     cleaned_text = str(payload["text"])
     content_hash, raw_text_path = _write_cache(cleaned_text)
-    returned_text, returned_char_count = _tier_text(cleaned_text, tier)
     record = {
         "url": source_url,
         "domain": _domain(source_url),
@@ -672,8 +761,10 @@ def _record(
         "content_hash": content_hash,
         "extraction_method": method,
         "raw_text_path": raw_text_path,
-        "char_count": returned_char_count,
-        "char_text_preview": returned_text[:200],
+        "char_count": len(cleaned_text),
+        "char_text_preview": cleaned_text[:200],
+        "text": cleaned_text,
+        "excerpt": cleaned_text[:EXCERPT_CHARS],
         "listicle_flagged": _is_listicle(str(payload["title"]).strip(), source_url),
     }
     if extra:
@@ -692,6 +783,8 @@ def _cloudflare_markdown_preflight(
     started_at = time.perf_counter()
     try:
         response = _get(source_url, timeout=15, headers={"Accept": "text/markdown"})
+    except DomainCooldown:
+        raise
     except Exception as exc:
         logger.debug("cloudflare-markdown preflight failed for %s: %s", source_url, exc)
         return None
@@ -725,6 +818,8 @@ def _pdf_docling(source_url: str, local_path: Path | None) -> dict[str, str | No
     except Exception as exc:  # pragma: no cover - optional dependency
         logger.info("docling unavailable: %s", exc)
         return {}
+    if local_path is None:
+        fetch_gate(source_url)
     source = str(local_path) if local_path is not None else source_url
     result = DocumentConverter().convert(source)
     document = getattr(result, "document", None)
@@ -775,6 +870,8 @@ def _markitdown_convert(path_or_url: str) -> str | None:
         logger.info("markitdown unavailable: %s", exc)
         return None
 
+    if _is_web_url(path_or_url):
+        fetch_gate(path_or_url)
     session = requests.Session()
     session.headers.update(REQUEST_HEADERS)
     session.headers.setdefault(
@@ -783,6 +880,8 @@ def _markitdown_convert(path_or_url: str) -> str | None:
     )
     try:
         result = MarkItDown(requests_session=session).convert(path_or_url)
+    except DomainCooldown:
+        raise
     except Exception as exc:
         logger.info("markitdown convert failed for %s: %s", path_or_url, exc)
         return None
@@ -814,9 +913,14 @@ def _jina(source_url: str) -> dict[str, str | None]:
             f"https://r.jina.ai/{source_url}",
             timeout=45,
             headers={"Authorization": f"Bearer {token}"},
+            group_url=source_url,
         )
     else:
-        response = _get(f"https://r.jina.ai/{source_url}", timeout=45)
+        response = _get(
+            f"https://r.jina.ai/{source_url}",
+            timeout=45,
+            group_url=source_url,
+        )
     response.raise_for_status()
     title = ""
     author = None
@@ -844,6 +948,7 @@ def _firecrawl_proxy(source_url: str) -> dict[str, str | None]:
     headers = dict(request.headers)
     if request.body is not None:
         headers.setdefault("Content-Type", "application/json")
+    fetch_gate(request.url, group_url=source_url)
     response = requests.request(
         request.method,
         request.url,
@@ -851,6 +956,11 @@ def _firecrawl_proxy(source_url: str) -> dict[str, str | None]:
         data=request.body,
         timeout=60,
     )
+    if response.status_code in BLOCK_STATUSES:
+        _get_politeness().note_block(
+            _domain(source_url), response.status_code, response.headers.get("Retry-After")
+        )
+        note_block(source_url, method=ExtractionMethod.FIRECRAWL.value, reason="proxy_http_status", status=response.status_code)
     response.raise_for_status()
     data = response.json()
     return _firecrawl_payload_from_proxy(data, source_url)
@@ -860,10 +970,14 @@ def _firecrawl_payload_from_proxy(data: dict, source_url: str) -> dict[str, str 
     results = data.get("results") if isinstance(data, dict) else None
     if not isinstance(results, list):
         return {}
+    requested_url = _canonical_seen_url(source_url)
     selected = next(
-        (item for item in results if isinstance(item, dict) and item.get("url") == source_url),
-        next((item for item in results if isinstance(item, dict)), {}),
+        (item for item in results if isinstance(item, dict) and _canonical_seen_url(str(item.get("url") or "")) == requested_url),
+        None,
     )
+    if selected is None:
+        note_block(source_url, method=ExtractionMethod.FIRECRAWL.value, reason="url_mismatch")
+        return {}
     body = str(
         selected.get("markdown")
         or selected.get("text")
@@ -877,13 +991,21 @@ def _firecrawl_payload_from_proxy(data: dict, source_url: str) -> dict[str, str 
     return _payload(title, body)
 
 
-def _firecrawl_payload_from_direct(data: dict) -> dict[str, str | None]:
+def _firecrawl_payload_from_direct(
+    data: dict, source_url: str
+) -> dict[str, str | None]:
     scrape_data = data.get("data") if isinstance(data, dict) else None
     if not isinstance(scrape_data, dict):
         return {}
     metadata = scrape_data.get("metadata")
     if not isinstance(metadata, dict):
         metadata = {}
+    returned_url = str(
+        metadata.get("sourceURL") or metadata.get("url") or scrape_data.get("url") or ""
+    )
+    if _canonical_seen_url(returned_url) != _canonical_seen_url(source_url):
+        note_block(source_url, method=ExtractionMethod.FIRECRAWL.value, reason="url_mismatch")
+        return {}
     body = str(
         scrape_data.get("markdown")
         or scrape_data.get("text")
@@ -922,6 +1044,7 @@ def _firecrawl(source_url: str) -> dict[str, str | None]:
     for attempt in range(len(keys)):
         env_var, key = _next_firecrawl_key(keys)
         logger.info("firecrawl path=direct key=%s", env_var)
+        fetch_gate(FIRECRAWL_SCRAPE_URL, group_url=source_url)
         response = requests.request(
             "POST",
             FIRECRAWL_SCRAPE_URL,
@@ -938,11 +1061,15 @@ def _firecrawl(source_url: str) -> dict[str, str | None]:
         except requests.HTTPError as exc:
             last_error = exc
             status = getattr(getattr(exc, "response", None), "status_code", response.status_code)
+            if status in BLOCK_STATUSES:
+                _get_politeness().note_block(
+                    _domain(source_url), status, response.headers.get("Retry-After")
+                )
             if status in FIRECRAWL_ADVANCE_STATUSES and attempt < len(keys) - 1:
                 logger.info("firecrawl direct key failed with status=%s; advancing key", status)
                 continue
             raise
-        return _firecrawl_payload_from_direct(response.json())
+        return _firecrawl_payload_from_direct(response.json(), source_url)
 
     if last_error is not None:
         raise last_error
@@ -960,11 +1087,7 @@ def _trafilatura(source_url: str, local_path: Path | None) -> dict[str, str | No
 
 
 def _crawl4ai(source_url: str) -> dict[str, str | None]:
-    try:
-        _, meta = _fetch_html(source_url, None)
-    except Exception as exc:
-        logger.debug("crawl4ai meta-probe failed for %s: %s", source_url, exc)
-        meta = {}
+    fetch_gate(source_url)
     result = subprocess.run(
         [paths.require_executable(paths.PYTHON_BIN_ENV, "python3"), str(CRAWL4AI_SCRIPT), source_url],
         check=False,
@@ -972,9 +1095,10 @@ def _crawl4ai(source_url: str) -> dict[str, str | None]:
         text=True,
         timeout=60,
     )
+    if result.returncode in {403, 429}:
+        _get_politeness().note_block(_domain(source_url), result.returncode)
     body = result.stdout.strip()
-    title = str(meta.get("title") or _title_from_text(body)).strip()
-    return _payload(title, body, meta.get("author"), meta.get("published_date"))
+    return _payload(_title_from_text(body), body)
 
 
 def _run_async(coro):
@@ -1002,6 +1126,8 @@ async def _crawlee_http_fetch(source_url: str, proxy_url: str | None) -> dict[st
         response = context.http_response
         status = int(getattr(response, "status_code", 0) or 0)
         if status >= 400:
+            if status in BLOCK_STATUSES:
+                _get_politeness().note_block(_domain(source_url), status)
             if context.session:
                 context.session.mark_bad()
             return
@@ -1044,9 +1170,9 @@ def _crawlee_http(
         return {}
 
     domain = _domain(source_url)
+    fetch_gate(source_url)
     backend = _get_proxy_backend()
     session = backend.acquire(domain=domain, sticky=use_sticky)
-    politeness.wait(domain)
     released = False
 
     try:
@@ -1063,6 +1189,8 @@ def _crawlee_http(
             "ladder_depth": 6,
         }
         return payload
+    except DomainCooldown:
+        raise
     except Exception as exc:
         logger.info("crawlee http failed for %s: %s", source_url, exc)
         if not released:
@@ -1086,9 +1214,9 @@ def _scrapling_stealth(
         return {}
 
     domain = _domain(source_url)
+    fetch_gate(source_url)
     backend = _get_proxy_backend()
     session = backend.acquire(domain=domain, sticky=use_sticky)
-    politeness.wait(domain)
     released = False
 
     try:
@@ -1102,7 +1230,10 @@ def _scrapling_stealth(
             block_webrtc=True,
         )
         html = str(getattr(page, "html_content", "") or "")
-        ok = bool(page) and int(getattr(page, "status", 0) or 0) < 400 and bool(html.strip())
+        status = int(getattr(page, "status", 0) or 0)
+        if status in BLOCK_STATUSES:
+            _get_politeness().note_block(_domain(source_url), status)
+        ok = bool(page) and status < 400 and bool(html.strip())
         backend.release(session, ok=ok)
         released = True
         if not ok:
@@ -1123,6 +1254,8 @@ def _scrapling_stealth(
             "ladder_depth": 6,
         }
         return payload
+    except DomainCooldown:
+        raise
     except Exception as exc:
         logger.info("scrapling stealth failed for %s: %s", source_url, exc)
         if not released:
@@ -1151,7 +1284,7 @@ def _agent_browser(
         note_block(source_url, method="agent_browser", reason="robots_disallow")
         return None
 
-    politeness.wait(_domain(source_url))
+    fetch_gate(source_url)
     timeout = int(os.environ.get("WEBREAD_L3_TIMEOUT_S", "120"))
     agent_browser_bin = paths.require_executable(
         paths.AGENT_BROWSER_BIN_ENV,
@@ -1258,7 +1391,7 @@ def _apify_item_text(item: dict) -> str:
     for field in ("text", "markdown", "body", "content", "caption", "description", "html"):
         value = item.get(field)
         if not value:
-            continue
+            return None
         if field == "html":
             return BeautifulSoup(str(value), "html.parser").get_text("\n")
         return str(value)
@@ -1301,6 +1434,7 @@ def _apify_actor_fetch(source_url: str) -> dict[str, str | None]:
             account,
             "POST",
             route.runs_path,
+            source_url=source_url,
             json_body=_apify_actor_input(source_url, route),
             timeout=60,
         )
@@ -1315,6 +1449,7 @@ def _apify_actor_fetch(source_url: str) -> dict[str, str | None]:
                 account,
                 "GET",
                 f"/v2/actor-runs/{run_id}",
+                source_url=source_url,
                 params={"waitForFinish": APIFY_WAIT_FOR_FINISH_S},
                 timeout=APIFY_WAIT_FOR_FINISH_S + 10,
             )
@@ -1330,6 +1465,7 @@ def _apify_actor_fetch(source_url: str) -> dict[str, str | None]:
                 account,
                 "GET",
                 f"/v2/actor-runs/{run_id}/dataset/items",
+                source_url=source_url,
                 params={"format": "json", "clean": "true"},
                 timeout=60,
             )
@@ -1350,6 +1486,7 @@ def _apify_actor_fetch(source_url: str) -> dict[str, str | None]:
                     account,
                     "GET",
                     f"/v2/actor-runs/{run_id}/key-value-store/records/{APIFY_OUTPUT_RECORD_KEY}",
+                    source_url=source_url,
                     timeout=60,
                 )
             except requests.HTTPError as exc:
@@ -1368,6 +1505,8 @@ def _apify_actor_fetch(source_url: str) -> dict[str, str | None]:
             "ladder_depth": 1 if route.platform in {"instagram", "tiktok"} else 7,
         }
         return payload
+    except DomainCooldown:
+        raise
     except Exception as exc:
         logger.info("apify fallback failed for %s: %s", source_url, exc)
         return {}
@@ -1500,15 +1639,78 @@ def _extract_apify_route(
     return _finalize_record(source_url, ExtractionMethod.APIFY.value, payload, tier=tier, extra=extra)
 
 
+@dataclass(frozen=True)
+class Rung:
+    name: str
+    fn: Callable[[str], dict[str, str | None]]
+    available: Callable[[], tuple[bool, str]]
+    carries_fetch_meta: bool
+
+
+def _always_available() -> tuple[bool, str]:
+    return True, ""
+
+
+def _firecrawl_available() -> tuple[bool, str]:
+    from research_engine.fetch_proxy import load_firecrawl_keys_from_env
+
+    if load_firecrawl_keys_from_env():
+        return True, ""
+    return False, "no FIRECRAWL_API_KEY_n configured"
+
+
+def _crawl4ai_available() -> tuple[bool, str]:
+    if CRAWL4AI_SCRIPT.is_file():
+        return True, ""
+    return False, f"script missing: {CRAWL4AI_SCRIPT}"
+
+
+def _import_available(module: str) -> tuple[bool, str]:
+    if importlib.util.find_spec(module) is not None:
+        return True, ""
+    return False, f"import missing: {module}"
+
+
+def _scrapling_available() -> tuple[bool, str]:
+    return _import_available("scrapling")
+
+
+def _crawlee_available() -> tuple[bool, str]:
+    return _import_available("crawlee")
+
+
+def _jina_available() -> tuple[bool, str]:
+    from research_engine.fetch_proxy import env_value
+
+    return (True, "") if env_value("JINA_API_KEY") else (False, "no JINA_API_KEY")
+
+
+def _cloudflare_markdown(source_url: str) -> dict[str, str | None]:
+    result = _cloudflare_markdown_preflight(source_url)
+    if result is None:
+        return {}
+    payload, _ = result
+    return payload
+
+
+WEB_RUNGS = (
+    Rung(ExtractionMethod.CLOUDFLARE_MARKDOWN.value, lambda url: _cloudflare_markdown(url), _always_available, False),
+    Rung(ExtractionMethod.TRAFILATURA.value, lambda url: _trafilatura(url, None), _always_available, False),
+    Rung(ExtractionMethod.FIRECRAWL.value, lambda url: _firecrawl(url), lambda: _firecrawl_available(), False),
+    Rung(ExtractionMethod.CRAWL4AI.value, lambda url: _crawl4ai(url), lambda: _crawl4ai_available(), False),
+    Rung(ExtractionMethod.SCRAPLING.value, lambda url: _scrapling_stealth(url), lambda: _scrapling_available(), True),
+    Rung(ExtractionMethod.CRAWLEE.value, lambda url: _crawlee_http(url), lambda: _crawlee_available(), True),
+    Rung(ExtractionMethod.JINA.value, lambda url: _jina(url), lambda: _jina_available(), False),
+)
+
+
+@functools.lru_cache(maxsize=None)
+def _rung_availability(name: str) -> tuple[bool, str]:
+    return next(rung.available() for rung in WEB_RUNGS if rung.name == name)
+
+
 def _web_ladder_rungs(source_url: str):
-    return [
-        (ExtractionMethod.TRAFILATURA.value, lambda: _trafilatura(source_url, None), False),
-        (ExtractionMethod.CRAWL4AI.value, lambda: _crawl4ai(source_url), False),
-        (ExtractionMethod.JINA.value, lambda: _jina(source_url), False),
-        (ExtractionMethod.CRAWLEE.value, lambda: _crawlee_http(source_url), True),
-        (ExtractionMethod.SCRAPLING.value, lambda: _scrapling_stealth(source_url), True),
-        (ExtractionMethod.FIRECRAWL.value, lambda: _firecrawl(source_url), False),
-    ]
+    return [(rung, lambda rung=rung: rung.fn(source_url)) for rung in WEB_RUNGS]
 
 
 def _extract_web_ladder(
@@ -1517,18 +1719,51 @@ def _extract_web_ladder(
     min_chars: int,
     tier: SourceTier | None,
 ) -> dict | None:
-    for method, fn, carries_fetch_meta in _web_ladder_rungs(source_url):
-        payload = _attempt(method, fn, min_chars=min_chars)
+    availability = {rung.name: _rung_availability(rung.name) for rung in WEB_RUNGS}
+    for name, (available, reason) in availability.items():
+        if not available:
+            _log(name, time.perf_counter(), False, 0, status="skipped", reason=reason)
+    for rung, fn in _web_ladder_rungs(source_url):
+        available, reason = availability[rung.name]
+        if not available:
+            continue
+        try:
+            payload = (
+                fn()
+                if rung.name == ExtractionMethod.CLOUDFLARE_MARKDOWN.value
+                else _attempt(rung.name, fn, min_chars=min_chars)
+            )
+        except DomainCooldown as exc:
+            _log(
+                rung.name,
+                time.perf_counter(),
+                False,
+                0,
+                status="domain_cooldown",
+                reason=f"{exc.group} {exc.seconds_remaining:.1f}s",
+            )
+            return None
         if not payload:
             continue
-        extra = {"fetch_meta": payload["fetch_meta"]} if carries_fetch_meta and payload.get("fetch_meta") else None
-        return _finalize_record(source_url, method, payload, tier=tier, extra=extra)
+        extra = {"fetch_meta": payload["fetch_meta"]} if rung.carries_fetch_meta and payload.get("fetch_meta") else None
+        return _finalize_record(source_url, rung.name, payload, tier=tier, extra=extra)
     if tier == SourceTier.T3:
-        payload = _attempt(
-            ExtractionMethod.AGENT_BROWSER.value,
-            lambda: _agent_browser(source_url, tier=tier),
-            min_chars=min_chars,
-        )
+        try:
+            payload = _attempt(
+                ExtractionMethod.AGENT_BROWSER.value,
+                lambda: _agent_browser(source_url, tier=tier),
+                min_chars=min_chars,
+            )
+        except DomainCooldown as exc:
+            _log(
+                ExtractionMethod.AGENT_BROWSER.value,
+                time.perf_counter(),
+                False,
+                0,
+                status="domain_cooldown",
+                reason=f"{exc.group} {exc.seconds_remaining:.1f}s",
+            )
+            return None
         if payload:
             return _finalize_record(
                 source_url,
@@ -1548,23 +1783,45 @@ def _extract_publisher_or_wayback(
     if _plausibly_paper_url(source_url):
         from research_engine.publisher_fallback import try_publisher_fallback
 
-        payload = _attempt(
-            ExtractionMethod.PUBLISHER_OA.value,
-            lambda: try_publisher_fallback(source_url),
-            min_chars=min_chars,
-        )
+        try:
+            payload = _attempt(
+                ExtractionMethod.PUBLISHER_OA.value,
+                lambda: try_publisher_fallback(source_url),
+                min_chars=min_chars,
+            )
+        except DomainCooldown as exc:
+            _log(ExtractionMethod.PUBLISHER_OA.value, time.perf_counter(), False, 0,
+                 status="domain_cooldown", reason=f"{exc.group} {exc.seconds_remaining:.1f}s")
+            return None
         if payload:
             return _finalize_record(
                 source_url, ExtractionMethod.PUBLISHER_OA.value, payload, tier=tier
             )
 
-    from research_engine.wayback_fallback import try_wayback
+    from research_engine.wayback_fallback import keys_available, try_wayback
 
-    payload = _attempt(
-        ExtractionMethod.WAYBACK.value,
-        lambda: try_wayback(source_url),
-        min_chars=min_chars,
-    )
+    available, reason = keys_available()
+    if not available:
+        _log(
+            ExtractionMethod.WAYBACK.value,
+            time.perf_counter(),
+            False,
+            0,
+            status="skipped",
+            reason=reason,
+        )
+        return None
+
+    try:
+        payload = _attempt(
+            ExtractionMethod.WAYBACK.value,
+            lambda: try_wayback(source_url),
+            min_chars=min_chars,
+        )
+    except DomainCooldown as exc:
+        _log(ExtractionMethod.WAYBACK.value, time.perf_counter(), False, 0,
+             status="domain_cooldown", reason=f"{exc.group} {exc.seconds_remaining:.1f}s")
+        return None
     if payload:
         return _finalize_record(source_url, ExtractionMethod.WAYBACK.value, payload, tier=tier)
     return None
@@ -1610,6 +1867,7 @@ def _gitingest(url: str, branch: str | None = None) -> dict[str, str | None] | N
     owner, repo, parsed_branch = parts
     effective_branch = branch if branch is not None else parsed_branch
     repo_url = f"https://github.com/{owner}/{repo}"
+    fetch_gate(repo_url)
     executor = ThreadPoolExecutor(max_workers=1)
     try:
         from gitingest import ingest
@@ -1621,6 +1879,8 @@ def _gitingest(url: str, branch: str | None = None) -> dict[str, str | None] | N
             exclude_patterns=_GITINGEST_EXCLUDE_PATTERNS,
         )
         summary, tree, content = future.result(timeout=_GITINGEST_TIMEOUT_S)
+    except DomainCooldown:
+        raise
     except Exception as exc:
         logger.debug("gitingest failed for %s: %s", url, exc)
         return None
@@ -1628,8 +1888,6 @@ def _gitingest(url: str, branch: str | None = None) -> dict[str, str | None] | N
         executor.shutdown(wait=False, cancel_futures=True)
 
     body = f"{summary}\n\n{tree}\n\n{content}"
-    if len(body) > _GITINGEST_CHAR_CAP:
-        body = body[:_GITINGEST_CHAR_CAP] + f"\n\n[truncated at {_GITINGEST_CHAR_CAP} chars]"
     title = f"{owner}/{repo} — GitHub repo (gitingest)"
     return _payload(title, body)
 
@@ -1682,47 +1940,63 @@ def extract_clean_text(
             "extraction_method": "skipped_duplicate",
         }
 
-    handled_as_document = _is_document_source(source_url, local_path)
-    extracted = _extract_pdf_or_document(
-        source_url,
-        local_path,
-        prefer_pdf_engine=prefer_pdf_engine,
-        min_chars=min_chars,
-        tier=tier,
-    )
+    try:
+        handled_as_document = _is_document_source(source_url, local_path)
+        extracted = _extract_pdf_or_document(
+            source_url,
+            local_path,
+            prefer_pdf_engine=prefer_pdf_engine,
+            min_chars=min_chars,
+            tier=tier,
+        )
+    except DomainCooldown as exc:
+        _log("head", time.perf_counter(), False, 0, status="domain_cooldown",
+             reason=f"{exc.group} {exc.seconds_remaining:.1f}s")
+        return None
     if extracted or handled_as_document:
         return extracted
 
-    extracted = _extract_github_repo(source_url, min_chars=min_chars, tier=tier)
-    if extracted:
-        return extracted
-
-    if _is_web_url(source_url):
-        extracted = _extract_apify_route(source_url, min_chars=min_chars, tier=tier)
-        if actor_route_for_url(source_url):
-            return extracted
+    try:
+        extracted = _extract_github_repo(source_url, min_chars=min_chars, tier=tier)
         if extracted:
             return extracted
 
-        extracted = _extract_web_ladder(source_url, min_chars=min_chars, tier=tier)
-        if extracted:
-            return extracted
-        extracted = _extract_publisher_or_wayback(source_url, min_chars=min_chars, tier=tier)
-        if extracted:
-            return extracted
-        note_block(source_url, method="ladder", reason="all_rungs_failed")
-        return None
+        if _is_web_url(source_url):
+            extracted = _extract_apify_route(source_url, min_chars=min_chars, tier=tier)
+            if actor_route_for_url(source_url):
+                return extracted
+            if extracted:
+                return extracted
 
-    payload = _attempt(
-        ExtractionMethod.TRAFILATURA.value,
-        lambda: _trafilatura(source_url, local_path),
-        min_chars=min_chars,
-    )
-    if payload:
-        return _finalize_record(
-            source_url, ExtractionMethod.TRAFILATURA.value, payload, tier=tier
+            extracted = _extract_web_ladder(source_url, min_chars=min_chars, tier=tier)
+            if extracted:
+                return extracted
+            extracted = _extract_publisher_or_wayback(source_url, min_chars=min_chars, tier=tier)
+            if extracted:
+                return extracted
+            note_block(source_url, method="ladder", reason="all_rungs_failed")
+            return None
+
+        payload = _attempt(
+            ExtractionMethod.TRAFILATURA.value,
+            lambda: _trafilatura(source_url, local_path),
+            min_chars=min_chars,
         )
-    return None
+        if payload:
+            return _finalize_record(
+                source_url, ExtractionMethod.TRAFILATURA.value, payload, tier=tier
+            )
+        return None
+    except DomainCooldown as exc:
+        _log(
+            "extract_clean_text",
+            time.perf_counter(),
+            False,
+            0,
+            status="domain_cooldown",
+            reason=f"{exc.group} {exc.seconds_remaining:.1f}s",
+        )
+        return None
 
 
 if __name__ == "__main__":
@@ -1763,9 +2037,9 @@ if __name__ == "__main__":
         ):
             result = extract_clean_text("https://example.com", tier=SourceTier.T2)
         assert result is not None
-        assert result["char_count"] <= 9000
+        assert result["char_count"] == len(result["text"])
+        assert len(result["excerpt"]) <= EXCERPT_CHARS
         assert Path(result["raw_text_path"]).exists()
-        assert len(Path(result["raw_text_path"]).read_text(encoding="utf-8")) > result["char_count"]
 
     def tier_t3_test() -> None:
         with patch(__name__ + "._is_pdf", return_value=False), patch(
@@ -1773,7 +2047,8 @@ if __name__ == "__main__":
         ):
             result = extract_clean_text("https://example.com", tier=SourceTier.T3)
         assert result is not None
-        assert result["char_count"] <= 1500
+        assert result["char_count"] == len(result["text"])
+        assert len(result["excerpt"]) <= EXCERPT_CHARS
 
     def dedup_test() -> None:
         assert _canonical_seen_url("https://example.com/Page#section?utm_source=x") == _canonical_seen_url(

@@ -169,7 +169,7 @@ lanes:
     command: "{RESEARCH_ENGINE_AGY_BIN}"
     profile: "canonical-agy"
     model_candidates:
-      - "Gemini 3.7 Flash (Medium)"
+      - "Gemini 3.8 Flash (Medium)"
     auth: oauth_subscription
     cost_per_call_usd: 0.0
     notes: "Front scout lane for /research and /deep-research only. The canonical agy binary receives the exact friendly --model name. Skip Gemini probes when unattended or when the locked daily budget is exhausted."
@@ -591,7 +591,7 @@ failsafe:
   abstention_message: "Insufficient evidence — refine query or expand search."
 
 # ---------------------------------------------------------------------------
-# Gemini 3.7 Flash scout front stage.
+# Gemini 3.8 Flash scout front stage.
 # ---------------------------------------------------------------------------
 
 scout:
@@ -607,13 +607,13 @@ scout:
   # The dispatcher passes the exact friendly model name via --model. It skips
   # Gemini probes for unattended runs and when the locked daily cap is full.
   model_candidates:
-    - "Gemini 3.7 Flash (Medium)"
+    - "Gemini 3.8 Flash (Medium)"
   fallback_flag: "--pro-synthesis-fallback"
 
 fleets:
   research:
     worker_count: 3
-    scout_model: "Gemini 3.7 Flash (Medium)"
+    scout_model: "Gemini 3.8 Flash (Medium)"
     scout_home: "{RESEARCH_ENGINE_AGY_BIN}"
     workers:
       - count: 1
@@ -630,7 +630,7 @@ fleets:
         provider: grok_cli
   deep_research:
     worker_count: 16
-    scout_model: "Gemini 3.7 Flash (Medium)"
+    scout_model: "Gemini 3.8 Flash (Medium)"
     scout_home: "{RESEARCH_ENGINE_AGY_BIN}"
     workers:
       - count: 5

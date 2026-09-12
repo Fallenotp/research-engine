@@ -39,7 +39,6 @@ SUFFICIENCY_OLLAMA_MODEL = (
     or os.getenv("BUZZ_OLLAMA_MODEL")
     or ""
 ).strip()
-SUFFICIENCY_SKIP_MODEL = "sufficiency-skip"
 PREFERRED_OLLAMA_MODELS = (
     "qwen3.5:9b",
     "qwen2.5:7b",
@@ -142,6 +141,8 @@ class CLIJsonClient:
             return [
                 self.executable,
                 SUFFICIENCY_AGY_SKIP_PERMISSIONS_FLAG,
+                "--model",
+                self.model_id,
                 "--print",
                 _agy_prompt_arg(prompt),
             ]
@@ -206,42 +207,8 @@ class CLIJsonClient:
         return env
 
 
-class SkipSufficiencyClient:
-    """Return permissive no-op verdicts when no sanctioned checker is available."""
-
-    provider_label = "skip"
-    model_id = SUFFICIENCY_SKIP_MODEL
-
-    def __init__(self) -> None:
-        self.prompt_chars = 0
-        self.output_chars = 0
-        self.call_count = 0
-
-    def generate_json(self, prompt: str) -> dict[str, Any]:
-        self.prompt_chars += len(prompt)
-        self.call_count += 1
-        if "query relevance filter" in prompt:
-            payload = {
-                "verdict": "relevant",
-                "reason": "The sufficiency gate was skipped because no sanctioned local provider was available.",
-            }
-        elif "Rewrite the search query to fill the missing evidence gap." in prompt:
-            payload = {"query": ""}
-        else:
-            payload = {
-                "verdict": "sufficient",
-                "reason": "The sufficiency gate was skipped because no sanctioned local provider was available.",
-                "missing": [],
-            }
-        rendered = json.dumps(payload)
-        self.output_chars += len(rendered)
-        return payload
-
-
-def get_sufficiency_clients() -> tuple[SufficiencyClient, SufficiencyClient]:
-    skip_client = SkipSufficiencyClient()
+def get_sufficiency_clients() -> tuple[SufficiencyClient | None, SufficiencyClient | None]:
     gemini_executable = _resolve_agy_executable()
-    ollama_runtime = _resolve_ollama_runtime()
     gemini_client = (
         CLIJsonClient(
             provider_label="flash",
@@ -252,23 +219,7 @@ def get_sufficiency_clients() -> tuple[SufficiencyClient, SufficiencyClient]:
         if gemini_executable
         else None
     )
-    ollama_client = (
-        CLIJsonClient(
-            provider_label="ollama-fallback",
-            model_id=ollama_runtime[1],
-            executable=ollama_runtime[0],
-            timeout_seconds=SUFFICIENCY_TIMEOUT_SECONDS,
-        )
-        if ollama_runtime
-        else None
-    )
-    if gemini_client and ollama_client:
-        return gemini_client, ollama_client
-    if gemini_client:
-        return gemini_client, skip_client
-    if ollama_client:
-        return ollama_client, skip_client
-    return skip_client, skip_client
+    return gemini_client, None
 
 
 def run_sufficiency_loop(
@@ -276,7 +227,7 @@ def run_sufficiency_loop(
     query: str,
     source_texts: Sequence[SourceText],
     retriever: Callable[[str], Sequence[SourceText]] | None = None,
-    clients: tuple[SufficiencyClient, SufficiencyClient] | None = None,
+    clients: tuple[SufficiencyClient | None, SufficiencyClient | None] | None = None,
     max_recovery_iterations: int = MAX_RECOVERY_ITERATIONS,
 ) -> dict[str, Any]:
     """Judge raw sources and optionally run a bounded recovery loop."""
@@ -303,6 +254,15 @@ def run_sufficiency_loop(
                 "judge": judge,
             }
         )
+        if judge.get("fail_stage") == "no_checker":
+            return _loop_result(
+                query=query,
+                attempts=attempts,
+                reformulations=reformulations,
+                terminal_state="unchecked",
+                stop_reason="checker_unavailable",
+                max_recovery_iterations=max_recovery_iterations,
+            )
         verdict = str(judge.get("verdict") or "insufficient")
         if verdict == "sufficient":
             return _loop_result(
@@ -376,12 +336,22 @@ def judge_sufficiency(
     *,
     query: str,
     source_texts: Sequence[SourceText],
-    clients: tuple[SufficiencyClient, SufficiencyClient] | None = None,
+    clients: tuple[SufficiencyClient | None, SufficiencyClient | None] | None = None,
 ) -> dict[str, Any]:
     """Run one query-aware judge call against raw sources only."""
 
     primary, fallback = clients or get_sufficiency_clients()
     capped_sources = cap_source_texts(source_texts)
+    if primary is None:
+        return fail_closed_decision(
+            query=query,
+            source_texts=capped_sources,
+            primary_error=SufficiencyError("no checker available"),
+            fallback_error=None,
+            fallback_model="none",
+            client=(None, None),
+            fail_stage="no_checker",
+        )
     if SUFFICIENCY_PREFILTER_ENABLED:
         try:
             filtered_sources, prefilter = filter_relevant_source_texts(
@@ -421,6 +391,17 @@ def judge_sufficiency(
             prefilter=prefilter,
         )
     except Exception as primary_exc:  # noqa: BLE001 - locked fallback boundary
+        if fallback is None:
+            return fail_closed_decision(
+                query=query,
+                source_texts=filtered_sources,
+                primary_error=primary_exc,
+                fallback_error=None,
+                fallback_model="none",
+                client=(primary, None),
+                fail_stage="judge",
+                prefilter=prefilter,
+            )
         try:
             return _judge_with_client(
                 query,
@@ -447,13 +428,17 @@ def reformulate_query(
     *,
     query: str,
     decision: dict[str, Any],
-    clients: tuple[SufficiencyClient, SufficiencyClient] | None = None,
+    clients: tuple[SufficiencyClient | None, SufficiencyClient | None] | None = None,
 ) -> str:
     primary, fallback = clients or get_sufficiency_clients()
+    if primary is None:
+        raise SufficiencyError("no checker available")
     prompt = build_reformulation_prompt(query, decision)
     try:
         payload = primary.generate_json(prompt)
     except Exception:
+        if fallback is None:
+            raise SufficiencyError("no fallback checker available")
         payload = fallback.generate_json(prompt)
     reformulated = " ".join(str(payload.get("query") or "").split())
     return reformulated[:300]
@@ -464,21 +449,25 @@ def fail_closed_decision(
     query: str,
     source_texts: Sequence[SourceText],
     primary_error: Exception,
-    fallback_error: Exception,
+    fallback_error: Exception | None,
     fallback_model: str,
-    client: SufficiencyClient | Sequence[SufficiencyClient] | None = None,
+    client: SufficiencyClient | Sequence[SufficiencyClient | None] | None = None,
     fail_stage: str = "judge",
     prefilter: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     decision = _base_decision(query, source_texts)
     decision.update(
         {
-            "verdict": "insufficient",
+            "verdict": None if fail_stage == "no_checker" else "insufficient",
             "reason": "checker_failed_closed",
             "missing": ["The sufficiency checker was unavailable."],
-            "checker_route": "failed-closed",
+            "checker_route": "unavailable" if fail_stage == "no_checker" else "failed-closed",
             "checker_error": f"{type(primary_error).__name__}: {primary_error}",
-            "fallback_error": f"{type(fallback_error).__name__}: {fallback_error}",
+            "fallback_error": (
+                f"{type(fallback_error).__name__}: {fallback_error}"
+                if fallback_error is not None
+                else None
+            ),
             "model": None,
             "fallback_model": fallback_model,
             "checker_usage": checker_usage(client),
@@ -493,7 +482,7 @@ def fail_closed_decision(
 
 def low_confidence_reason_for_result(result: dict[str, Any]) -> str:
     final = final_judge(result)
-    if final.get("checker_route") == "failed-closed":
+    if final.get("checker_route") in {"failed-closed", "unavailable"}:
         return CHECKER_UNAVAILABLE_REASON
     missing = final.get("missing") or []
     missing_text = "; ".join(str(item) for item in missing if str(item).strip())
@@ -681,7 +670,7 @@ def extract_json_object(text: str) -> dict[str, Any]:
 
 
 def checker_usage(
-    client: SufficiencyClient | Sequence[SufficiencyClient] | None,
+    client: SufficiencyClient | Sequence[SufficiencyClient | None] | None,
 ) -> dict[str, int]:
     if client is None:
         return {"call_count": 0, "prompt_chars": 0, "output_chars": 0}
@@ -694,6 +683,8 @@ def checker_usage(
     prompt_chars = 0
     output_chars = 0
     for current in clients:
+        if current is None:
+            continue
         current_prompt_chars = int(getattr(current, "prompt_chars", 0))
         current_output_chars = int(getattr(current, "output_chars", 0))
         if current_prompt_chars == 0 and hasattr(current, "prompts"):
@@ -762,9 +753,11 @@ def filter_relevant_source_texts(
     *,
     query: str,
     source_texts: Sequence[SourceText],
-    clients: tuple[SufficiencyClient, SufficiencyClient] | None = None,
+    clients: tuple[SufficiencyClient | None, SufficiencyClient | None] | None = None,
 ) -> tuple[list[SourceText], dict[str, Any]]:
     primary, fallback = clients or get_sufficiency_clients()
+    if primary is None:
+        raise SufficiencyError("no checker available")
     capped_sources = cap_source_texts(source_texts)
     kept: list[SourceText] = []
     dropped: list[dict[str, Any]] = []
@@ -803,9 +796,11 @@ def _check_source_relevance(
     *,
     query: str,
     source: SourceText,
-    primary: SufficiencyClient,
-    fallback: SufficiencyClient,
+    primary: SufficiencyClient | None,
+    fallback: SufficiencyClient | None,
 ) -> dict[str, Any]:
+    if primary is None:
+        raise SufficiencyError("no checker available")
     try:
         return _check_source_relevance_with_client(
             query=query,
@@ -815,6 +810,8 @@ def _check_source_relevance(
             checker_error=None,
         )
     except Exception as primary_exc:  # noqa: BLE001 - locked fallback boundary
+        if fallback is None:
+            raise SufficiencyError("no fallback checker available") from primary_exc
         return _check_source_relevance_with_client(
             query=query,
             source=source,
@@ -869,7 +866,7 @@ def _loop_result(
         "reason": final.get("reason", ""),
         "missing": final.get("missing", []),
         "proceed": terminal_state in {"sufficient", "partial"},
-        "low_confidence": terminal_state in {"partial", "exhausted"},
+        "low_confidence": terminal_state in {"partial", "exhausted", "unchecked"},
         "stop_reason": stop_reason,
         "max_recovery_iterations": max_recovery_iterations,
         "recovery_iterations": len(reformulations),
@@ -886,6 +883,8 @@ def _loop_result(
             "could not substantiate from available sources; "
             f"tried: {tried}"
         )
+    elif terminal_state == "unchecked":
+        result["result_message"] = CHECKER_UNAVAILABLE_REASON
     return result
 
 
@@ -968,7 +967,9 @@ def _preview(value: str, limit: int = 500) -> str:
     return f"{compact[:limit]}..."
 
 
-def _client_route(client: SufficiencyClient) -> str:
+def _client_route(client: SufficiencyClient | None) -> str:
+    if client is None:
+        return "unavailable"
     return str(getattr(client, "provider_label", "unknown") or "unknown")
 
 

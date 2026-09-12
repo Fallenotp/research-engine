@@ -20,8 +20,6 @@ except ModuleNotFoundError:  # pragma: no cover - direct script execution fallba
 SESSIONS_DIR = paths.optional_path(paths.RESEARCH_SESSIONS_DIR_ENV) or paths.home_path(
     ".claude", "research-sessions"
 )
-MASTER_LOG = paths.telemetry_path("research-telemetry.jsonl")
-CALL_LOG = paths.telemetry_path("research-call-log.jsonl")
 ROW_FIELDS = (
     "ts",
     "run_ts",
@@ -60,15 +58,40 @@ CALL_LOG_FIELDS = (
 logger = logging.getLogger(__name__)
 
 
+def master_log_path() -> Path:
+    """Return the current session telemetry location."""
+    legacy_path = globals().get("MASTER_LOG")
+    if legacy_path is not None:
+        return Path(legacy_path)
+    return paths.telemetry_path("research-telemetry.jsonl")
+
+
+def call_log_path() -> Path:
+    """Return the current search-call telemetry location."""
+    legacy_path = globals().get("CALL_LOG")
+    if legacy_path is not None:
+        return Path(legacy_path)
+    return paths.telemetry_path("research-call-log.jsonl")
+
+
+def __getattr__(name: str) -> Path:
+    legacy_paths = {"MASTER_LOG": master_log_path, "CALL_LOG": call_log_path}
+    try:
+        return legacy_paths[name]()
+    except KeyError as exc:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from exc
+
+
 def _telemetry_parent_is_configured() -> bool:
-    if MASTER_LOG.parent.exists():
+    master_log = master_log_path()
+    if master_log.parent.exists():
         return True
-    if os.environ.get(paths.DATA_DIR_ENV, "").strip() or MASTER_LOG.parent != paths.data_dir():
-        MASTER_LOG.parent.mkdir(parents=True, exist_ok=True)
+    if os.environ.get(paths.DATA_DIR_ENV, "").strip() or master_log.parent != paths.data_dir():
+        master_log.parent.mkdir(parents=True, exist_ok=True)
         return True
     logger.warning(
         paths.missing_config_message(
-            MASTER_LOG.parent,
+            master_log.parent,
             paths.DATA_DIR_ENV,
             label="Telemetry root",
         )
@@ -193,12 +216,12 @@ def _append_row(row: dict[str, Any]) -> Exception | None:
         if not _telemetry_parent_is_configured():
             return FileNotFoundError(
                 paths.missing_config_message(
-                    MASTER_LOG.parent,
+                    master_log_path().parent,
                     paths.DATA_DIR_ENV,
                     label="Telemetry root",
                 )
             )
-        with MASTER_LOG.open("a", encoding="utf-8") as handle:
+        with master_log_path().open("a", encoding="utf-8") as handle:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
             try:
                 handle.write(json.dumps(row) + "\n")
@@ -264,12 +287,13 @@ def log_buzz(
 
 
 def existing_session_ids() -> set[str]:
-    if not MASTER_LOG.exists():
+    master_log = master_log_path()
+    if not master_log.exists():
         return set()
 
     seen: set[str] = set()
     try:
-        with MASTER_LOG.open("r", encoding="utf-8") as handle:
+        with master_log.open("r", encoding="utf-8") as handle:
             for line in handle:
                 try:
                     record = json.loads(line)
@@ -330,7 +354,7 @@ def summarize_calls(
 ) -> dict[str, dict[str, float | int]]:
     try:
         buckets: dict[str, dict[str, float | int]] = {}
-        for row in rows if rows is not None else _read_jsonl_dict_rows(CALL_LOG):
+        for row in rows if rows is not None else _read_jsonl_dict_rows(call_log_path()):
             if not isinstance(row, dict):
                 continue
             lane = str(row.get("lane") or "").strip()
@@ -398,6 +422,7 @@ def format_call_summary(summary: dict[str, dict[str, float | int]]) -> str:
 
 
 def run() -> dict[str, Any]:
+    master_log = master_log_path()
     if not SESSIONS_DIR.exists():
         message = paths.missing_config_message(
             SESSIONS_DIR,
@@ -410,12 +435,12 @@ def run() -> dict[str, Any]:
             "added": 0,
             "skipped": 0,
             "errors": 1,
-            "master_log": str(MASTER_LOG),
+            "master_log": str(master_log_path()),
             "error": message,
         }
     if not _telemetry_parent_is_configured():
         message = paths.missing_config_message(
-            MASTER_LOG.parent,
+            master_log.parent,
             paths.DATA_DIR_ENV,
             label="Telemetry root",
         )
@@ -424,7 +449,7 @@ def run() -> dict[str, Any]:
             "added": 0,
             "skipped": 0,
             "errors": 1,
-            "master_log": str(MASTER_LOG),
+            "master_log": str(master_log),
             "error": message,
         }
     seen = existing_session_ids()
@@ -471,7 +496,7 @@ def run() -> dict[str, Any]:
         "added": added,
         "skipped": skipped,
         "errors": errors,
-        "master_log": str(MASTER_LOG),
+        "master_log": str(master_log),
     }
     print(summary)
     return summary
@@ -500,7 +525,7 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
             "topic": args.log_buzz,
             "n_signals": args.n_signals,
             "platforms": _sorted_strings(args.platform),
-            "master_log": str(MASTER_LOG),
+            "master_log": str(master_log_path()),
         }
         print(json.dumps(result, sort_keys=True) if args.emit_json else result)
         return result

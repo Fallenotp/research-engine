@@ -10,6 +10,7 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from . import paths
@@ -20,7 +21,6 @@ except ModuleNotFoundError:  # pragma: no cover - direct script execution fallba
     import query_quality
 
 
-CALL_LOG = str(paths.telemetry_path("research-call-log.jsonl"))
 SEARXNG_URL = "http://localhost:8888/search"
 PROXY_URL = "http://localhost:18791/search"
 PROVIDER_ALIASES = {
@@ -51,6 +51,20 @@ _NEAR_TIE_RESULT_COUNT_DELTA = 1
 
 
 logger = logging.getLogger(__name__)
+
+
+def call_log_path() -> Path:
+    """Return the current search-call log location."""
+    legacy_path = globals().get("CALL_LOG")
+    if legacy_path is not None:
+        return Path(legacy_path)
+    return paths.telemetry_path("research-call-log.jsonl")
+
+
+def __getattr__(name: str) -> Path:
+    if name == "CALL_LOG":
+        return call_log_path()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 @dataclass(frozen=True)
@@ -174,10 +188,9 @@ def _parse_atom_results(body: str) -> list[dict[str, str]]:
 
 def _append_call(row):
     try:
-        parent = os.path.dirname(CALL_LOG)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        with open(CALL_LOG, "a", encoding="utf-8") as handle:
+        log_path = call_log_path()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as handle:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
             try:
                 handle.write(json.dumps(row) + "\n")
@@ -197,10 +210,10 @@ def _record_call(
     agent,
     error: str | None,
     result_count: int | None,
+    duration_ms: int,
     quality: query_quality.ResultQuality | None = None,
     retry_metadata: _RetryMetadata | None = None,
 ) -> None:
-    duration_ms = int((time.time() - started) * 1000)
     _append_call(
         _build_call_row(
             protocol=protocol,
@@ -236,10 +249,6 @@ def _repair_query_text(query: str, *, lane: str) -> tuple[str, bool]:
     return query, False
 
 
-def _call_log_supports_extended_fields() -> bool:
-    return "PYTEST_CURRENT_TEST" not in os.environ
-
-
 def _build_call_row(
     *,
     protocol,
@@ -263,8 +272,7 @@ def _build_call_row(
         "error": error,
         "agent": _agent_name(agent),
     }
-    supports_extended_fields = _call_log_supports_extended_fields()
-    if quality is not None and supports_extended_fields:
+    if quality is not None:
         row.update(
             {
                 "retrieval_verdict": quality.verdict.value,
@@ -274,7 +282,7 @@ def _build_call_row(
                 "retrieval_has_error": quality.has_error,
             }
         )
-    if supports_extended_fields and retry_metadata is not None:
+    if retry_metadata is not None:
         row.update(
             {
                 "query_retry": True,
@@ -466,7 +474,7 @@ def _run_logged_attempt(
     error = None
     result_count = None
     payload = None
-    started = time.time()
+    started = time.perf_counter()
 
     try:
         payload = execute()
@@ -475,6 +483,10 @@ def _run_logged_attempt(
         error = str(exc)
         payload = error_payload_factory(error)
 
+    duration_ms = int((time.perf_counter() - started) * 1000)
+    payload = dict(payload)
+    payload["duration_ms"] = duration_ms
+    payload["cost_usd_estimate"] = _lane_cost_per_call_usd(lane) or 0.0
     quality = _score_payload_quality(payload, lane=lane)
     _record_call(
         started=started,
@@ -484,6 +496,7 @@ def _run_logged_attempt(
         agent=agent,
         error=error,
         result_count=result_count,
+        duration_ms=duration_ms,
         quality=quality,
         retry_metadata=retry_metadata,
     )

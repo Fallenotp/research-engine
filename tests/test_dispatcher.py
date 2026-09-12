@@ -79,7 +79,7 @@ def test_discover_gemini_pro_model_uses_canonical_flash_candidate(monkeypatch, t
             "-p",
             "Reply with exactly OK.",
             "--model",
-            "Gemini 3.7 Flash (Medium)",
+            "Gemini 3.8 Flash (Medium)",
         ]
         assert "env" not in kwargs
         return _completed(0, stdout="OK\n")
@@ -118,14 +118,14 @@ def test_discover_gemini_pro_model_retries_transient_failures(tmp_path) -> None:
         return _completed(0, stdout="OK\n")
 
     result = discover_gemini_pro_model(
-        candidates=("Gemini 3.7 Flash (Medium)",),
+        candidates=("Gemini 3.8 Flash (Medium)",),
         cli_home=str(tmp_path),
         runner=runner,
         sleeper=sleeps.append,
         use_cache=False,
     )
 
-    assert result.model_id == "Gemini 3.7 Flash (Medium)"
+    assert result.model_id == "Gemini 3.8 Flash (Medium)"
     assert calls["count"] == 3
     assert sleeps == [2, 6]
 
@@ -140,7 +140,7 @@ def test_discover_gemini_pro_model_does_not_retry_auth_failure(tmp_path) -> None
         return _completed(1, stderr="Opening authentication page in your browser")
 
     result = discover_gemini_pro_model(
-        candidates=("Gemini 3.7 Flash (Medium)",),
+        candidates=("Gemini 3.8 Flash (Medium)",),
         cli_home=str(tmp_path),
         runner=runner,
         use_cache=False,
@@ -348,14 +348,14 @@ def test_dispatch_scout_emits_agy_command(monkeypatch, tmp_path) -> None:
     assert spec is not None
     assert spec.provider == "agy_cli"
     assert spec.worker_model == WorkerModel.GEMINI_FLASH.value
-    assert spec.model_id == "Gemini 3.7 Flash (Medium)"
+    assert spec.model_id == "Gemini 3.8 Flash (Medium)"
     assert spec.invocation_hint.startswith(
         "/opt/research-engine-test/bin/agy --dangerously-skip-permissions -p "
     )
     assert spec.brief_path in spec.invocation_hint
     assert spec.output_path in spec.invocation_hint
     assert "HOME=" not in spec.invocation_hint
-    assert "--model 'Gemini 3.7 Flash (Medium)'" in spec.invocation_hint
+    assert "--model 'Gemini 3.8 Flash (Medium)'" in spec.invocation_hint
     assert '-p "$(cat ' in spec.invocation_hint
     assert "--yolo" not in spec.invocation_hint
     assert "--skip-trust" not in spec.invocation_hint
@@ -378,14 +378,14 @@ def test_social_lane_emits_gemini_invocation_hint(monkeypatch) -> None:
 
     assert spec.worker_model == WorkerModel.GEMINI_FLASH.value
     assert spec.provider == "agy_cli"
-    assert spec.model_id == "Gemini 3.7 Flash (Medium)"
+    assert spec.model_id == "Gemini 3.8 Flash (Medium)"
     assert spec.invocation_hint.startswith(
         "/opt/research-engine-test/bin/agy --dangerously-skip-permissions -p "
     )
     assert spec.brief_path in spec.invocation_hint
     assert spec.output_path in spec.invocation_hint
     assert "HOME=" not in spec.invocation_hint
-    assert "--model 'Gemini 3.7 Flash (Medium)'" in spec.invocation_hint
+    assert "--model 'Gemini 3.8 Flash (Medium)'" in spec.invocation_hint
     assert '-p "$(cat ' in spec.invocation_hint
     assert "--yolo" not in spec.invocation_hint
     assert "--skip-trust" not in spec.invocation_hint

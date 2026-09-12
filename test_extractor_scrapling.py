@@ -130,7 +130,7 @@ def test_apify_actor_fetch_returns_payload(monkeypatch) -> None:
         def next_account(self) -> ApifyAccount:
             return ApifyAccount(id="test-account", token="test-token")
 
-    def fake_request(account, method: str, path: str, *, json_body=None, params=None, timeout=60):
+    def fake_request(account, method: str, path: str, *, source_url, json_body=None, params=None, timeout=60):
         assert account.id == "test-account"
         calls.append((method, path, params))
         if method == "POST":
@@ -172,7 +172,7 @@ def test_apify_actor_fetch_reads_output_record_when_dataset_empty(monkeypatch) -
         def next_account(self) -> ApifyAccount:
             return ApifyAccount(id="test-account", token="test-token")
 
-    def fake_request(account, method: str, path: str, *, json_body=None, params=None, timeout=60):
+    def fake_request(account, method: str, path: str, *, source_url, json_body=None, params=None, timeout=60):
         if method == "POST":
             return {"data": {"id": "run-456"}}
         if path == "/v2/actor-runs/run-456":
@@ -201,7 +201,7 @@ def test_apify_actor_fetch_reads_output_record_when_dataset_item_is_stub(monkeyp
         def next_account(self) -> ApifyAccount:
             return ApifyAccount(id="test-account", token="test-token")
 
-    def fake_request(account, method: str, path: str, *, json_body=None, params=None, timeout=60):
+    def fake_request(account, method: str, path: str, *, source_url, json_body=None, params=None, timeout=60):
         if method == "POST":
             return {"data": {"id": "run-457"}}
         if path == "/v2/actor-runs/run-457":
@@ -230,7 +230,7 @@ def test_apify_actor_fetch_returns_empty_on_failed_run(monkeypatch) -> None:
         def next_account(self) -> ApifyAccount:
             return ApifyAccount(id="test-account", token="test-token")
 
-    def fake_request(account, method: str, path: str, *, json_body=None, params=None, timeout=60):
+    def fake_request(account, method: str, path: str, *, source_url, json_body=None, params=None, timeout=60):
         if method == "POST":
             return {"data": {"id": "run-789"}}
         if path == "/v2/actor-runs/run-789":
@@ -241,6 +241,21 @@ def test_apify_actor_fetch_returns_empty_on_failed_run(monkeypatch) -> None:
     monkeypatch.setattr(extractor, "_apify_api_request", fake_request)
 
     assert extractor._apify_actor_fetch("https://protected.example/article") == {}
+
+
+def test_apify_actor_fetch_propagates_domain_cooldown(monkeypatch) -> None:
+    class FakePool:
+        def next_account(self) -> ApifyAccount:
+            return ApifyAccount(id="test-account", token="test-token")
+
+    def cooling_request(*_args, **_kwargs):
+        raise extractor.DomainCooldown("protected.example", 60)
+
+    monkeypatch.setattr(extractor, "_get_apify_account_pool", lambda: FakePool())
+    monkeypatch.setattr(extractor, "_apify_api_request", cooling_request)
+
+    with pytest.raises(extractor.DomainCooldown):
+        extractor._apify_actor_fetch("https://protected.example/article")
 
 
 def test_instagram_routes_to_apify_before_general_ladder(tmp_path) -> None:

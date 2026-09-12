@@ -92,6 +92,37 @@ def test_ground_uses_searxng_results_without_escalation(monkeypatch, tmp_path: P
     assert all(Path(source.raw_text_path).exists() for source in result.sources)
 
 
+def test_missing_model_confidence_stays_none_through_ground(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(
+        grounding.logged_search,
+        "searxng",
+        lambda *args, **kwargs: {
+            "results": [
+                {
+                    "url": "https://example.com/paris",
+                    "title": "Paris",
+                    "content": "Paris is the capital of France.",
+                }
+            ]
+        },
+    )
+    _fake_extract(monkeypatch, tmp_path)
+    monkeypatch.setattr(grounding, "_should_escalate", lambda *args, **kwargs: False)
+    monkeypatch.setattr(grounding, "_lookup_fallback_sources", lambda *args, **kwargs: [])
+    from research_engine import llm_call
+
+    monkeypatch.setattr(
+        llm_call,
+        "llm_complete",
+        lambda *args, **kwargs: ('{"status": "grounded", "answer": "Paris is the capital of France."}', "fake"),
+    )
+
+    result = grounding.ground("What is the capital of France?", topic_slug="capital-france")
+
+    assert result.status == "grounded"
+    assert result.confidence is None
+
+
 def test_ground_escalates_then_returns_not_found_when_all_backends_fail(
     monkeypatch,
     tmp_path: Path,

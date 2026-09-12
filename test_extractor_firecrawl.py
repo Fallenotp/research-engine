@@ -13,6 +13,46 @@ def test_firecrawl_method_exists() -> None:
     assert ExtractionMethod.FIRECRAWL.value == "firecrawl"
 
 
+def test_firecrawl_proxy_refuses_result_with_other_url(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(extractor, "BLOCKED_LOG_PATH", tmp_path / "blocked.jsonl", raising=False)
+    extractor.clear_blocked_events()
+
+    result = extractor._firecrawl_payload_from_proxy(
+        {"results": [{"url": "https://other.example/x", "markdown": "wrong page"}]},
+        "https://site.example/a",
+    )
+
+    assert result == {}
+    assert extractor.blocked_events()[-1]["reason"] == "url_mismatch"
+
+
+def test_firecrawl_proxy_accepts_canonical_match() -> None:
+    result = extractor._firecrawl_payload_from_proxy(
+        {"results": [{"url": "https://www.site.example/a/", "markdown": "right page " * 30}]},
+        "http://site.example/a",
+    )
+
+    assert result["text"]
+
+
+def test_firecrawl_direct_refuses_result_with_other_url(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(extractor, "BLOCKED_LOG_PATH", tmp_path / "blocked.jsonl", raising=False)
+    extractor.clear_blocked_events()
+
+    result = extractor._firecrawl_payload_from_direct(
+        {
+            "data": {
+                "markdown": "wrong page",
+                "metadata": {"sourceURL": "https://other.example/x"},
+            }
+        },
+        "https://site.example/a",
+    )
+
+    assert result == {}
+    assert extractor.blocked_events()[-1]["reason"] == "url_mismatch"
+
+
 def test_chain_uses_firecrawl_after_scrapling_fails(tmp_path) -> None:
     url = "https://protected.example/article"
     good = {
@@ -22,32 +62,18 @@ def test_chain_uses_firecrawl_after_scrapling_fails(tmp_path) -> None:
         "published_date": None,
     }
 
+    extractor._rung_availability.cache_clear()
     with patch.object(extractor, "_is_pdf", return_value=False), patch.object(
-        extractor,
-        "_crawl4ai",
-        return_value={},
-    ) as crawl4ai_mock, patch.object(
-        extractor,
-        "_crawlee_http",
-        return_value={},
-    ) as crawlee_mock, patch.object(
-        extractor,
-        "_scrapling_stealth",
-        return_value={},
-    ) as scrapling_mock, patch.object(
-        extractor,
-        "_firecrawl",
-        return_value=good,
-    ) as firecrawl_mock:
+        extractor, "_cloudflare_markdown_preflight", return_value=None
+    ), patch.object(extractor, "_trafilatura", return_value={}), patch.object(
+        extractor, "_firecrawl_available", return_value=(True, "")
+    ), patch.object(extractor, "_firecrawl", return_value=good) as firecrawl_mock:
         out = extractor.extract_clean_text(url, seen_urls_path=tmp_path / "seen.txt")
 
     assert out is not None
     assert out["extraction_method"] == ExtractionMethod.FIRECRAWL.value
     assert "firecrawl recovered" in out["char_text_preview"]
     assert "firecrawl recovered" in Path(out["raw_text_path"]).read_text(encoding="utf-8")
-    crawl4ai_mock.assert_called_once_with(url)
-    crawlee_mock.assert_called_once_with(url)
-    scrapling_mock.assert_called_once_with(url)
     firecrawl_mock.assert_called_once_with(url)
 
 
@@ -60,36 +86,27 @@ def test_chain_bypasses_firecrawl_when_crawl4ai_succeeds(tmp_path) -> None:
         "published_date": None,
     }
 
+    extractor._rung_availability.cache_clear()
     with patch.object(extractor, "_is_pdf", return_value=False), patch.object(
-        extractor,
-        "_crawl4ai",
-        return_value=good,
-    ), patch.object(
-        extractor,
-        "_firecrawl",
+        extractor, "_cloudflare_markdown_preflight", return_value=None
+    ), patch.object(extractor, "_trafilatura", return_value=good), patch.object(
+        extractor, "_firecrawl"
     ) as firecrawl_mock:
         out = extractor.extract_clean_text(url, seen_urls_path=tmp_path / "seen.txt")
 
     assert out is not None
-    assert out["extraction_method"] == ExtractionMethod.CRAWL4AI.value
+    assert out["extraction_method"] == ExtractionMethod.TRAFILATURA.value
     firecrawl_mock.assert_not_called()
 
 
 def test_web_ladder_does_not_attempt_removed_rungs(tmp_path) -> None:
     url = "https://protected.example/article"
 
+    extractor._rung_availability.cache_clear()
     with patch.object(extractor, "_is_pdf", return_value=False), patch.object(
-        extractor,
-        "_cloudflare_markdown_preflight",
-        side_effect=AssertionError("cloudflare-md is not in the web ladder"),
-    ), patch.object(
-        extractor,
-        "_jina",
-        side_effect=AssertionError("jina is not in the web ladder"),
-    ), patch.object(
-        extractor,
-        "_trafilatura",
-        side_effect=AssertionError("trafilatura is not in the web ladder"),
+        extractor, "_cloudflare_markdown_preflight", return_value=None
+    ), patch.object(extractor, "_jina_available", return_value=(False, "no JINA_API_KEY")), patch.object(
+        extractor, "_trafilatura", return_value={}
     ), patch.object(
         extractor,
         "_crawl4ai",
@@ -149,7 +166,10 @@ def test_firecrawl_direct_env_keys_rotate_across_calls(monkeypatch) -> None:
                 "success": True,
                 "data": {
                     "markdown": "direct firecrawl body " * 20,
-                    "metadata": {"title": "Direct Firecrawl"},
+                    "metadata": {
+                        "title": "Direct Firecrawl",
+                        "sourceURL": kwargs["json"]["url"],
+                    },
                 },
             }
         )

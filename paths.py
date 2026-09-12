@@ -13,6 +13,7 @@ PROJECT_DIR = PACKAGE_DIR.parent
 logger = logging.getLogger(__name__)
 
 DATA_DIR_ENV = "RESEARCH_ENGINE_DATA_DIR"
+CACHE_DIR_ENV = "RESEARCH_ENGINE_CACHE_DIR"
 ENV_FILE_ENV = "RESEARCH_ENGINE_ENV_FILE"
 AGY_BIN_ENV = "RESEARCH_ENGINE_AGY_BIN"
 GROK_BIN_ENV = "RESEARCH_ENGINE_GROK_BIN"
@@ -193,6 +194,11 @@ def package_path(*parts: str) -> Path:
 def data_dir() -> Path:
     raw = os.environ.get(DATA_DIR_ENV)
     return Path(raw).expanduser() if raw else _DATA_DIR_DEFAULT
+
+
+def cache_dir() -> Path:
+    raw = os.environ.get(CACHE_DIR_ENV)
+    return Path(raw).expanduser() if raw else package_path("cache")
 
 
 def data_path(*parts: str) -> Path:

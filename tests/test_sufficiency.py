@@ -111,9 +111,11 @@ def _session(
             GeminiProRunRecord(
                 run_type=GeminiProRunKind.SCOUT,
                 success=True,
-                model_id="Gemini 3.7 Flash (Medium)",
+                model_id="Gemini 3.8 Flash (Medium)",
             )
         ],
+        total_duration_ms=1350,
+        total_cost_usd_estimate=0.0042,
     )
 
 
@@ -145,6 +147,8 @@ class SufficiencyTests(unittest.TestCase):
             [
                 "agy-cli-1",
                 "--dangerously-skip-permissions",
+                "--model",
+                "gemini-3.1-flash-lite-preview",
                 "--print",
                 "judge prompt",
             ],
@@ -182,7 +186,7 @@ class SufficiencyTests(unittest.TestCase):
         self.assertEqual(set(kwargs["env"]), {"HOME", "LANG", "LC_ALL", "PATH", "TMPDIR"})
         self.assertEqual(kwargs["env"]["HOME"], str(Path.home()))
 
-    def test_get_sufficiency_clients_prefers_gemini_then_ollama(self) -> None:
+    def test_get_clients_returns_gemini_and_no_fallback(self) -> None:
         with patch.object(
             sufficiency,
             "_resolve_agy_executable",
@@ -197,16 +201,31 @@ class SufficiencyTests(unittest.TestCase):
 
         self.assertEqual(primary.provider_label, "flash")
         self.assertEqual(primary.model_id, "gemini-3.1-flash-lite-preview")
-        self.assertEqual(fallback.provider_label, "ollama-fallback")
-        self.assertEqual(fallback.model_id, "qwen3.5:9b")
+        self.assertIsNone(fallback)
 
-    def test_get_sufficiency_clients_skips_when_no_provider_is_available(self) -> None:
+    def test_ollama_is_never_selected_automatically(self) -> None:
         with patch.object(sufficiency, "_resolve_agy_executable", return_value=None):
-            with patch.object(sufficiency, "_resolve_ollama_runtime", return_value=None):
+            with patch.object(
+                sufficiency,
+                "_resolve_ollama_runtime",
+                return_value=("/usr/bin/ollama", "qwen3.5:9b"),
+            ):
                 primary, fallback = sufficiency.get_sufficiency_clients()
 
-        self.assertEqual(primary.provider_label, "skip")
-        self.assertEqual(fallback.provider_label, "skip")
+        self.assertEqual((primary, fallback), (None, None))
+
+    def test_flash_command_carries_model_argv(self) -> None:
+        client = sufficiency.CLIJsonClient(
+            provider_label="flash",
+            model_id="M",
+            executable="/bin/echo",
+            timeout_seconds=1,
+        )
+
+        command = client._command("p")
+
+        pairs = [command[index : index + 2] for index in range(len(command) - 1)]
+        self.assertIn(["--model", "M"], pairs)
 
     def test_resolve_agy_executable_accepts_command_on_path(self) -> None:
         with patch.object(sufficiency, "SUFFICIENCY_AGY_BIN", "agy"):
@@ -422,10 +441,29 @@ class SufficiencyTests(unittest.TestCase):
         self.assertLessEqual(result["recovery_iterations"], 2)
         self.assertEqual(len(primary.prompts), 3)
 
-    def test_skip_client_returns_non_blocking_sufficient_verdict(self) -> None:
-        primary = sufficiency.SkipSufficiencyClient()
-        fallback = sufficiency.SkipSufficiencyClient()
+    def test_flash_failure_mid_recovery_degrades_to_exhausted(self) -> None:
+        primary = FakeClient(
+            "flash",
+            "gemini-3.1-flash-lite-preview",
+            [{"verdict": "insufficient", "reason": "need more", "missing": ["detail"]}, RuntimeError("flash down")],
+        )
+        sources = [
+            sufficiency.SourceText("web:1", "Topic page", "example.com", "Initial evidence.")
+        ]
 
+        with patch.object(sufficiency, "SUFFICIENCY_PREFILTER_ENABLED", False):
+            result = sufficiency.run_sufficiency_loop(
+                query="What changed?",
+                source_texts=sources,
+                retriever=lambda _query: sources,
+                clients=(primary, None),
+            )
+
+        self.assertIn(result["terminal_state"], ("exhausted", "partial"))
+        self.assertFalse(result["proceed"])
+        self.assertEqual(result["stop_reason"], "reformulation_failed")
+
+    def test_no_checker_available_yields_unchecked_not_sufficient(self) -> None:
         result = sufficiency.run_sufficiency_loop(
             query="What changed?",
             source_texts=[
@@ -436,12 +474,33 @@ class SufficiencyTests(unittest.TestCase):
                     "A short item that still requires the checker to inspect it.",
                 )
             ],
-            clients=(primary, fallback),
+            clients=(None, None),
         )
 
-        self.assertEqual(result["terminal_state"], "sufficient")
-        self.assertEqual(result["final_judge"]["checker_route"], "skip")
-        self.assertTrue(result["proceed"])
+        self.assertEqual(result["terminal_state"], "unchecked")
+        self.assertFalse(result["proceed"])
+        self.assertEqual(result["stop_reason"], "checker_unavailable")
+        self.assertEqual(result["final_judge"]["checker_route"], "unavailable")
+        self.assertTrue(result["final_judge"]["fail_closed"])
+        self.assertIsNone(result["final_judge"]["verdict"])
+        self.assertNotEqual(result["final_judge"]["verdict"], "insufficient")
+        self.assertNotEqual(result["final_judge"]["verdict"], "sufficient")
+        self.assertIsNone(result["verdict"])
+
+    def test_primary_only_failure_fails_closed_without_fallback(self) -> None:
+        decision = sufficiency.judge_sufficiency(
+            query="What changed?",
+            source_texts=[
+                sufficiency.SourceText(
+                    "web:1", "Topic page", "example.com", "A short item."
+                )
+            ],
+            clients=(FakeClient("flash", "flash", [RuntimeError("flash down")]), None),
+        )
+
+        self.assertNotEqual(decision["verdict"], "sufficient")
+        self.assertNotEqual(decision["checker_route"], "skip")
+        self.assertTrue(decision["fail_closed"])
 
     def test_explicit_broken_clients_still_fail_closed_insufficient(self) -> None:
         primary = FakeClient("flash", "gemini-3.1-flash-lite-preview", [RuntimeError("flash down")])
@@ -538,7 +597,7 @@ class SufficiencyTests(unittest.TestCase):
         self.assertTrue(result.open_questions)
         self.assertEqual(result.evidence_gate_decision["terminal_state"], "partial")
 
-    def test_mark_partial_preserves_measured_zero_and_none_confidence(self) -> None:
+    def test_mark_partial_preserves_measured_zero_and_abstains_when_unmeasured(self) -> None:
         zero_session = _session(
             "What changed in the policy?",
             "The policy added an appeal window.",
@@ -568,8 +627,9 @@ class SufficiencyTests(unittest.TestCase):
             {"terminal_state": "partial", "reason": "missing details"},
         )
 
-        self.assertEqual(none_result.confidence, 0.0)
-        self.assertEqual(none_result.answer_confidence, 0.0)
+        self.assertIsNone(none_result.confidence)
+        self.assertIsNone(none_result.answer_confidence)
+        self.assertEqual(none_result.answer_kind, AnswerKind.ABSTAIN)
 
     def test_mark_partial_caps_high_measured_confidence_at_exactly_half(self) -> None:
         session = _session(

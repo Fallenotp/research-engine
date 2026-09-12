@@ -10,6 +10,7 @@ import requests
 import trafilatura
 
 from . import paths
+from .politeness import DomainCooldown
 
 logger = logging.getLogger("extractor")
 _WARNED_MISSING_KEYS = False
@@ -42,10 +43,17 @@ def _extractor_helpers():
     if extractor_module is None:
         from research_engine import extractor as extractor_module
 
-    return extractor_module._html_meta, extractor_module._payload
+    return extractor_module._html_meta, extractor_module._payload, extractor_module.fetch_gate
 
 
 _ENV_FILE_VALUES = _load_env_file_values(paths.env_file())
+
+
+def keys_available() -> tuple[bool, str]:
+    """Return whether the Wayback fallback can authenticate without a request."""
+    access = (os.getenv("WAYBACK_ACCESS_KEY") or _ENV_FILE_VALUES.get("WAYBACK_ACCESS_KEY") or "").strip()
+    secret = (os.getenv("WAYBACK_SECRET_KEY") or _ENV_FILE_VALUES.get("WAYBACK_SECRET_KEY") or "").strip()
+    return (True, "") if access and secret else (False, "no WAYBACK keys")
 
 
 def try_wayback(source_url: str) -> dict[str, str | None] | None:
@@ -53,13 +61,14 @@ def try_wayback(source_url: str) -> dict[str, str | None] | None:
     global _WARNED_MISSING_KEYS
 
     try:
-        access = (os.getenv("WAYBACK_ACCESS_KEY") or _ENV_FILE_VALUES.get("WAYBACK_ACCESS_KEY") or "").strip()
-        secret = (os.getenv("WAYBACK_SECRET_KEY") or _ENV_FILE_VALUES.get("WAYBACK_SECRET_KEY") or "").strip()
-        if not access or not secret:
+        available, _ = keys_available()
+        if not available:
             if not _WARNED_MISSING_KEYS:
                 logger.warning("Wayback fallback disabled: missing API keys")
                 _WARNED_MISSING_KEYS = True
             return None
+        access = (os.getenv("WAYBACK_ACCESS_KEY") or _ENV_FILE_VALUES.get("WAYBACK_ACCESS_KEY") or "").strip()
+        secret = (os.getenv("WAYBACK_SECRET_KEY") or _ENV_FILE_VALUES.get("WAYBACK_SECRET_KEY") or "").strip()
 
         headers = {
             "Authorization": f"LOW {access}:{secret}",
@@ -70,6 +79,8 @@ def try_wayback(source_url: str) -> dict[str, str | None] | None:
             f"?url={quote(source_url, safe='')}"
             "&limit=1&output=json&filter=statuscode:200&from=2020&sort=reverse"
         )
+        _html_meta, _payload, fetch_gate = _extractor_helpers()
+        fetch_gate(cdx_url, group_url=source_url)
         cdx_response = requests.get(cdx_url, headers=headers, timeout=8)
         cdx_response.raise_for_status()
         rows = cdx_response.json()
@@ -83,6 +94,7 @@ def try_wayback(source_url: str) -> dict[str, str | None] | None:
             return None
 
         snapshot_url = f"https://web.archive.org/web/{timestamp}id_/{original}"
+        fetch_gate(snapshot_url, group_url=source_url)
         response = requests.get(
             snapshot_url, headers=headers, allow_redirects=True, timeout=30
         )
@@ -92,7 +104,7 @@ def try_wayback(source_url: str) -> dict[str, str | None] | None:
         if len(text.strip()) < 200:
             return None
 
-        html_meta, payload = _extractor_helpers()
+        html_meta, payload, _fetch_gate = _extractor_helpers()
         meta = html_meta(html)
         return payload(
             str(meta.get("title") or "").strip(),
@@ -100,6 +112,8 @@ def try_wayback(source_url: str) -> dict[str, str | None] | None:
             meta.get("author"),
             meta.get("published_date"),
         )
+    except DomainCooldown:
+        raise
     except Exception as exc:  # pragma: no cover - hard boundary for caller contract
         logger.warning("Wayback fallback failed for %s: %s", source_url, exc)
         return None

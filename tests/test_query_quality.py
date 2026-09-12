@@ -223,7 +223,9 @@ def test_logged_search_fail_safe_uses_original_query_when_validation_raises(
 
     result = logged_search.searxng(original_query, protocol="/search", topic="topic")
 
-    assert result == {"results": [{"url": "https://example.com/1"}]}
+    assert result["results"] == [{"url": "https://example.com/1"}]
+    assert "duration_ms" in result
+    assert "cost_usd_estimate" in result
     assert parse_qs(urlsplit(captured["url"]).query)["q"] == [original_query]
     rows = _read_rows(call_log)
     assert len(rows) == 1
@@ -238,7 +240,6 @@ def test_logged_search_records_retrieval_quality_fields_when_enabled(
     call_log = tmp_path / "agent_state" / "research-call-log.jsonl"
 
     monkeypatch.setattr(logged_search, "CALL_LOG", str(call_log))
-    monkeypatch.setattr(logged_search, "_call_log_supports_extended_fields", lambda: True)
     monkeypatch.setattr(
         logged_search.urllib.request,
         "urlopen",
@@ -262,6 +263,7 @@ def test_logged_search_records_retrieval_quality_fields_when_enabled(
     assert row["retrieval_unique_domain_count"] == 3
     assert row["retrieval_top_domain_share"] == 0.5
     assert row["retrieval_has_error"] is False
+    assert "duration_ms" in row
 
 
 def test_repair_query_preserves_meaningful_word_order() -> None:

@@ -67,6 +67,12 @@ def _good_payload():
     )
 
 
+def _assert_measured_payload(actual, expected) -> None:
+    assert {key: actual[key] for key in expected} == expected
+    assert "duration_ms" in actual
+    assert "cost_usd_estimate" in actual
+
+
 def _thin_payload():
     return _payload_from_domains(["a.example", "b.example"])
 
@@ -94,7 +100,7 @@ def test_empty_verdict_on_free_lane_retries_once_with_broadened_query(
         topic="apparel",
     )
 
-    assert result == _good_payload()
+    _assert_measured_payload(result, _good_payload())
     assert len(queries) == 2
     assert queries[0] == "organic cotton t-shirt manufacturer UK site:example.com"
     assert queries[1] == "organic cotton t-shirt manufacturer UK"
@@ -116,7 +122,7 @@ def test_good_verdict_does_not_retry(tmp_path, monkeypatch) -> None:
 
     result = logged_search.searxng("organic cotton manufacturer", topic="apparel")
 
-    assert result == _good_payload()
+    _assert_measured_payload(result, _good_payload())
     assert len(queries) == 1
 
 
@@ -134,7 +140,7 @@ def test_error_verdict_does_not_retry(tmp_path, monkeypatch) -> None:
 
     result = logged_search.searxng("organic cotton manufacturer", topic="apparel")
 
-    assert result == {"error": "blocked"}
+    _assert_measured_payload(result, {"error": "blocked"})
     assert len(calls) == 1
 
 
@@ -156,7 +162,7 @@ def test_empty_string_error_payload_does_not_retry(tmp_path, monkeypatch) -> Non
         topic="apparel",
     )
 
-    assert result == payload
+    _assert_measured_payload(result, payload)
     assert (
         score_result_quality(result, "searxng_general").verdict
         is ResultQualityVerdict.ERROR
@@ -259,7 +265,7 @@ def test_errored_empty_payload_grades_error_and_does_not_retry(tmp_path, monkeyp
         topic="apparel",
     )
 
-    assert result == {"results": [], "error": "HTTP 429"}
+    _assert_measured_payload(result, {"results": [], "error": "HTTP 429"})
     assert score_result_quality(result, "exa_direct").verdict is ResultQualityVerdict.ERROR
     assert len(calls) == 1
 
@@ -296,7 +302,7 @@ def test_paid_lanes_never_retry_even_when_cost_looks_free(
         topic="apparel",
     )
 
-    assert result == {"results": []}
+    _assert_measured_payload(result, {"results": []})
     assert len(calls) == 1
 
 
@@ -320,7 +326,7 @@ def test_exa_direct_retries_when_empty(tmp_path, monkeypatch) -> None:
         topic="apparel",
     )
 
-    assert result == _good_payload()
+    _assert_measured_payload(result, _good_payload())
     assert len(queries) == 2
     assert queries[0] == "organic cotton manufacturer site:example.com"
     assert queries[1] == "organic cotton manufacturer"
@@ -344,7 +350,7 @@ def test_two_empty_results_stop_after_two_calls_total(tmp_path, monkeypatch) -> 
         topic="apparel",
     )
 
-    assert result == {"results": []}
+    _assert_measured_payload(result, {"results": []})
     assert len(calls) == 2
     assert len(_read_rows(call_log)) == 2
 
@@ -392,7 +398,7 @@ def test_short_bare_query_returns_none_and_does_not_retry(
 
     result = logged_search.searxng("organic cotton tshirts", topic="apparel")
 
-    assert result == {"results": []}
+    _assert_measured_payload(result, {"results": []})
     assert len(calls) == 1
 
 
@@ -436,7 +442,7 @@ def test_retry_returning_fewer_results_keeps_original_payload(
         topic="apparel",
     )
 
-    assert result == first_payload
+    _assert_measured_payload(result, first_payload)
     assert len(queries) == 2
     assert queries[0] != queries[1]
 
@@ -448,7 +454,6 @@ def test_broaden_query_failure_returns_original_payload_and_records_telemetry(
     call_log = tmp_path / "agent_state" / "research-call-log.jsonl"
 
     monkeypatch.setattr(logged_search, "CALL_LOG", str(call_log))
-    monkeypatch.setattr(logged_search, "_call_log_supports_extended_fields", lambda: True)
     monkeypatch.setattr(
         logged_search.query_quality,
         "broaden_query",
@@ -465,7 +470,7 @@ def test_broaden_query_failure_returns_original_payload_and_records_telemetry(
         topic="apparel",
     )
 
-    assert result == {"results": []}
+    _assert_measured_payload(result, {"results": []})
     rows = _read_rows(call_log)
     assert len(rows) == 1
     assert rows[0]["retrieval_verdict"] == "EMPTY"
@@ -479,7 +484,6 @@ def test_retry_telemetry_records_second_row_as_retry_with_transforms(
     responses = [FakeResponse({"results": []}), FakeResponse(_good_payload())]
 
     monkeypatch.setattr(logged_search, "CALL_LOG", str(call_log))
-    monkeypatch.setattr(logged_search, "_call_log_supports_extended_fields", lambda: True)
     monkeypatch.setattr(
         logged_search.urllib.request,
         "urlopen",
@@ -502,3 +506,5 @@ def test_retry_telemetry_records_second_row_as_retry_with_transforms(
     ]
     assert rows[1]["query_retry_prior_result_count"] == 0
     assert rows[1]["query_retry_prior_verdict"] == "EMPTY"
+    assert "duration_ms" in rows[0]
+    assert "duration_ms" in rows[1]

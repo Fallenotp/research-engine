@@ -16,7 +16,7 @@ def _payload(char_count: int, *, title: str = "Example Domain") -> dict[str, str
 def test_extract_clean_text_uses_gitingest_for_github_repo() -> None:
     fake_content = "CONTENT-XYZ " * 30
 
-    with patch.object(extractor, "_is_pdf", return_value=False), patch(
+    with patch.object(extractor, "_is_document_source", return_value=False), patch(
         "gitingest.ingest",
         return_value=("SUMMARY", "TREE", fake_content),
     ) as ingest_mock, patch.object(
@@ -51,58 +51,60 @@ def test_is_github_repo_url_accepts_repo_root_and_tree_branch() -> None:
 
 
 def test_extract_clean_text_falls_back_when_gitingest_raises() -> None:
-    with patch.object(extractor, "_is_pdf", return_value=False), patch(
+    with patch.object(extractor, "_is_document_source", return_value=False), patch.object(
+        extractor, "_extract_pdf_or_document", return_value=None
+    ), patch(
         "gitingest.ingest",
         side_effect=RuntimeError("network down"),
-    ), patch.object(
-        extractor, "_crawl4ai", return_value=_payload(2400)
-    ) as crawl4ai_mock:
+    ), patch.object(extractor, "_extract_web_ladder", side_effect=lambda url, **kwargs: extractor._finalize_record(url, "crawl4ai", _payload(2400), tier=kwargs["tier"])) as ladder_mock:
         result = extractor.extract_clean_text("https://github.com/octo/repo")
 
     assert result is not None
     assert result["extraction_method"] != "gitingest"
     assert result["extraction_method"] == "crawl4ai"
-    crawl4ai_mock.assert_called_once_with("https://github.com/octo/repo")
+    ladder_mock.assert_called_once()
 
 
 def test_extract_clean_text_falls_back_when_gitingest_import_unavailable() -> None:
-    with patch.object(extractor, "_is_pdf", return_value=False), patch(
+    with patch.object(extractor, "_is_document_source", return_value=False), patch.object(
+        extractor, "_extract_pdf_or_document", return_value=None
+    ), patch(
         "gitingest.ingest",
         side_effect=ImportError("gitingest not installed"),
-    ), patch.object(
-        extractor, "_crawl4ai", return_value=_payload(2400)
-    ) as crawl4ai_mock:
+    ), patch.object(extractor, "_extract_web_ladder", side_effect=lambda url, **kwargs: extractor._finalize_record(url, "crawl4ai", _payload(2400), tier=kwargs["tier"])) as ladder_mock:
         result = extractor.extract_clean_text("https://github.com/octo/repo")
 
     assert result is not None
     assert result["extraction_method"] != "gitingest"
     assert result["extraction_method"] == "crawl4ai"
-    crawl4ai_mock.assert_called_once_with("https://github.com/octo/repo")
+    ladder_mock.assert_called_once()
 
 
-def test_gitingest_char_cap_truncates_cached_text() -> None:
-    huge_content = "X" * (extractor._GITINGEST_CHAR_CAP + 50_000)
+def test_gitingest_stores_untruncated_body() -> None:
+    huge_content = "X" * 250_000
 
-    with patch.object(extractor, "_is_pdf", return_value=False), patch(
+    with patch.object(extractor, "_is_document_source", return_value=False), patch(
         "gitingest.ingest",
-        return_value=("SUMMARY", "TREE", huge_content),
-    ), patch.object(
-        extractor, "_cloudflare_markdown_preflight",
+        return_value=("", "", huge_content),
+    ) as ingest_mock, patch.object(
+        extractor,
+        "_cloudflare_markdown_preflight",
         side_effect=AssertionError("HTML cascade should not run"),
     ):
         result = extractor.extract_clean_text("https://github.com/octo/repo")
 
     assert result is not None
     assert result["extraction_method"] == "gitingest"
+    ingest_mock.assert_called_once()
     cached_text = Path(result["raw_text_path"]).read_text(encoding="utf-8")
-    marker = f"[truncated at {extractor._GITINGEST_CHAR_CAP} chars]"
-    assert marker in cached_text
-    title_overhead = len("octo/repo — GitHub repo (gitingest)") + 10
-    assert len(cached_text) <= extractor._GITINGEST_CHAR_CAP + len(marker) + title_overhead
+    assert cached_text.endswith(huge_content)
+    assert len(cached_text) > len(huge_content)
+    assert "[truncated at" not in cached_text
+    assert result["char_count"] == len(cached_text)
 
 
 def test_extract_clean_text_passes_tree_branch_to_gitingest() -> None:
-    with patch.object(extractor, "_is_pdf", return_value=False), patch(
+    with patch.object(extractor, "_is_document_source", return_value=False), patch(
         "gitingest.ingest",
         return_value=("SUMMARY", "TREE", "CONTENT " * 30),
     ) as ingest_mock, patch.object(
@@ -124,11 +126,13 @@ def test_gitingest_timeout_does_not_hang(monkeypatch: pytest.MonkeyPatch) -> Non
 
     monkeypatch.setattr(extractor, "_GITINGEST_TIMEOUT_S", 1)
 
-    with patch.object(extractor, "_is_pdf", return_value=False), patch(
+    with patch.object(extractor, "_is_document_source", return_value=False), patch.object(
+        extractor, "_extract_pdf_or_document", return_value=None
+    ), patch(
         "gitingest.ingest",
         side_effect=slow_ingest,
     ), patch.object(
-        extractor, "_crawl4ai", return_value=_payload(2400)
+        extractor, "_extract_web_ladder", side_effect=lambda url, **kwargs: extractor._finalize_record(url, "crawl4ai", _payload(2400), tier=kwargs["tier"])
     ):
         started = time.monotonic()
         result = extractor.extract_clean_text("https://github.com/octo/repo")

@@ -213,8 +213,11 @@ class EvidenceChunk(BaseModel):
     char_length: int = Field(ge=1)
     rerank_score: float = Field(ge=0.0, le=1.0)
     supports_claim: NonEmptyStr  # the specific claim this chunk grounds
-    crystal_check_passed: bool  # RAGAS-style sentence↔paragraph faithfulness
-    crystal_check_score: float = Field(ge=0.0, le=1.0)
+    # crystal_* is reserved for a real claim-level faithfulness judge and stays
+    # None until one fills it; lexical_overlap_score is token overlap.
+    crystal_check_passed: Optional[bool] = None
+    crystal_check_score: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    lexical_overlap_score: Optional[float] = Field(default=None, ge=0.0, le=1.0)
 
 
 class Territory(BaseModel):
@@ -414,8 +417,8 @@ class ResearchSession(BaseModel):
     mentor_metadata: Optional[MentorContext] = None
 
     # Cost telemetry
-    total_cost_usd_estimate: float = Field(default=0.0, ge=0.0)
-    total_duration_ms: int = Field(default=0, ge=0)
+    total_cost_usd_estimate: float = Field(ge=0.0)
+    total_duration_ms: int = Field(ge=0)
 
     # ----- invariants -----
 
@@ -464,14 +467,20 @@ class ResearchSession(BaseModel):
                 FinalStatus.INSUFFICIENT_EVIDENCE,
             ):
                 self.answer_kind = AnswerKind.ABSTAIN if not self.answer else AnswerKind.PARTIAL
-            elif self.answer:
+            elif self.answer and self.confidence is not None:
                 self.answer_kind = AnswerKind.FULL
+            elif self.answer and self.confidence is None:
+                raise ValueError(
+                    "an answer without a measured confidence has no answer_kind; abstain or measure"
+                )
 
         if self.answer_kind == AnswerKind.FULL:
             if self.final_status != FinalStatus.COMPLETE:
                 raise ValueError("answer_kind=full requires final_status=COMPLETE")
             if not self.answer:
                 raise ValueError("answer_kind=full requires a non-empty answer")
+            if self.confidence is None:
+                raise ValueError("answer_kind=full requires a measured confidence")
 
         if self.answer_kind == AnswerKind.PARTIAL:
             if not self.answer:

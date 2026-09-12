@@ -12,6 +12,7 @@ iteration count, and cost telemetry.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from uuid import UUID
@@ -262,7 +263,7 @@ def plan_recursive_research(
     scout_summary: str = "",
     distinct_llm_count: int | None = None,
 ) -> RecursivePlan:
-    """Create level-1 recursive work from the Gemini 3.7 Flash scout's depth targets."""
+    """Create level-1 recursive work from the Gemini 3.8 Flash scout's depth targets."""
 
     tier = select_recursion_tier(
         session,
@@ -696,6 +697,8 @@ def _parse_published_date(value: str | None) -> datetime | None:
 
 
 if __name__ == "__main__":
+    started = time.perf_counter()
+    queries_run = []
     ok = True
     failures: list[str] = []
     router = load_router(DEFAULT_CONFIG_PATH)
@@ -706,6 +709,9 @@ if __name__ == "__main__":
         final_status=FinalStatus.COMPLETE,
         answer="A complete answer exists.",
         iteration_count=0,
+        queries_run=queries_run,
+        total_duration_ms=int((time.perf_counter() - started) * 1000),
+        total_cost_usd_estimate=sum(call.cost_usd_estimate for call in queries_run),
     )
     gaps = detect_gaps(base)
     if not any(gap.detection_reason == "no counter-evidence" for gap in gaps):

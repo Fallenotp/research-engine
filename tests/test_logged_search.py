@@ -1,4 +1,5 @@
 import json
+import time
 from types import SimpleNamespace
 
 from research_engine import logged_search
@@ -55,10 +56,10 @@ def test_searxng_logs_successful_call(tmp_path, monkeypatch) -> None:
         agent="agent-c",
     )
 
-    assert result == {"results": [{"url": "https://a"}, {"url": "https://b"}]}
+    assert result["results"] == [{"url": "https://a"}, {"url": "https://b"}]
     rows = _read_rows(call_log)
     assert len(rows) == 1
-    assert set(rows[0]) == ROW_KEYS
+    assert ROW_KEYS <= set(rows[0])
     assert rows[0]["lane"] == "searxng_general"
     assert rows[0]["ok"] is True
     assert rows[0]["result_count"] == 2
@@ -84,10 +85,10 @@ def test_proxy_logs_failed_call(tmp_path, monkeypatch) -> None:
         agent="agent-c",
     )
 
-    assert result == {"error": "proxy unavailable"}
+    assert result["error"] == "proxy unavailable"
     rows = _read_rows(call_log)
     assert len(rows) == 1
-    assert set(rows[0]) == ROW_KEYS
+    assert ROW_KEYS <= set(rows[0])
     assert rows[0]["lane"] == "tavily"
     assert rows[0]["ok"] is False
     assert rows[0]["result_count"] is None
@@ -113,7 +114,7 @@ def test_proxy_normalizes_direct_provider_aliases(tmp_path, monkeypatch) -> None
         agent="agent-c",
     )
 
-    assert result == {"results": [{"url": "https://example.com"}]}
+    assert result["results"] == [{"url": "https://example.com"}]
     assert json.loads(captured["req"].data.decode("utf-8"))["provider"] == "tavily"
     rows = _read_rows(call_log)
     assert rows[0]["lane"] == "tavily"
@@ -129,7 +130,65 @@ def test_searxng_still_returns_when_log_write_fails(monkeypatch) -> None:
 
     result = logged_search.searxng("test query", protocol="/search", topic="topic-slug")
 
-    assert result == {"results": [{"url": "https://a"}]}
+    assert result["results"] == [{"url": "https://a"}]
+
+
+def test_searxng_payload_carries_duration_and_cost(monkeypatch) -> None:
+    def delayed_response(_req, **_kwargs):
+        time.sleep(0.005)
+        return FakeResponse({"results": [{"url": "https://a"}]})
+
+    monkeypatch.setattr(logged_search.urllib.request, "urlopen", delayed_response)
+
+    payload = logged_search.searxng("test query")
+
+    assert payload["duration_ms"] >= 5
+    assert payload["cost_usd_estimate"] == 0.0
+
+
+def test_proxy_payload_carries_lane_cost_and_error_duration(monkeypatch) -> None:
+    lane = "tavily"
+    lane_cost = logged_search._lane_cost_per_call_usd(lane)
+    assert lane_cost is not None and lane_cost > 0
+
+    def delayed_failure(_req, **_kwargs):
+        time.sleep(0.005)
+        raise OSError("proxy unavailable")
+
+    monkeypatch.setattr(logged_search.urllib.request, "urlopen", delayed_failure)
+
+    payload = logged_search.proxy("test query", provider=lane)
+
+    assert payload["error"] == "proxy unavailable"
+    assert payload["duration_ms"] >= 5
+    assert payload["cost_usd_estimate"] == lane_cost
+
+
+def test_call_row_always_has_extended_fields() -> None:
+    quality = logged_search.query_quality.score_result_quality(
+        {"results": [{"url": "https://example.com"}]},
+        "searxng_general",
+    )
+    retry_metadata = logged_search._RetryMetadata(
+        transforms=("broaden",),
+        prior_result_count=0,
+        prior_verdict="empty",
+    )
+
+    row = logged_search._build_call_row(
+        protocol="/search",
+        topic="topic",
+        lane="searxng_general",
+        error=None,
+        result_count=1,
+        duration_ms=5,
+        agent="pytest",
+        quality=quality,
+        retry_metadata=retry_metadata,
+    )
+
+    assert "retrieval_verdict" in row
+    assert "query_retry" in row
 
 
 def test_api_lane_logs_and_normalizes_pubmed_results(tmp_path, monkeypatch) -> None:

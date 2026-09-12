@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from research_engine import research_cli
+from research_engine import evidence_gate, research_cli, sufficiency
 from research_engine import paths
 import research_engine.dispatcher as dispatcher
 from research_engine.persistence import CANONICAL_GEMINI_PRO_MODEL_ID
@@ -21,6 +21,54 @@ from research_engine.schema import (
     Protocol,
     WorkerModel,
 )
+
+
+def test_query_call_reads_duration_and_cost_from_payload() -> None:
+    call = research_cli.query_call(
+        "q",
+        lane="searxng_general",
+        payload={"results": [], "duration_ms": 42, "cost_usd_estimate": 0.01},
+        worker_model=WorkerModel.HAIKU,
+    )
+
+    assert call.duration_ms == 42
+    assert call.cost_usd_estimate == 0.01
+
+
+def test_query_call_without_measurement_raises() -> None:
+    with pytest.raises(ValueError, match="duration_ms"):
+        research_cli.query_call(
+            "q",
+            lane="searxng_general",
+            payload={"results": []},
+            worker_model=WorkerModel.HAIKU,
+        )
+
+
+def test_build_query_calls_use_payload_measurements() -> None:
+    calls = research_cli.build_query_calls(
+        "q",
+        sx={"results": [], "duration_ms": 7, "cost_usd_estimate": 0.0},
+        px={"results": [], "duration_ms": 9, "cost_usd_estimate": 0.02},
+        chosen_provider="exa_direct",
+        api_payloads=[("arxiv", {"results": [], "duration_ms": 3, "cost_usd_estimate": 0.0})],
+    )
+
+    assert [call.duration_ms for call in calls] == [7, 3, 9]
+    assert [call.cost_usd_estimate for call in calls] == [0.0, 0.0, 0.02]
+
+
+def test_grok_x_query_call_carries_elapsed(tmp_path: Path) -> None:
+    spec = SimpleNamespace(lanes=[])
+    call = research_cli.grok_x_query_call(
+        "q",
+        spec=spec,
+        output_text="result",
+        error=None,
+        elapsed_ms=120,
+    )
+
+    assert call.duration_ms == 120
 
 
 def _install_common_fakes(monkeypatch, tmp_path: Path, *, extract_result, grok_calls=None):
@@ -51,7 +99,7 @@ def _install_common_fakes(monkeypatch, tmp_path: Path, *, extract_result, grok_c
                 "abstain_confidence_below": 0.05,
             }
 
-    def fake_save_session(session, root):
+    def fake_write_session(session, *, root):
         saved_sessions.append(session)
         path = Path(root) / session.created_at.strftime("%Y-%m-%d") / f"{session.session_id}.json"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -62,12 +110,12 @@ def _install_common_fakes(monkeypatch, tmp_path: Path, *, extract_result, grok_c
     monkeypatch.setattr(
         research_cli.logged_search,
         "searxng",
-        lambda *args, **kwargs: {"results": [{"url": "https://ex.com/a"}]},
+        lambda *args, **kwargs: {"results": [{"url": "https://ex.com/a"}], "duration_ms": 1},
     )
     monkeypatch.setattr(
         research_cli.logged_search,
         "proxy",
-        lambda *args, **kwargs: {"results": [{"url": "https://ex.com/a"}]},
+        lambda *args, **kwargs: {"results": [{"url": "https://ex.com/a"}], "duration_ms": 1},
     )
     monkeypatch.setattr(research_cli, "extract_clean_text", lambda *args, **kwargs: extract_result)
     monkeypatch.setattr(
@@ -76,7 +124,8 @@ def _install_common_fakes(monkeypatch, tmp_path: Path, *, extract_result, grok_c
         lambda spec: grok_calls.append(spec) or "X post by @example on 2026-05-27. https://x.com/example/status/1",
     )
     monkeypatch.setattr(research_cli.persistence, "DEFAULT_ROOT", tmp_path)
-    monkeypatch.setattr(research_cli.persistence, "save_session", fake_save_session)
+    monkeypatch.setattr(research_cli.persistence, "finalize_session", lambda session: session)
+    monkeypatch.setattr(research_cli.persistence, "write_session", fake_write_session)
     monkeypatch.setattr(research_cli.telemetry_observer, "run", lambda: {"added": 1})
     return saved_sessions
 
@@ -142,7 +191,7 @@ def _install_research_fakes(
                 "abstain_confidence_below": 0.05,
             }
 
-    def fake_save_session(session, root):
+    def fake_write_session(session, *, root):
         saved_sessions.append(session)
         path = Path(root) / session.created_at.strftime("%Y-%m-%d") / f"{session.session_id}.json"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -153,7 +202,7 @@ def _install_research_fakes(
         lane = kwargs.get("provider") or "searxng_general"
         search_calls.append({"lane": lane, "query": query})
         suffix = len(search_calls) if unique_urls else "only"
-        return {"results": [{"url": f"https://ex.com/{suffix}"}]}
+        return {"results": [{"url": f"https://ex.com/{suffix}"}], "duration_ms": 1}
 
     def fake_extract(url, *args, **kwargs):
         if no_sources:
@@ -196,7 +245,8 @@ def _install_research_fakes(
     monkeypatch.setattr(research_cli, "execute_mistral_worker_spec", fake_execute_cli_worker_spec)
     monkeypatch.setattr(research_cli.persistence, "DEFAULT_ROOT", tmp_path)
     if fake_save:
-        monkeypatch.setattr(research_cli.persistence, "save_session", fake_save_session)
+        monkeypatch.setattr(research_cli.persistence, "finalize_session", lambda session: session)
+        monkeypatch.setattr(research_cli.persistence, "write_session", fake_write_session)
     else:
         monkeypatch.setattr(research_cli.persistence, "enforce_evidence_gate", lambda session: session)
         monkeypatch.setattr(
@@ -231,7 +281,7 @@ def _install_research_fakes(
     return saved_sessions, search_calls
 
 
-def test_save_session_with_fallback_preserves_original_session_on_save_failure(
+def test_save_session_with_fallback_writes_gated_session_on_save_failure(
     monkeypatch, tmp_path
 ) -> None:
     source_text = "Grounded source text."
@@ -250,13 +300,17 @@ def test_save_session_with_fallback_preserves_original_session_on_save_failure(
         evidence_chunks=[],
         queries_run=[],
         open_questions=[],
+        total_duration_ms=1,
+        total_cost_usd_estimate=0.0,
     )
 
     monkeypatch.setattr(research_cli.persistence, "DEFAULT_ROOT", tmp_path / "missing-root")
+    monkeypatch.setattr(sufficiency, "get_sufficiency_clients", lambda: (None, None))
+    monkeypatch.setattr(evidence_gate, "get_sufficiency_clients", lambda: (None, None))
     monkeypatch.setattr(
         research_cli.persistence,
-        "save_session",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(FileNotFoundError("missing root")),
+        "write_session",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("missing root")),
     )
 
     saved_session, path = research_cli.save_session_with_fallback(session)
@@ -264,9 +318,9 @@ def test_save_session_with_fallback_preserves_original_session_on_save_failure(
     assert saved_session is session
     assert path is not None
     payload = json.loads(path.read_text(encoding="utf-8"))
-    assert payload["answer"] == "Real answer"
-    assert payload["final_status"] == FinalStatus.COMPLETE.value
-    assert payload["answer_kind"] == AnswerKind.FULL.value
+    assert payload["answer"] is None
+    assert payload["final_status"] == FinalStatus.INSUFFICIENT_EVIDENCE.value
+    assert payload["answer_kind"] == AnswerKind.ABSTAIN.value
 
 
 def test_run_search_builds_session_with_source_answer_and_path(monkeypatch, tmp_path):
@@ -343,7 +397,8 @@ def test_run_search_skips_paid_proxy_when_searxng_has_enough_results(
         research_cli.logged_search,
         "searxng",
         lambda *args, **kwargs: {
-            "results": [{"url": f"https://ex.com/free-{index}"} for index in range(5)]
+            "results": [{"url": f"https://ex.com/free-{index}"} for index in range(5)],
+            "duration_ms": 1,
         },
     )
     monkeypatch.setattr(
@@ -389,12 +444,12 @@ def test_run_search_uses_paid_proxy_when_searxng_is_thin(monkeypatch, tmp_path):
     monkeypatch.setattr(
         research_cli.logged_search,
         "searxng",
-        lambda *args, **kwargs: {"results": [{"url": "https://ex.com/free-only"}]},
+        lambda *args, **kwargs: {"results": [{"url": "https://ex.com/free-only"}], "duration_ms": 1},
     )
 
     def fake_proxy(*args, **kwargs):
         proxy_calls.append(kwargs)
-        return {"results": [{"url": "https://ex.com/paid"}]}
+        return {"results": [{"url": "https://ex.com/paid"}], "duration_ms": 1}
 
     monkeypatch.setattr(research_cli.logged_search, "proxy", fake_proxy)
     monkeypatch.setattr(
@@ -459,7 +514,7 @@ def test_run_search_uses_free_specialty_lane_before_paid_proxy(
     monkeypatch.setattr(
         research_cli.logged_search,
         "searxng",
-        lambda *args, **kwargs: {"results": [{"url": "https://ex.com/thin"}]},
+        lambda *args, **kwargs: {"results": [{"url": "https://ex.com/thin"}], "duration_ms": 1},
     )
 
     def fake_api_lane(lane, request, **kwargs):
@@ -468,7 +523,8 @@ def test_run_search_uses_free_specialty_lane_before_paid_proxy(
             "results": [
                 {"url": f"https://arxiv.org/abs/1234.0000{index}"}
                 for index in range(4)
-            ]
+            ],
+            "duration_ms": 1,
         }
 
     monkeypatch.setattr(research_cli.logged_search, "api_lane", fake_api_lane)
@@ -930,7 +986,7 @@ def test_example_seeking_decomposition_removes_majority_meta_questions(monkeypat
                     "Which companies are commonly described by journalists as the Uber of X?",
                     "Which three companies are the strongest examples to use?",
                     "How should the answer be formatted?",
-                ]
+                ],
             ),
             "mock",
         )
@@ -1228,7 +1284,7 @@ def test_execute_gemini_worker_spec_uses_agy_with_explicit_gemini_model(monkeypa
         output_path=str(output_path),
         lanes=["gemini_pro_scout"],
         rationale="test",
-        model_id="Gemini 3.7 Flash (Medium)",
+        model_id="Gemini 3.8 Flash (Medium)",
     )
 
     output = research_cli.execute_gemini_worker_spec(spec, router=Router())
@@ -1245,7 +1301,7 @@ def test_execute_gemini_worker_spec_uses_agy_with_explicit_gemini_model(monkeypa
         "-p",
         "Scout this question.",
         "--model",
-        "Gemini 3.7 Flash (Medium)",
+        "Gemini 3.8 Flash (Medium)",
     ]
     assert "input" not in kwargs
     assert "env" not in kwargs
@@ -1290,7 +1346,7 @@ def test_execute_gemini_worker_spec_routes_to_fallback_when_daily_cap_hit(
         output_path=str(output_path),
         lanes=["gemini_pro_scout"],
         rationale="test",
-        model_id="Gemini 3.7 Flash (Medium)",
+        model_id="Gemini 3.8 Flash (Medium)",
     )
 
     output = research_cli.execute_gemini_worker_spec(spec, router=object())
@@ -1331,7 +1387,7 @@ def test_execute_gemini_worker_spec_routes_unattended_run_to_full_quota_model(
         output_path=str(output_path),
         lanes=["gemini_pro_scout"],
         rationale="test",
-        model_id="Gemini 3.7 Flash (Medium)",
+        model_id="Gemini 3.8 Flash (Medium)",
     )
 
     output = research_cli.execute_gemini_worker_spec(spec, router=object())
@@ -1384,7 +1440,7 @@ def test_execute_gemini_worker_spec_prefixes_dash_prefixed_prompt(monkeypatch, t
         "-p",
         "Brief:\n-start with a flag-like line",
         "--model",
-        "Gemini 3.7 Flash (Medium)",
+        "Gemini 3.8 Flash (Medium)",
     ]
 
 
@@ -1511,7 +1567,7 @@ def test_failed_gemini_exit_releases_budget_without_charge(monkeypatch, tmp_path
         output_path=str(tmp_path / "output.md"),
         lanes=["gemini_pro_scout"],
         rationale="test",
-        model_id="Gemini 3.7 Flash (Medium)",
+        model_id="Gemini 3.8 Flash (Medium)",
     )
 
     with pytest.raises(research_cli.GeminiProScoutError):
@@ -1533,7 +1589,7 @@ def test_scout_record_uses_model_actually_run(monkeypatch, tmp_path) -> None:
         output_path=str(tmp_path / "output.md"),
         lanes=["gemini_pro_scout"],
         rationale="test",
-        model_id="Gemini 3.7 Flash (Medium)",
+        model_id="Gemini 3.8 Flash (Medium)",
     )
 
     def fake_run(cmd, **kwargs):
@@ -1745,12 +1801,9 @@ def test_run_local_search_lanes_surfaces_not_configured_error(tmp_path) -> None:
         errors=errors,
     )
 
-    assert payloads == [
-        (
-            "mentor_memory",
-            {"results": [], "error": expected_error, "not_configured": True},
-        )
-    ]
+    assert payloads[0][0] == "mentor_memory"
+    assert payloads[0][1]["error"] == expected_error
+    assert "duration_ms" in payloads[0][1]
     assert research_cli.first_error_or("no usable sources retrieved", errors) == expected_error
 
 
@@ -1766,10 +1819,7 @@ def test_unset_buzz_script_surfaces_actionable_not_configured_error(monkeypatch)
         errors=errors,
     )
 
-    assert payloads == [
-        (
-            "bluesky_jetstream",
-            {"results": [], "error": expected_error, "not_configured": True},
-        )
-    ]
+    assert payloads[0][0] == "bluesky_jetstream"
+    assert payloads[0][1]["error"] == expected_error
+    assert "duration_ms" in payloads[0][1]
     assert errors == [expected_error]
